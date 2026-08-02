@@ -1,0 +1,41 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.base.building",
+  "name": "Architectural Materials",
+  "version": "1.0.0",
+  "blocks": [
+    { "id": 106, "key": "rtxsandbox:stone_bricks", "displayName": "Stone Bricks", "category": "Building / Masonry", "tags": ["brick", "stone"], "albedo": [0.43,0.45,0.47], "roughness": 0.84, "surfacePattern": "Brick" },
+    { "id": 107, "key": "rtxsandbox:slate_bricks", "displayName": "Slate Bricks", "category": "Building / Masonry", "tags": ["brick", "slate", "dark"], "albedo": [0.14,0.17,0.21], "roughness": 0.81, "surfacePattern": "Brick" },
+    { "id": 108, "key": "rtxsandbox:blackstone_bricks", "displayName": "Blackstone Bricks", "category": "Building / Masonry", "tags": ["brick", "black", "dark"], "albedo": [0.055,0.06,0.072], "roughness": 0.78, "surfacePattern": "Brick" },
+    { "id": 109, "key": "rtxsandbox:marble_bricks", "displayName": "Marble Bricks", "category": "Building / Masonry", "tags": ["brick", "marble", "bright"], "albedo": [0.82,0.81,0.78], "roughness": 0.35, "surfacePattern": "Brick" },
+    { "id": 110, "key": "rtxsandbox:granite_bricks", "displayName": "Granite Bricks", "category": "Building / Masonry", "tags": ["brick", "granite"], "albedo": [0.52,0.29,0.25], "roughness": 0.73, "surfacePattern": "Brick" },
+    { "id": 111, "key": "rtxsandbox:limestone_bricks", "displayName": "Limestone Bricks", "category": "Building / Masonry", "tags": ["brick", "limestone"], "albedo": [0.75,0.69,0.54], "roughness": 0.77, "surfacePattern": "Brick" },
+    { "id": 112, "key": "rtxsandbox:red_bricks", "displayName": "Red Bricks", "category": "Building / Masonry", "tags": ["brick", "red"], "albedo": [0.58,0.14,0.07], "roughness": 0.86, "surfacePattern": "Brick" },
+    { "id": 113, "key": "rtxsandbox:sandstone_bricks", "displayName": "Sandstone Bricks", "category": "Building / Masonry", "tags": ["brick", "sandstone"], "albedo": [0.75,0.56,0.32], "roughness": 0.86, "surfacePattern": "Brick" },
+
+    { "id": 114, "key": "rtxsandbox:smooth_stone", "displayName": "Smooth Stone", "category": "Building / Cut Stone", "tags": ["smooth", "stone"], "albedo": [0.51,0.53,0.55], "roughness": 0.48 },
+    { "id": 115, "key": "rtxsandbox:cut_stone", "displayName": "Cut Stone", "category": "Building / Cut Stone", "tags": ["cut", "stone"], "albedo": [0.47,0.49,0.51], "roughness": 0.62, "surfacePattern": "Tiles" },
+    { "id": 116, "key": "rtxsandbox:chiseled_stone", "displayName": "Chiseled Stone", "category": "Building / Cut Stone", "tags": ["chiseled", "stone", "decorative"], "albedo": [0.44,0.46,0.48], "roughness": 0.7, "surfacePattern": "Panels" },
+    { "id": 117, "key": "rtxsandbox:stone_pillar", "displayName": "Stone Pillar", "category": "Building / Cut Stone", "tags": ["pillar", "stone"], "albedo": [0.53,0.54,0.55], "roughness": 0.58, "surfacePattern": "Panels" },
+    { "id": 118, "key": "rtxsandbox:polished_granite", "displayName": "Polished Granite", "category": "Building / Cut Stone", "tags": ["polished", "granite"], "albedo": [0.59,0.32,0.28], "roughness": 0.24, "surfacePattern": "Marble" },
+    { "id": 119, "key": "rtxsandbox:polished_diorite", "displayName": "Polished Diorite", "category": "Building / Cut Stone", "tags": ["polished", "diorite"], "albedo": [0.75,0.74,0.72], "roughness": 0.25, "surfacePattern": "Marble" },
+    { "id": 120, "key": "rtxsandbox:polished_andesite", "displayName": "Polished Andesite", "category": "Building / Cut Stone", "tags": ["polished", "andesite"], "albedo": [0.43,0.45,0.46], "roughness": 0.27, "surfacePattern": "Stone" },
+    { "id": 121, "key": "rtxsandbox:polished_limestone", "displayName": "Polished Limestone", "category": "Building / Cut Stone", "tags": ["polished", "limestone"], "albedo": [0.8,0.75,0.6], "roughness": 0.3, "surfacePattern": "Marble" },
+
+    { "id": 122, "key": "rtxsandbox:white_tiles", "displayName": "White Tiles", "category": "Building / Tiles", "tags": ["tile", "white", "floor"], "albedo": [0.92,0.92,0.9], "roughness": 0.22, "surfacePattern": "Tiles" },
+    { "id": 123, "key": "rtxsandbox:black_tiles", "displayName": "Black Tiles", "category": "Building / Tiles", "tags": ["tile", "black", "floor"], "albedo": [0.035,0.04,0.05], "roughness": 0.2, "surfacePattern": "Tiles" },
+    { "id": 124, "key": "rtxsandbox:blue_tiles", "displayName": "Blue Tiles", "category": "Building / Tiles", "tags": ["tile", "blue", "floor"], "albedo": [0.06,0.24,0.62], "roughness": 0.19, "surfacePattern": "Tiles" },
+    { "id": 125, "key": "rtxsandbox:green_tiles", "displayName": "Green Tiles", "category": "Building / Tiles", "tags": ["tile", "green", "floor"], "albedo": [0.06,0.46,0.24], "roughness": 0.21, "surfacePattern": "Tiles" },
+    { "id": 126, "key": "rtxsandbox:terracotta_tiles", "displayName": "Terracotta Tiles", "category": "Building / Tiles", "tags": ["tile", "terracotta", "warm"], "albedo": [0.67,0.25,0.12], "roughness": 0.7, "surfacePattern": "Tiles" },
+    { "id": 127, "key": "rtxsandbox:checker_tiles", "displayName": "Checker Tiles", "category": "Building / Tiles", "tags": ["tile", "checker", "floor"], "albedo": [0.82,0.82,0.8], "roughness": 0.3, "surfacePattern": "Checker" },
+
+    { "id": 128, "key": "rtxsandbox:light_gray_concrete", "displayName": "Light Gray Concrete", "category": "Building / Concrete", "tags": ["concrete", "gray"], "albedo": [0.58,0.6,0.62], "roughness": 0.92 },
+    { "id": 129, "key": "rtxsandbox:red_concrete", "displayName": "Red Concrete", "category": "Building / Concrete", "tags": ["concrete", "red"], "albedo": [0.62,0.045,0.035], "roughness": 0.9 },
+    { "id": 130, "key": "rtxsandbox:blue_concrete", "displayName": "Blue Concrete", "category": "Building / Concrete", "tags": ["concrete", "blue"], "albedo": [0.035,0.12,0.62], "roughness": 0.9 },
+    { "id": 131, "key": "rtxsandbox:yellow_concrete", "displayName": "Yellow Concrete", "category": "Building / Concrete", "tags": ["concrete", "yellow"], "albedo": [0.84,0.57,0.025], "roughness": 0.91 },
+    { "id": 132, "key": "rtxsandbox:white_plaster", "displayName": "White Plaster", "category": "Building / Interior", "tags": ["plaster", "white", "wall"], "albedo": [0.95,0.93,0.88], "roughness": 0.98 },
+    { "id": 133, "key": "rtxsandbox:charcoal_plaster", "displayName": "Charcoal Plaster", "category": "Building / Interior", "tags": ["plaster", "dark", "wall"], "albedo": [0.075,0.08,0.09], "roughness": 0.97 },
+    { "id": 134, "key": "rtxsandbox:red_fabric", "displayName": "Red Fabric", "category": "Building / Interior", "tags": ["fabric", "red", "soft"], "albedo": [0.5,0.025,0.035], "roughness": 1.0, "surfacePattern": "Fabric", "soundSet": "fabric", "particleEffect": "fiber" },
+    { "id": 135, "key": "rtxsandbox:blue_fabric", "displayName": "Blue Fabric", "category": "Building / Interior", "tags": ["fabric", "blue", "soft"], "albedo": [0.025,0.08,0.52], "roughness": 1.0, "surfacePattern": "Fabric", "soundSet": "fabric", "particleEffect": "fiber" }
+  ]
+}

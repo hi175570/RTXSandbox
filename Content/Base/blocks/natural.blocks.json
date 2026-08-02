@@ -1,0 +1,40 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.base.natural",
+  "name": "Natural Materials",
+  "version": "1.0.0",
+  "blocks": [
+    { "id": 36, "key": "rtxsandbox:coarse_dirt", "displayName": "Coarse Dirt", "category": "Nature / Soil", "tags": ["soil", "earth"], "albedo": [0.34, 0.18, 0.08], "roughness": 1.0, "soundSet": "soil", "particleEffect": "brown_dust" },
+    { "id": 37, "key": "rtxsandbox:sandy_soil", "displayName": "Sandy Soil", "category": "Nature / Soil", "tags": ["soil", "sand"], "albedo": [0.55, 0.39, 0.2], "roughness": 0.98, "soundSet": "soil" },
+    { "id": 38, "key": "rtxsandbox:red_soil", "displayName": "Red Soil", "category": "Nature / Soil", "tags": ["soil", "red"], "albedo": [0.53, 0.17, 0.07], "roughness": 0.99, "soundSet": "soil" },
+    { "id": 39, "key": "rtxsandbox:black_soil", "displayName": "Black Soil", "category": "Nature / Soil", "tags": ["soil", "dark"], "albedo": [0.105, 0.075, 0.052], "roughness": 1.0, "soundSet": "soil" },
+    { "id": 40, "key": "rtxsandbox:clay", "displayName": "Clay", "category": "Nature / Soil", "tags": ["soil", "clay"], "albedo": [0.45, 0.49, 0.52], "roughness": 0.91, "soundSet": "soil" },
+    { "id": 41, "key": "rtxsandbox:swamp_mud", "displayName": "Swamp Mud", "category": "Nature / Soil", "tags": ["soil", "swamp", "wet"], "albedo": [0.085, 0.105, 0.045], "roughness": 0.82, "soundSet": "mud", "particleEffect": "mud_splash" },
+    { "id": 42, "key": "rtxsandbox:peat", "displayName": "Peat", "category": "Nature / Soil", "tags": ["soil", "swamp", "dark"], "albedo": [0.075, 0.052, 0.034], "roughness": 1.0, "soundSet": "soil" },
+    { "id": 43, "key": "rtxsandbox:dry_mud", "displayName": "Dry Mud", "category": "Nature / Soil", "tags": ["soil", "dry"], "albedo": [0.27, 0.18, 0.11], "roughness": 1.0, "soundSet": "soil", "surfacePattern": "Stone" },
+    { "id": 44, "key": "rtxsandbox:mossy_soil", "displayName": "Mossy Soil", "category": "Nature / Soil", "tags": ["soil", "moss"], "albedo": [0.14, 0.25, 0.07], "roughness": 0.99, "soundSet": "soil", "surfacePattern": "Grass" },
+    { "id": 45, "key": "rtxsandbox:white_sand", "displayName": "White Sand", "category": "Nature / Soil", "tags": ["sand", "bright"], "albedo": [0.88, 0.82, 0.66], "roughness": 0.96, "affectedByGravity": true, "soundSet": "sand", "surfacePattern": "Sand" },
+
+    { "id": 46, "key": "rtxsandbox:granite", "displayName": "Granite", "category": "Nature / Stone", "tags": ["stone", "igneous"], "albedo": [0.48, 0.29, 0.25], "roughness": 0.78, "surfacePattern": "Stone" },
+    { "id": 47, "key": "rtxsandbox:diorite", "displayName": "Diorite", "category": "Nature / Stone", "tags": ["stone", "bright"], "albedo": [0.69, 0.68, 0.65], "roughness": 0.81, "surfacePattern": "Stone" },
+    { "id": 48, "key": "rtxsandbox:andesite", "displayName": "Andesite", "category": "Nature / Stone", "tags": ["stone", "gray"], "albedo": [0.38, 0.4, 0.41], "roughness": 0.84, "surfacePattern": "Stone" },
+    { "id": 49, "key": "rtxsandbox:limestone", "displayName": "Limestone", "category": "Nature / Stone", "tags": ["stone", "warm"], "albedo": [0.72, 0.68, 0.53], "roughness": 0.88, "surfacePattern": "Stone" },
+    { "id": 50, "key": "rtxsandbox:slate", "displayName": "Slate", "category": "Nature / Stone", "tags": ["stone", "dark"], "albedo": [0.16, 0.19, 0.23], "roughness": 0.76, "surfacePattern": "Stone" },
+    { "id": 51, "key": "rtxsandbox:volcanic_rock", "displayName": "Volcanic Rock", "category": "Nature / Stone", "tags": ["stone", "volcanic"], "albedo": [0.055, 0.045, 0.042], "roughness": 0.97, "surfacePattern": "Stone" },
+    { "id": 52, "key": "rtxsandbox:travertine", "displayName": "Travertine", "category": "Nature / Stone", "tags": ["stone", "warm"], "albedo": [0.73, 0.58, 0.42], "roughness": 0.72, "surfacePattern": "Marble" },
+    { "id": 53, "key": "rtxsandbox:sandstone", "displayName": "Sandstone", "category": "Nature / Stone", "tags": ["stone", "sand"], "albedo": [0.72, 0.54, 0.3], "roughness": 0.9, "surfacePattern": "Sand" },
+    { "id": 54, "key": "rtxsandbox:red_sandstone", "displayName": "Red Sandstone", "category": "Nature / Stone", "tags": ["stone", "sand", "red"], "albedo": [0.66, 0.25, 0.095], "roughness": 0.88, "surfacePattern": "Sand" },
+    { "id": 55, "key": "rtxsandbox:gneiss", "displayName": "Gneiss", "category": "Nature / Stone", "tags": ["stone", "striped"], "albedo": [0.34, 0.31, 0.3], "roughness": 0.79, "surfacePattern": "Marble" },
+
+    { "id": 56, "key": "rtxsandbox:iron_ore", "displayName": "Iron Ore", "category": "Nature / Ore", "tags": ["ore", "iron", "metal"], "albedo": [0.42, 0.36, 0.31], "roughness": 0.72, "metallic": 0.22, "surfacePattern": "Stone" },
+    { "id": 57, "key": "rtxsandbox:copper_ore", "displayName": "Copper Ore", "category": "Nature / Ore", "tags": ["ore", "copper", "metal"], "albedo": [0.47, 0.25, 0.15], "roughness": 0.68, "metallic": 0.3, "surfacePattern": "CopperPatina" },
+    { "id": 58, "key": "rtxsandbox:gold_ore", "displayName": "Gold Ore", "category": "Nature / Ore", "tags": ["ore", "gold", "metal"], "albedo": [0.5, 0.42, 0.2], "roughness": 0.58, "metallic": 0.42, "surfacePattern": "Stone" },
+    { "id": 59, "key": "rtxsandbox:silver_ore", "displayName": "Silver Ore", "category": "Nature / Ore", "tags": ["ore", "silver", "metal"], "albedo": [0.5, 0.53, 0.56], "roughness": 0.55, "metallic": 0.48, "surfacePattern": "Stone" },
+    { "id": 60, "key": "rtxsandbox:aluminum_ore", "displayName": "Aluminum Ore", "category": "Nature / Ore", "tags": ["ore", "aluminum", "metal"], "albedo": [0.56, 0.58, 0.6], "roughness": 0.62, "metallic": 0.34, "surfacePattern": "Stone" },
+    { "id": 61, "key": "rtxsandbox:titanium_ore", "displayName": "Titanium Ore", "category": "Nature / Ore", "tags": ["ore", "titanium", "metal"], "albedo": [0.34, 0.36, 0.43], "roughness": 0.5, "metallic": 0.52, "surfacePattern": "Stone" },
+    { "id": 62, "key": "rtxsandbox:quartz_ore", "displayName": "Quartz Ore", "category": "Nature / Ore", "tags": ["ore", "quartz", "crystal"], "albedo": [0.78, 0.7, 0.68], "roughness": 0.46, "surfacePattern": "Stone" },
+    { "id": 63, "key": "rtxsandbox:gem_ore", "displayName": "Gem Ore", "category": "Nature / Ore", "tags": ["ore", "gem", "crystal"], "albedo": [0.18, 0.42, 0.37], "roughness": 0.34, "metallic": 0.18, "emission": [0.01, 0.06, 0.035], "surfacePattern": "Stone" },
+    { "id": 64, "key": "rtxsandbox:coal_ore", "displayName": "Coal Ore", "category": "Nature / Ore", "tags": ["ore", "coal", "dark"], "albedo": [0.09, 0.085, 0.08], "roughness": 0.98, "surfacePattern": "Stone" },
+    { "id": 65, "key": "rtxsandbox:uranium_ore", "displayName": "Uranium Ore", "category": "Nature / Ore", "tags": ["ore", "uranium", "glow"], "albedo": [0.12, 0.38, 0.08], "roughness": 0.5, "metallic": 0.2, "emission": [0.08, 0.42, 0.025], "surfacePattern": "Stone" }
+  ]
+}

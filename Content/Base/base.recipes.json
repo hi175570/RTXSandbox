@@ -1,0 +1,117 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.base.recipes",
+  "name": "RTX Sandbox Base Recipes",
+  "version": "0.7.0",
+  "recipes": [
+    {
+      "key": "rtxsandbox:planks_from_wood",
+      "displayName": "Saw Wood Planks",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:wood", "count": 1 }
+      ],
+      "output": { "itemKey": "rtxsandbox:planks", "count": 4 }
+    },
+    {
+      "key": "rtxsandbox:sticks_from_planks",
+      "displayName": "Cut Sticks",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:planks", "count": 2 }
+      ],
+      "output": { "itemKey": "rtxsandbox:stick", "count": 4 }
+    },
+    {
+      "key": "rtxsandbox:workbench",
+      "displayName": "Build Workbench",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:planks", "count": 4 }
+      ],
+      "output": { "itemKey": "rtxsandbox:workbench", "count": 1 }
+    },
+    {
+      "key": "rtxsandbox:wooden_pickaxe",
+      "displayName": "Wooden Pickaxe",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:planks", "count": 3 },
+        { "itemKey": "rtxsandbox:stick", "count": 2 }
+      ],
+      "output": { "itemKey": "rtxsandbox:wooden_pickaxe", "count": 1 }
+    },
+    {
+      "key": "rtxsandbox:stone_pickaxe",
+      "displayName": "Stone Pickaxe",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:stone", "count": 3 },
+        { "itemKey": "rtxsandbox:stick", "count": 2 }
+      ],
+      "output": { "itemKey": "rtxsandbox:stone_pickaxe", "count": 1 },
+      "requiresWorkbench": true
+    },
+    {
+      "key": "rtxsandbox:stone_axe",
+      "displayName": "Stone Axe",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:stone", "count": 3 },
+        { "itemKey": "rtxsandbox:stick", "count": 2 }
+      ],
+      "output": { "itemKey": "rtxsandbox:stone_axe", "count": 1 },
+      "requiresWorkbench": true
+    },
+    {
+      "key": "rtxsandbox:stone_shovel",
+      "displayName": "Stone Shovel",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:stone", "count": 1 },
+        { "itemKey": "rtxsandbox:stick", "count": 2 }
+      ],
+      "output": { "itemKey": "rtxsandbox:stone_shovel", "count": 1 },
+      "requiresWorkbench": true
+    },
+    {
+      "key": "rtxsandbox:brick_blocks",
+      "displayName": "Stone Bricks",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:stone", "count": 4 }
+      ],
+      "output": { "itemKey": "rtxsandbox:brick", "count": 4 },
+      "requiresWorkbench": true
+    },
+    {
+      "key": "rtxsandbox:glass_blocks",
+      "displayName": "Glass Blocks",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:sand", "count": 4 }
+      ],
+      "output": { "itemKey": "rtxsandbox:glass", "count": 2 },
+      "requiresWorkbench": true
+    },
+    {
+      "key": "rtxsandbox:forage_apple",
+      "displayName": "Forage Forest Apple",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:leaves", "count": 3 }
+      ],
+      "output": { "itemKey": "rtxsandbox:apple", "count": 1 }
+    },
+    {
+      "key": "rtxsandbox:red_lamp",
+      "displayName": "Red Lamp",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:copper", "count": 2 },
+        { "itemKey": "rtxsandbox:glow", "count": 1 }
+      ],
+      "output": { "itemKey": "rtxsandbox:red_lamp", "count": 2 },
+      "requiresWorkbench": true
+    },
+    {
+      "key": "rtxsandbox:blue_lamp",
+      "displayName": "Blue Lamp",
+      "ingredients": [
+        { "itemKey": "rtxsandbox:metal", "count": 2 },
+        { "itemKey": "rtxsandbox:glow", "count": 1 }
+      ],
+      "output": { "itemKey": "rtxsandbox:blue_lamp", "count": 2 },
+      "requiresWorkbench": true
+    }
+  ]
+}

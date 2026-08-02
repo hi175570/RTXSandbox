@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>RTXSandbox.ModAPI</AssemblyName>
+    <Description>Stable public modding API for RTX Sandbox</Description>
+  </PropertyGroup>
+</Project>

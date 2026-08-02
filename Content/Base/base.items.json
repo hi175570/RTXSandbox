@@ -1,0 +1,62 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.base.items",
+  "name": "RTX Sandbox Base Items",
+  "version": "0.7.0",
+  "items": [
+    {
+      "key": "rtxsandbox:stick",
+      "displayName": "Stick",
+      "maxStack": 64,
+      "iconTint": [0.58, 0.31, 0.11]
+    },
+    {
+      "key": "rtxsandbox:wooden_pickaxe",
+      "displayName": "Wooden Pickaxe",
+      "maxStack": 1,
+      "maxDurability": 64,
+      "iconTint": [0.66, 0.38, 0.16],
+      "toolType": "pickaxe",
+      "toolTier": 1,
+      "miningSpeedMultiplier": 2.25
+    },
+    {
+      "key": "rtxsandbox:stone_pickaxe",
+      "displayName": "Stone Pickaxe",
+      "maxStack": 1,
+      "maxDurability": 192,
+      "iconTint": [0.52, 0.55, 0.60],
+      "toolType": "pickaxe",
+      "toolTier": 2,
+      "miningSpeedMultiplier": 4.2
+    },
+    {
+      "key": "rtxsandbox:stone_axe",
+      "displayName": "Stone Axe",
+      "maxStack": 1,
+      "maxDurability": 176,
+      "iconTint": [0.50, 0.53, 0.58],
+      "toolType": "axe",
+      "toolTier": 2,
+      "miningSpeedMultiplier": 3.7
+    },
+    {
+      "key": "rtxsandbox:stone_shovel",
+      "displayName": "Stone Shovel",
+      "maxStack": 1,
+      "maxDurability": 160,
+      "iconTint": [0.48, 0.51, 0.55],
+      "toolType": "shovel",
+      "toolTier": 2,
+      "miningSpeedMultiplier": 4.0
+    },
+    {
+      "key": "rtxsandbox:apple",
+      "displayName": "Forest Apple",
+      "maxStack": 16,
+      "iconTint": [0.86, 0.08, 0.035],
+      "foodValue": 5.0,
+      "healValue": 1.0
+    }
+  ]
+}

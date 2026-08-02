@@ -1,0 +1,55 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.base.wood",
+  "name": "Wood Library",
+  "version": "1.0.0",
+  "blocks": [
+    { "id": 66, "key": "rtxsandbox:oak_log", "displayName": "Oak Log", "category": "Wood / Oak", "tags": ["wood", "oak", "log"], "albedo": [0.42,0.25,0.1], "roughness": 0.82, "surfacePattern": "Wood", "soundSet": "wood", "particleEffect": "wood_chips" },
+    { "id": 67, "key": "rtxsandbox:oak_planks", "displayName": "Oak Planks", "category": "Wood / Oak", "tags": ["wood", "oak", "planks"], "albedo": [0.67,0.43,0.19], "roughness": 0.72, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 68, "key": "rtxsandbox:oak_pillar", "displayName": "Oak Pillar", "category": "Wood / Oak", "tags": ["wood", "oak", "pillar"], "albedo": [0.52,0.31,0.12], "roughness": 0.68, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 69, "key": "rtxsandbox:oak_decorative", "displayName": "Carved Oak", "category": "Wood / Oak", "tags": ["wood", "oak", "decorative"], "albedo": [0.61,0.37,0.15], "roughness": 0.64, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 70, "key": "rtxsandbox:oak_bark", "displayName": "Oak Bark", "category": "Wood / Oak", "tags": ["wood", "oak", "bark"], "albedo": [0.25,0.135,0.055], "roughness": 0.96, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 71, "key": "rtxsandbox:spruce_log", "displayName": "Spruce Log", "category": "Wood / Spruce", "tags": ["wood", "spruce", "log"], "albedo": [0.27,0.15,0.065], "roughness": 0.86, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 72, "key": "rtxsandbox:spruce_planks", "displayName": "Spruce Planks", "category": "Wood / Spruce", "tags": ["wood", "spruce", "planks"], "albedo": [0.49,0.29,0.12], "roughness": 0.75, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 73, "key": "rtxsandbox:spruce_pillar", "displayName": "Spruce Pillar", "category": "Wood / Spruce", "tags": ["wood", "spruce", "pillar"], "albedo": [0.36,0.2,0.078], "roughness": 0.7, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 74, "key": "rtxsandbox:spruce_decorative", "displayName": "Carved Spruce", "category": "Wood / Spruce", "tags": ["wood", "spruce", "decorative"], "albedo": [0.43,0.245,0.095], "roughness": 0.68, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 75, "key": "rtxsandbox:spruce_bark", "displayName": "Spruce Bark", "category": "Wood / Spruce", "tags": ["wood", "spruce", "bark"], "albedo": [0.15,0.082,0.04], "roughness": 0.98, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 76, "key": "rtxsandbox:birch_log", "displayName": "Birch Log", "category": "Wood / Birch", "tags": ["wood", "birch", "log"], "albedo": [0.78,0.72,0.58], "roughness": 0.84, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 77, "key": "rtxsandbox:birch_planks", "displayName": "Birch Planks", "category": "Wood / Birch", "tags": ["wood", "birch", "planks"], "albedo": [0.82,0.68,0.4], "roughness": 0.7, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 78, "key": "rtxsandbox:birch_pillar", "displayName": "Birch Pillar", "category": "Wood / Birch", "tags": ["wood", "birch", "pillar"], "albedo": [0.74,0.62,0.39], "roughness": 0.69, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 79, "key": "rtxsandbox:birch_decorative", "displayName": "Carved Birch", "category": "Wood / Birch", "tags": ["wood", "birch", "decorative"], "albedo": [0.87,0.73,0.45], "roughness": 0.63, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 80, "key": "rtxsandbox:birch_bark", "displayName": "Birch Bark", "category": "Wood / Birch", "tags": ["wood", "birch", "bark"], "albedo": [0.68,0.67,0.61], "roughness": 0.94, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 81, "key": "rtxsandbox:hemlock_log", "displayName": "Hemlock Log", "category": "Wood / Hemlock", "tags": ["wood", "hemlock", "log"], "albedo": [0.32,0.19,0.09], "roughness": 0.86, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 82, "key": "rtxsandbox:hemlock_planks", "displayName": "Hemlock Planks", "category": "Wood / Hemlock", "tags": ["wood", "hemlock", "planks"], "albedo": [0.59,0.38,0.18], "roughness": 0.73, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 83, "key": "rtxsandbox:hemlock_pillar", "displayName": "Hemlock Pillar", "category": "Wood / Hemlock", "tags": ["wood", "hemlock", "pillar"], "albedo": [0.44,0.27,0.12], "roughness": 0.7, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 84, "key": "rtxsandbox:hemlock_decorative", "displayName": "Carved Hemlock", "category": "Wood / Hemlock", "tags": ["wood", "hemlock", "decorative"], "albedo": [0.54,0.34,0.15], "roughness": 0.65, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 85, "key": "rtxsandbox:hemlock_bark", "displayName": "Hemlock Bark", "category": "Wood / Hemlock", "tags": ["wood", "hemlock", "bark"], "albedo": [0.19,0.1,0.048], "roughness": 0.98, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 86, "key": "rtxsandbox:darkwood_log", "displayName": "Darkwood Log", "category": "Wood / Darkwood", "tags": ["wood", "dark", "log"], "albedo": [0.105,0.052,0.032], "roughness": 0.88, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 87, "key": "rtxsandbox:darkwood_planks", "displayName": "Darkwood Planks", "category": "Wood / Darkwood", "tags": ["wood", "dark", "planks"], "albedo": [0.19,0.09,0.055], "roughness": 0.72, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 88, "key": "rtxsandbox:darkwood_pillar", "displayName": "Darkwood Pillar", "category": "Wood / Darkwood", "tags": ["wood", "dark", "pillar"], "albedo": [0.14,0.065,0.04], "roughness": 0.67, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 89, "key": "rtxsandbox:darkwood_decorative", "displayName": "Carved Darkwood", "category": "Wood / Darkwood", "tags": ["wood", "dark", "decorative"], "albedo": [0.23,0.105,0.065], "roughness": 0.61, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 90, "key": "rtxsandbox:darkwood_bark", "displayName": "Darkwood Bark", "category": "Wood / Darkwood", "tags": ["wood", "dark", "bark"], "albedo": [0.055,0.028,0.022], "roughness": 0.99, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 91, "key": "rtxsandbox:redwood_log", "displayName": "Redwood Log", "category": "Wood / Redwood", "tags": ["wood", "redwood", "log"], "albedo": [0.39,0.12,0.055], "roughness": 0.84, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 92, "key": "rtxsandbox:redwood_planks", "displayName": "Redwood Planks", "category": "Wood / Redwood", "tags": ["wood", "redwood", "planks"], "albedo": [0.62,0.22,0.095], "roughness": 0.7, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 93, "key": "rtxsandbox:redwood_pillar", "displayName": "Redwood Pillar", "category": "Wood / Redwood", "tags": ["wood", "redwood", "pillar"], "albedo": [0.49,0.16,0.07], "roughness": 0.68, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 94, "key": "rtxsandbox:redwood_decorative", "displayName": "Carved Redwood", "category": "Wood / Redwood", "tags": ["wood", "redwood", "decorative"], "albedo": [0.7,0.27,0.11], "roughness": 0.6, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 95, "key": "rtxsandbox:redwood_bark", "displayName": "Redwood Bark", "category": "Wood / Redwood", "tags": ["wood", "redwood", "bark"], "albedo": [0.24,0.065,0.035], "roughness": 0.98, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 96, "key": "rtxsandbox:palm_log", "displayName": "Palm Log", "category": "Wood / Palm", "tags": ["wood", "palm", "log"], "albedo": [0.43,0.3,0.14], "roughness": 0.87, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 97, "key": "rtxsandbox:palm_planks", "displayName": "Palm Planks", "category": "Wood / Palm", "tags": ["wood", "palm", "planks"], "albedo": [0.72,0.57,0.31], "roughness": 0.74, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 98, "key": "rtxsandbox:palm_pillar", "displayName": "Palm Pillar", "category": "Wood / Palm", "tags": ["wood", "palm", "pillar"], "albedo": [0.56,0.4,0.19], "roughness": 0.7, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 99, "key": "rtxsandbox:palm_decorative", "displayName": "Carved Palm", "category": "Wood / Palm", "tags": ["wood", "palm", "decorative"], "albedo": [0.79,0.63,0.34], "roughness": 0.64, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 100, "key": "rtxsandbox:palm_bark", "displayName": "Palm Bark", "category": "Wood / Palm", "tags": ["wood", "palm", "bark"], "albedo": [0.28,0.19,0.085], "roughness": 0.99, "surfacePattern": "Wood", "soundSet": "wood" },
+
+    { "id": 101, "key": "rtxsandbox:maple_log", "displayName": "Maple Log", "category": "Wood / Maple", "tags": ["wood", "maple", "log"], "albedo": [0.38,0.22,0.11], "roughness": 0.83, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 102, "key": "rtxsandbox:maple_planks", "displayName": "Maple Planks", "category": "Wood / Maple", "tags": ["wood", "maple", "planks"], "albedo": [0.74,0.48,0.24], "roughness": 0.7, "surfacePattern": "Panels", "soundSet": "wood" },
+    { "id": 103, "key": "rtxsandbox:maple_pillar", "displayName": "Maple Pillar", "category": "Wood / Maple", "tags": ["wood", "maple", "pillar"], "albedo": [0.55,0.31,0.14], "roughness": 0.67, "surfacePattern": "Wood", "soundSet": "wood" },
+    { "id": 104, "key": "rtxsandbox:maple_decorative", "displayName": "Carved Maple", "category": "Wood / Maple", "tags": ["wood", "maple", "decorative"], "albedo": [0.8,0.52,0.27], "roughness": 0.61, "surfacePattern": "Tiles", "soundSet": "wood" },
+    { "id": 105, "key": "rtxsandbox:maple_bark", "displayName": "Maple Bark", "category": "Wood / Maple", "tags": ["wood", "maple", "bark"], "albedo": [0.24,0.125,0.06], "roughness": 0.97, "surfacePattern": "Wood", "soundSet": "wood" }
+  ]
+}

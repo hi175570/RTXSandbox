@@ -1,0 +1,27 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.37516.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTXSandbox", "RTXSandbox.csproj", "{7A87C6B2-0E2B-4B9A-9A4C-4A65D7F3D1E8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTXSandbox.ModAPI", "RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj", "{56A687F3-B3B4-4A41-A6AB-4DF87F8D722C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7A87C6B2-0E2B-4B9A-9A4C-4A65D7F3D1E8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7A87C6B2-0E2B-4B9A-9A4C-4A65D7F3D1E8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7A87C6B2-0E2B-4B9A-9A4C-4A65D7F3D1E8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7A87C6B2-0E2B-4B9A-9A4C-4A65D7F3D1E8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{56A687F3-B3B4-4A41-A6AB-4DF87F8D722C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{56A687F3-B3B4-4A41-A6AB-4DF87F8D722C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{56A687F3-B3B4-4A41-A6AB-4DF87F8D722C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{56A687F3-B3B4-4A41-A6AB-4DF87F8D722C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
