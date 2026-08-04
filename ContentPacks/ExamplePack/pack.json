@@ -1,0 +1,8 @@
+{
+  "id": "rtxsandbox.example-content",
+  "name": "RTX Sandbox Example Content Pack",
+  "version": "1.0.0",
+  "priority": 100,
+  "enabled": true,
+  "forceOverrides": false
+}

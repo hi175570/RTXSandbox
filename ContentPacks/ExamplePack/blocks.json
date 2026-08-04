@@ -1,0 +1,22 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.example-content.blocks",
+  "name": "RTX Sandbox Example Content Blocks",
+  "version": "1.0.0",
+  "blocks": [
+    {
+      "id": 500,
+      "key": "examplepack:cyan_lamp",
+      "displayName": "Example Cyan Lamp",
+      "category": "Example Pack",
+      "albedo": [0.03, 0.72, 0.86],
+      "roughness": 0.18,
+      "metallic": 0.28,
+      "emission": [0.12, 4.8, 7.2],
+      "hardnessSeconds": 0.55,
+      "preferredToolType": "pickaxe",
+      "surfacePattern": "Panels",
+      "tags": ["example", "content-pack", "lighting"]
+    }
+  ]
+}

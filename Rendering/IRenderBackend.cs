@@ -17,7 +17,7 @@ public interface IRenderBackend : IDisposable
         Camera camera,
         VoxelHit? selection,
         float timeOfDay,
-        int pathBounces,
+        RenderQualitySettings quality,
         float exposure);
 }
 

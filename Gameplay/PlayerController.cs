@@ -8,10 +8,12 @@ public sealed class PlayerController
     public const float Radius = 0.32f;
     public const float Height = 1.8f;
     public const float EyeHeight = 1.62f;
+    private const float ExternalDepenetrationSpeed = 2.4f;
 
     private readonly VoxelWorld _world;
     private readonly List<VoxelAabb> _collisionBoxes = new(24);
     private float _verticalVelocity;
+    private Vector3 _externalPushDirection;
 
     public Vector3 Position { get; private set; }
     public bool IsGrounded { get; private set; }
@@ -22,6 +24,7 @@ public sealed class PlayerController
     public float VerticalVelocity => _verticalVelocity;
     public bool FlightMode { get; set; }
     public bool NoClip { get; set; }
+    public float LastExternalPushDistance { get; private set; }
 
     public Vector3 EyePosition => Position + Vector3.UnitY * EyeHeight;
 
@@ -95,13 +98,28 @@ public sealed class PlayerController
                     IsFluidAt(Position + Vector3.UnitY * 1.1f);
         IsHeadUnderwater = IsFluidAt(EyePosition);
         float speed = IsInWater ? 3.4f : sprint ? 8.5f : 5.2f;
-        MoveAxis(0, desired.X * speed * deltaTime);
-        MoveAxis(2, desired.Z * speed * deltaTime);
+        bool blockedX = MoveAxis(0, desired.X * speed * deltaTime);
+        bool blockedZ = MoveAxis(2, desired.Z * speed * deltaTime);
+
+        // Shore assistance is input-driven: colliding with a wall must never raise
+        // the player unless they are actively holding the jump/swim-up control.
+        if (IsInWater && jump && (blockedX || blockedZ) && desired.LengthSquared() > 0.001f)
+        {
+            float climb = MathF.Min(6f * deltaTime, 0.16f);
+            float beforeClimb = Position.Y;
+            MoveAxis(1, climb);
+            if (Position.Y > beforeClimb + 0.0001f)
+            {
+                if (blockedX) MoveAxis(0, desired.X * speed * deltaTime);
+                if (blockedZ) MoveAxis(2, desired.Z * speed * deltaTime);
+                _verticalVelocity = MathF.Max(_verticalVelocity, 4.8f);
+            }
+        }
 
         if (IsInWater)
         {
-            float targetVerticalSpeed = jump ? 3.6f : descend ? -3.0f : 0.45f;
-            float response = 1f - MathF.Exp(-5.5f * deltaTime);
+            float targetVerticalSpeed = jump ? 6.2f : descend ? -3.2f : 0f;
+            float response = 1f - MathF.Exp(-8f * deltaTime);
             _verticalVelocity += (targetVerticalSpeed - _verticalVelocity) * response;
             IsGrounded = false;
             MoveAxis(1, _verticalVelocity * deltaTime);
@@ -142,11 +160,82 @@ public sealed class PlayerController
         LastLandingSpeed = 0f;
     }
 
-    private void MoveAxis(int axis, float amount)
+    public bool ResolveExternalPenetration(float deltaTime)
+    {
+        LastExternalPushDistance = 0f;
+        if (NoClip) return false;
+        if (!_world.PhysicsGrids.TryCalculatePlayerPenetration(
+                BoundsMin(Position), BoundsMax(Position), out Vector3 correction, out _))
+            return false;
+
+        float correctionLength = correction.Length();
+        if (correctionLength < 0.000001f) return false;
+        Vector3 direction = FindHorizontalEscapeDirection();
+        if (direction.LengthSquared() < 0.5f)
+        {
+            // Vertical correction is a last resort only. It remains rate-limited, so a
+            // completely boxed-in player can still escape without being teleported.
+            Vector3 fallback = correction / correctionLength;
+            direction = fallback.Y > 0.1f && IsStaticSafe(Position - Vector3.UnitY * 0.1f)
+                ? -Vector3.UnitY
+                : fallback;
+        }
+        _externalPushDirection = direction;
+        // This is an anti-stuck recovery, not collision impulse transfer. A fast Grid
+        // must never launch the player faster than a stationary overlapping Grid.
+        float maximumDistance = ExternalDepenetrationSpeed * Math.Clamp(deltaTime, 0f, 0.05f);
+        Vector3 boundedCorrection = direction * maximumDistance;
+        Vector3 before = Position;
+        MoveAxis(0, boundedCorrection.X, includeDynamicGrids: false);
+        MoveAxis(2, boundedCorrection.Z, includeDynamicGrids: false);
+        if (MathF.Abs(boundedCorrection.Y) > 0.0001f)
+            MoveAxis(1, boundedCorrection.Y, includeDynamicGrids: false);
+        LastExternalPushDistance = Vector3.Distance(before, Position);
+        return LastExternalPushDistance > 0.000001f;
+    }
+
+    private Vector3 FindHorizontalEscapeDirection()
+    {
+        Vector3[] directions =
+        {
+            Vector3.UnitX, -Vector3.UnitX, Vector3.UnitZ, -Vector3.UnitZ,
+            Vector3.Normalize(Vector3.UnitX + Vector3.UnitZ),
+            Vector3.Normalize(Vector3.UnitX - Vector3.UnitZ),
+            Vector3.Normalize(-Vector3.UnitX + Vector3.UnitZ),
+            Vector3.Normalize(-Vector3.UnitX - Vector3.UnitZ),
+        };
+
+        Vector3 best = Vector3.Zero;
+        float bestDistance = float.MaxValue;
+        foreach (Vector3 direction in directions)
+        {
+            float preference = _externalPushDirection.LengthSquared() > 0.5f &&
+                               Vector3.Dot(direction, _externalPushDirection) > 0.98f ? -0.04f : 0f;
+            for (float distance = 0.1f; distance <= 2.4f; distance += 0.1f)
+            {
+                Vector3 candidate = Position + direction * distance;
+                if (!IsStaticSafe(candidate)) break;
+                if (_world.PhysicsGrids.TryCalculatePlayerPenetration(
+                        BoundsMin(candidate), BoundsMax(candidate), out _, out _)) continue;
+                if (distance + preference < bestDistance)
+                {
+                    bestDistance = distance + preference;
+                    best = direction;
+                }
+                break;
+            }
+        }
+        return best;
+    }
+
+    private bool IsStaticSafe(Vector3 position) =>
+        !_world.IntersectsStaticSolid(BoundsMin(position), BoundsMax(position));
+
+    private bool MoveAxis(int axis, float amount, bool includeDynamicGrids = true)
     {
         if (MathF.Abs(amount) < 0.000001f)
         {
-            return;
+            return false;
         }
 
         Vector3 candidate = Position;
@@ -173,7 +262,8 @@ public sealed class PlayerController
         for (int x = minX; x <= maxX; x++)
         {
             _collisionBoxes.Clear();
-            _world.GetCollisionBoxes(x, y, z, _collisionBoxes);
+            if (includeDynamicGrids) _world.GetCollisionBoxes(x, y, z, _collisionBoxes);
+            else _world.GetStaticCollisionBoxes(x, y, z, _collisionBoxes);
             foreach (VoxelAabb box in _collisionBoxes)
             {
                 if (!box.Intersects(minimum, maximum)) continue;
@@ -213,7 +303,10 @@ public sealed class PlayerController
 
         // Collision iteration above is deterministic for voxel AABBs; this guard catches
         // accidental tunnelling if movement tuning changes later.
-        if (collided && _world.IntersectsSolid(BoundsMin(Position), BoundsMax(Position)))
+        bool stillIntersecting = includeDynamicGrids
+            ? _world.IntersectsSolid(BoundsMin(Position), BoundsMax(Position))
+            : _world.IntersectsStaticSolid(BoundsMin(Position), BoundsMax(Position));
+        if (collided && stillIntersecting)
         {
             Position = axis switch
             {
@@ -222,6 +315,7 @@ public sealed class PlayerController
                 _ => Position with { Z = Position.Z - amount },
             };
         }
+        return collided;
     }
 
     private static Vector3 BoundsMin(Vector3 position) =>
@@ -230,8 +324,12 @@ public sealed class PlayerController
     private static Vector3 BoundsMax(Vector3 position) =>
         new(position.X + Radius, position.Y + Height, position.Z + Radius);
 
-    private bool IsFluidAt(Vector3 point) => _world.IsFluid(
-        (int)MathF.Floor(point.X),
-        (int)MathF.Floor(point.Y),
-        (int)MathF.Floor(point.Z));
+    private bool IsFluidAt(Vector3 point)
+    {
+        int x = (int)MathF.Floor(point.X);
+        int y = (int)MathF.Floor(point.Y);
+        int z = (int)MathF.Floor(point.Z);
+        return _world.IsFluid(x, y, z) &&
+               (point.Y - y < VoxelWorld.FluidSurfaceHeight || _world.IsFluid(x, y + 1, z));
+    }
 }

@@ -46,6 +46,7 @@ public sealed class PhysicsGrid
     public ulong Id { get; }
     public IReadOnlyList<PhysicsGridElement> Elements => _elements;
     public IReadOnlyList<PhysicsGridElement> CollisionElements => _collisionElements;
+    public int TopologyVersion { get; private set; } = 1;
     public Vector3 Position { get; internal set; }
     public Quaternion Orientation { get; internal set; } = Quaternion.Identity;
     public Vector3 LinearVelocity { get; set; }
@@ -53,6 +54,7 @@ public sealed class PhysicsGrid
     public Vector3 CenterOfMassLocal { get; private set; }
     public float Mass { get; private set; }
     public Vector3 LocalInertia { get; private set; }
+    public float BoundingRadius { get; private set; }
     public bool IsSleeping { get; internal set; }
     public float SleepTimer { get; internal set; }
     public bool FractureOnImpact { get; set; }
@@ -103,6 +105,7 @@ public sealed class PhysicsGrid
         if (!_cellElements.ContainsKey((x, y, z))) return false;
         Vector3 oldCenter = CenterOfMassLocal;
         _elements.RemoveAll(element => element.CellX == x && element.CellY == y && element.CellZ == z);
+        TopologyVersion++;
         if (_elements.Count == 0)
         {
             _cellElements.Clear();
@@ -124,6 +127,7 @@ public sealed class PhysicsGrid
             new Vector3(x, y, z),
             new Vector3(x + 1f, y + 1f, z + 1f),
             materialId));
+        TopologyVersion++;
         RebuildCellIndex();
         RecalculateMass();
         Position += Vector3.Transform(CenterOfMassLocal - oldCenter, Orientation);
@@ -173,19 +177,23 @@ public sealed class PhysicsGrid
         Wake();
     }
 
-    internal void SetPhysicsState(
+    internal bool SetPhysicsState(
         Vector3 position,
         Quaternion orientation,
         Vector3 linearVelocity,
         Vector3 angularVelocity,
         bool sleeping)
     {
+        orientation = Quaternion.Normalize(orientation);
+        bool transformChanged = Vector3.DistanceSquared(Position, position) > 0.0000000001f ||
+                                1f - MathF.Abs(Quaternion.Dot(Orientation, orientation)) > 0.0000001f;
         Position = position;
-        Orientation = Quaternion.Normalize(orientation);
+        Orientation = orientation;
         LinearVelocity = linearVelocity;
         AngularVelocity = angularVelocity;
         IsSleeping = sleeping;
         if (!sleeping) SleepTimer = 0f;
+        return transformChanged;
     }
 
     public PhysicsGridRayHit? Raycast(Vector3 origin, Vector3 direction, float maximumDistance)
@@ -250,6 +258,87 @@ public sealed class PhysicsGrid
             maximum = Vector3.Max(maximum, world);
         }
         return (minimum, maximum);
+    }
+
+    public bool TryCalculatePenetration(
+        Vector3 axisAlignedMinimum,
+        Vector3 axisAlignedMaximum,
+        out Vector3 correction)
+    {
+        Vector3 playerCenter = (axisAlignedMinimum + axisAlignedMaximum) * 0.5f;
+        Vector3 playerHalfExtents = (axisAlignedMaximum - axisAlignedMinimum) * 0.5f;
+        correction = Vector3.Zero;
+        float largestRequiredCorrection = 0f;
+
+        foreach (PhysicsGridElement element in _collisionElements)
+        {
+            Vector3 boxCenter = LocalToWorld(element.Center);
+            Vector3 boxHalfExtents = element.HalfExtents;
+            if (!TryAabbObbMinimumTranslation(
+                    playerCenter,
+                    playerHalfExtents,
+                    boxCenter,
+                    boxHalfExtents,
+                    Orientation,
+                    out Vector3 elementCorrection)) continue;
+            if (elementCorrection.LengthSquared() <= largestRequiredCorrection * largestRequiredCorrection) continue;
+            correction = elementCorrection;
+            largestRequiredCorrection = elementCorrection.Length();
+        }
+        return largestRequiredCorrection > 0f;
+    }
+
+    private static bool TryAabbObbMinimumTranslation(
+        Vector3 centerA,
+        Vector3 extentsA,
+        Vector3 centerB,
+        Vector3 extentsB,
+        Quaternion orientationB,
+        out Vector3 correction)
+    {
+        Vector3[] axesA = { Vector3.UnitX, Vector3.UnitY, Vector3.UnitZ };
+        Vector3[] axesB =
+        {
+            Vector3.Normalize(Vector3.Transform(Vector3.UnitX, orientationB)),
+            Vector3.Normalize(Vector3.Transform(Vector3.UnitY, orientationB)),
+            Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, orientationB)),
+        };
+        Vector3 centerDelta = centerA - centerB;
+        float minimumOverlap = float.PositiveInfinity;
+        Vector3 minimumAxis = Vector3.Zero;
+
+        bool TestAxis(Vector3 rawAxis)
+        {
+            float lengthSquared = rawAxis.LengthSquared();
+            if (lengthSquared < 0.0000001f) return true;
+            Vector3 axis = rawAxis / MathF.Sqrt(lengthSquared);
+            float radiusA = extentsA.X * MathF.Abs(axis.X) +
+                            extentsA.Y * MathF.Abs(axis.Y) +
+                            extentsA.Z * MathF.Abs(axis.Z);
+            float radiusB = extentsB.X * MathF.Abs(Vector3.Dot(axis, axesB[0])) +
+                            extentsB.Y * MathF.Abs(Vector3.Dot(axis, axesB[1])) +
+                            extentsB.Z * MathF.Abs(Vector3.Dot(axis, axesB[2]));
+            float signedDistance = Vector3.Dot(centerDelta, axis);
+            float overlap = radiusA + radiusB - MathF.Abs(signedDistance);
+            if (overlap <= 0f) return false;
+            if (overlap < minimumOverlap)
+            {
+                minimumOverlap = overlap;
+                minimumAxis = signedDistance < 0f ? -axis : axis;
+            }
+            return true;
+        }
+
+        foreach (Vector3 axis in axesA)
+            if (!TestAxis(axis)) { correction = Vector3.Zero; return false; }
+        foreach (Vector3 axis in axesB)
+            if (!TestAxis(axis)) { correction = Vector3.Zero; return false; }
+        foreach (Vector3 axisA in axesA)
+        foreach (Vector3 axisB in axesB)
+            if (!TestAxis(Vector3.Cross(axisA, axisB))) { correction = Vector3.Zero; return false; }
+
+        correction = minimumAxis * (minimumOverlap + 0.0005f);
+        return minimumOverlap < float.PositiveInfinity;
     }
 
     private static bool IntersectAabb(
@@ -368,6 +457,15 @@ public sealed class PhysicsGrid
             inertia.Z += elementMass * ((size.X * size.X + size.Y * size.Y) / 12f + offset.X * offset.X + offset.Y * offset.Y);
         }
         LocalInertia = Vector3.Max(inertia, new Vector3(0.01f));
+        float radiusSquared = 0f;
+        foreach (PhysicsGridElement element in _elements)
+        {
+            Vector3 extent = Vector3.Max(
+                Vector3.Abs(element.Minimum - CenterOfMassLocal),
+                Vector3.Abs(element.Maximum - CenterOfMassLocal));
+            radiusSquared = MathF.Max(radiusSquared, extent.LengthSquared());
+        }
+        BoundingRadius = MathF.Sqrt(radiusSquared);
     }
 }
 
@@ -422,6 +520,28 @@ public sealed class PhysicsGridWorld
     public void NotifyChanged() => Changed?.Invoke();
 
     public PhysicsGrid? Get(ulong id) => _grids.FirstOrDefault(grid => grid.Id == id);
+
+    public bool TryCalculatePlayerPenetration(
+        Vector3 minimum,
+        Vector3 maximum,
+        out Vector3 correction,
+        out Vector3 surfaceVelocity)
+    {
+        correction = Vector3.Zero;
+        surfaceVelocity = Vector3.Zero;
+        float largest = 0f;
+        Vector3 center = (minimum + maximum) * 0.5f;
+        foreach (PhysicsGrid grid in _grids)
+        {
+            if (!grid.TryCalculatePenetration(minimum, maximum, out Vector3 candidate)) continue;
+            float length = candidate.Length();
+            if (length <= largest) continue;
+            largest = length;
+            correction = candidate;
+            surfaceVelocity = grid.VelocityAtPoint(center);
+        }
+        return largest > 0f;
+    }
 
     public PhysicsGridRayHit? Raycast(Vector3 origin, Vector3 direction, float maximumDistance)
     {

@@ -60,6 +60,11 @@ public sealed class MicroBuildSystem : IMicroVoxelService
 
     public bool Place(PrecisionHit hit, ushort materialId)
     {
+        if (!PlacementRules.IsFarEnough(hit.Distance))
+        {
+            Status = $"Precision placement must be at least {PlacementRules.MinimumEyeDistance:0.0} blocks from the eye";
+            return false;
+        }
         BlockDefinition material = _blocks.Get(materialId);
         if (!material.IsPlaceable || materialId == 0 || materialId == BlockRegistry.UnknownBlockId)
         {
@@ -118,7 +123,7 @@ public sealed class MicroBuildSystem : IMicroVoxelService
         else if (before.RegularBlockId != 0)
         {
             BlockDefinition regular = _blocks.Get(before.RegularBlockId);
-            if (regular.IsUnbreakable)
+            if (regular.IsUnbreakable && !regular.IsFluid)
             {
                 Status = "That material is unbreakable";
                 return false;
@@ -167,7 +172,11 @@ public sealed class MicroBuildSystem : IMicroVoxelService
         }
 
         MicroVoxelCellSnapshot before = _world.CaptureCell(worldX, worldY, worldZ);
-        if (before.RegularBlockId != 0 && _blocks.Get(before.RegularBlockId).IsUnbreakable && !force) return false;
+        if (before.RegularBlockId != 0)
+        {
+            BlockDefinition existing = _blocks.Get(before.RegularBlockId);
+            if (existing.IsUnbreakable && !existing.IsFluid && !force) return false;
+        }
         MicroVoxelContainer container;
         if (before.MicroVoxels is not null)
         {

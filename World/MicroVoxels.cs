@@ -328,6 +328,7 @@ public static class MicroVoxelRaycast
             float inverse = 1f / snapshot.Resolution;
             foreach (MicroVoxelBox box in snapshot.Boxes)
             {
+                if (world.IsFluidMaterial(box.MaterialId)) continue;
                 Vector3 minimum = new(x + box.MinX * inverse, y + box.MinY * inverse, z + box.MinZ * inverse);
                 Vector3 maximum = new(x + box.MaxX * inverse, y + box.MaxY * inverse, z + box.MaxZ * inverse);
                 if (!IntersectAabb(origin, direction, minimum, maximum, maxDistance, out float distance, out Vector3 normal)) continue;

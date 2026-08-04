@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Numerics;
 using RTXSandbox.ModAPI;
 
@@ -5,13 +6,24 @@ namespace RTXSandbox.World;
 
 public sealed class VoxelWorld : IVoxelWorld
 {
+    // Width/Depth are the legacy GPU clip-window dimensions, not horizontal world bounds.
     public const int Width = 64;
-    public const int Height = 32;
     public const int Depth = 64;
+    public const int MinimumY = -64;
+    public const int MaximumY = 512;
+    public const int Height = MaximumY - MinimumY;
+    public const int DefaultGenerationRadiusChunks = 3;
+    public const float FluidSurfaceHeight = 0.875f;
 
-    private readonly ushort[] _voxels = new ushort[Width * Height * Depth];
+    private readonly VoxelChunkStore _storage = new(MinimumY, MaximumY);
+    private readonly HashSet<ChunkCoordinate> _generatedChunks = new();
+    private readonly ConcurrentQueue<ChunkGenerationRequest> _pendingChunkGeneration = new();
+    private readonly ConcurrentQueue<ChunkGenerationResult> _completedChunkGeneration = new();
+    private readonly ConcurrentDictionary<ChunkCoordinate, byte> _queuedChunkGeneration = new();
     private readonly BlockRegistry _blocks;
-    private readonly Dictionary<int, MicroVoxelContainer> _microVoxels = new();
+    private int _chunkGenerationWorkerRunning;
+    private int _chunkGenerationVersion;
+    private bool _proceduralGenerationEnabled;
     public PhysicsGridWorld PhysicsGrids { get; } = new();
     public int Seed { get; private set; }
     public WorldGenerationSettings GenerationSettings { get; private set; }
@@ -19,14 +31,35 @@ public sealed class VoxelWorld : IVoxelWorld
     public event Action<int, int, int, VoxelMaterial>? VoxelChanged;
     public event Action<VoxelChangedEvent>? DetailedVoxelChanged;
     public event Action? WorldReloaded;
+    public event Action<int, int, int>? MicroVoxelCellChanged;
+    public event Action? MicroVoxelsReloaded;
+    // Legacy aggregate notification retained for the GPU packed micro-voxel buffer and Mods.
     public event Action? MicroVoxelsChanged;
+    public event Action<ChunkCoordinate>? ChunkGenerated;
 
-    public ushort[] RawData => _voxels;
-    public int MicroVoxelContainerCount => _microVoxels.Count;
+    public ushort[] RawData => _storage.CreateLinearSnapshot(Width, Depth);
+    public ushort[] CreateRenderWindowSnapshot(int originX, int originZ) =>
+        _storage.CreateWindowSnapshot(originX, originZ, Width, Depth);
+    internal ushort[] CreateRenderChunkSnapshot(ChunkCoordinate chunk) =>
+        _storage.CreateWindowSnapshot(
+            chunk.MinimumX, chunk.MinimumZ, ChunkCoordinate.Size, ChunkCoordinate.Size);
+    public int LoadedChunkCount => _storage.ChunkCount;
+    public int PendingChunkGenerationCount => _queuedChunkGeneration.Count;
+    public int MicroVoxelContainerCount => _storage.MicroVoxelContainerCount;
+    public IReadOnlyList<ChunkCoordinate> SnapshotLoadedChunks() => _storage.SnapshotCoordinates();
+    public IReadOnlyCollection<ChunkCoordinate> SnapshotGeneratedChunks() => _generatedChunks.ToArray();
+    internal VoxelChunkSnapshot SnapshotChunk(ChunkCoordinate coordinate) => _storage.SnapshotChunk(coordinate);
+    internal bool TryGetChunkVerticalBounds(
+        ChunkCoordinate coordinate,
+        out int minimumY,
+        out int maximumYExclusive) =>
+        _storage.TryGetVerticalBounds(coordinate, out minimumY, out maximumYExclusive);
 
     int IVoxelWorld.Width => Width;
     int IVoxelWorld.Height => Height;
     int IVoxelWorld.Depth => Depth;
+    int IVoxelWorld.MinimumY => MinimumY;
+    int IVoxelWorld.MaximumYExclusive => MaximumY;
     string IVoxelWorld.GenerationPreset => GenerationSettings.Preset.ToString();
     string IVoxelWorld.GenerationBiome => GenerationSettings.Biome.ToString();
 
@@ -41,21 +74,23 @@ public sealed class VoxelWorld : IVoxelWorld
         GenerationSettings.Seed = generationSettings?.Seed ?? seed;
         GenerationSettings.Validate();
         Seed = GenerationSettings.Seed;
+        _proceduralGenerationEnabled = generate;
         if (generate)
         {
             GenerateWorld();
         }
     }
 
-    public bool IsInside(int x, int y, int z) =>
-        x >= 0 && x < Width && y >= 0 && y < Height && z >= 0 && z < Depth;
+    public bool IsInside(int x, int y, int z) => y >= MinimumY && y < MaximumY;
 
     public VoxelMaterial Get(int x, int y, int z)
     {
-        return IsInside(x, y, z) ? (VoxelMaterial)_voxels[Index(x, y, z)] : VoxelMaterial.Air;
+        return IsInside(x, y, z) ? (VoxelMaterial)_storage.GetBlock(x, y, z) : VoxelMaterial.Air;
     }
 
     public ushort GetBlockId(int x, int y, int z) => (ushort)Get(x, y, z);
+    internal ushort GetLoadedBlockId(int x, int y, int z) =>
+        IsInside(x, y, z) ? _storage.GetBlock(x, y, z) : (ushort)0;
 
     ushort IVoxelWorld.GetBlock(int x, int y, int z) => GetBlockId(x, y, z);
 
@@ -69,14 +104,19 @@ public sealed class VoxelWorld : IVoxelWorld
         return blockId != 0 && _blocks.Get(blockId).IsFluid;
     }
 
+    public bool IsFluidMaterial(ushort materialId) =>
+        materialId != 0 && _blocks.Get(materialId).IsFluid;
+    internal bool IsCollidableMaterial(ushort materialId) =>
+        materialId != 0 && _blocks.Get(materialId).IsCollidable;
+
     public bool IsSolidForCollision(int x, int y, int z)
     {
-        if (y < 0 || x < 0 || x >= Width || z < 0 || z >= Depth)
+        if (y < MinimumY)
         {
             return true;
         }
 
-        if (y >= Height)
+        if (y >= MaximumY)
         {
             return false;
         }
@@ -96,22 +136,18 @@ public sealed class VoxelWorld : IVoxelWorld
         {
             return false;
         }
+        ChunkCoordinate chunk = ChunkCoordinate.FromVoxel(x, z);
+        if (_proceduralGenerationEnabled) EnsureChunkGenerated(chunk);
+        else _generatedChunks.Add(chunk);
 
-        int index = Index(x, y, z);
-        ushort oldBlockId = _voxels[index];
-        bool removedMicro = _microVoxels.Remove(index);
-        if (oldBlockId == blockId && !removedMicro)
-        {
-            return false;
-        }
+        if (!_storage.SetBlock(x, y, z, blockId, out ushort oldBlockId, out bool removedMicro)) return false;
 
         if (oldBlockId != blockId)
         {
-            _voxels[index] = blockId;
             VoxelChanged?.Invoke(x, y, z, (VoxelMaterial)blockId);
             DetailedVoxelChanged?.Invoke(new VoxelChangedEvent(x, y, z, oldBlockId, blockId));
         }
-        if (removedMicro) MicroVoxelsChanged?.Invoke();
+        if (removedMicro) PublishMicroVoxelCellChanged(x, y, z);
         return true;
     }
 
@@ -119,34 +155,55 @@ public sealed class VoxelWorld : IVoxelWorld
 
     public void LoadRawData(ReadOnlySpan<ushort> data)
     {
-        if (data.Length != _voxels.Length)
+        ClearPendingChunkGeneration();
+        int expectedLength = Width * Height * Depth;
+        if (data.Length != expectedLength)
         {
-            throw new ArgumentException($"Expected {_voxels.Length} voxel bytes, received {data.Length}.", nameof(data));
+            throw new ArgumentException($"Expected {expectedLength} voxels, received {data.Length}.", nameof(data));
         }
-        data.CopyTo(_voxels);
-        _microVoxels.Clear();
+        _storage.LoadLinear(data, Width, Depth);
+        _generatedChunks.Clear();
+        foreach (ChunkCoordinate chunk in ChunkCoordinate.CoveringArea(Width, Depth))
+            _generatedChunks.Add(chunk);
         PhysicsGrids.Clear();
         WorldReloaded?.Invoke();
+        MicroVoxelsReloaded?.Invoke();
+        MicroVoxelsChanged?.Invoke();
+    }
+
+    internal void LoadChunks(IReadOnlyList<VoxelChunkSnapshot> chunks)
+    {
+        ClearPendingChunkGeneration();
+        _storage.LoadChunks(chunks);
+        _generatedChunks.Clear();
+        foreach (VoxelChunkSnapshot chunk in chunks) _generatedChunks.Add(chunk.Coordinate);
+        PhysicsGrids.Clear();
+        WorldReloaded?.Invoke();
+        MicroVoxelsReloaded?.Invoke();
         MicroVoxelsChanged?.Invoke();
     }
 
     public void Regenerate(WorldGenerationSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        ClearPendingChunkGeneration();
         GenerationSettings = settings.Clone();
         GenerationSettings.Validate();
         Seed = GenerationSettings.Seed;
-        Array.Clear(_voxels, 0, _voxels.Length);
-        _microVoxels.Clear();
+        _proceduralGenerationEnabled = true;
+        _storage.Clear();
+        _generatedChunks.Clear();
         PhysicsGrids.Clear();
         GenerateWorld();
         WorldReloaded?.Invoke();
+        MicroVoxelsReloaded?.Invoke();
         MicroVoxelsChanged?.Invoke();
     }
 
     public void SetGenerationMetadata(WorldGenerationSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        ClearPendingChunkGeneration();
         GenerationSettings = settings.Clone();
         GenerationSettings.Validate();
         Seed = GenerationSettings.Seed;
@@ -154,7 +211,9 @@ public sealed class VoxelWorld : IVoxelWorld
 
     public int FindSurfaceY(int x, int z)
     {
-        for (int y = Height - 1; y >= 0; y--)
+        ChunkCoordinate chunk = ChunkCoordinate.FromVoxel(x, z);
+        if (!TryGetChunkVerticalBounds(chunk, out int minimumY, out int maximumY)) return MinimumY;
+        for (int y = maximumY - 1; y >= minimumY; y--)
         {
             ushort materialId = GetBlockId(x, y, z);
             if (materialId != 0 && _blocks.Get(materialId).IsCollidable)
@@ -163,12 +222,14 @@ public sealed class VoxelWorld : IVoxelWorld
             }
         }
 
-        return 0;
+        return MinimumY;
     }
 
     public int FindTopVoxelY(int x, int z)
     {
-        for (int y = Height - 1; y >= 0; y--)
+        ChunkCoordinate chunk = ChunkCoordinate.FromVoxel(x, z);
+        if (!TryGetChunkVerticalBounds(chunk, out int minimumY, out int maximumY)) return MinimumY;
+        for (int y = maximumY - 1; y >= minimumY; y--)
         {
             if (IsSolid(x, y, z))
             {
@@ -176,7 +237,7 @@ public sealed class VoxelWorld : IVoxelWorld
             }
         }
 
-        return 0;
+        return MinimumY;
     }
 
     public bool TryGetMicroVoxels(int x, int y, int z, out MicroVoxelContainer? container)
@@ -186,14 +247,14 @@ public sealed class VoxelWorld : IVoxelWorld
             container = null;
             return false;
         }
-        return _microVoxels.TryGetValue(Index(x, y, z), out container);
+        return _storage.TryGetMicroVoxels(x, y, z, out container);
     }
 
     public MicroVoxelCellSnapshot CaptureCell(int x, int y, int z)
     {
         if (!IsInside(x, y, z)) throw new ArgumentOutOfRangeException(nameof(x));
-        MicroVoxelSnapshot? micro = _microVoxels.TryGetValue(Index(x, y, z), out MicroVoxelContainer? container)
-            ? container.Snapshot()
+        MicroVoxelSnapshot? micro = _storage.TryGetMicroVoxels(x, y, z, out MicroVoxelContainer? container)
+            ? container!.Snapshot()
             : null;
         return new MicroVoxelCellSnapshot(x, y, z, GetBlockId(x, y, z), micro);
     }
@@ -201,33 +262,35 @@ public sealed class VoxelWorld : IVoxelWorld
     public bool RestoreCell(MicroVoxelCellSnapshot snapshot)
     {
         if (!IsInside(snapshot.X, snapshot.Y, snapshot.Z)) return false;
-        int index = Index(snapshot.X, snapshot.Y, snapshot.Z);
-        ushort oldBlock = _voxels[index];
-        _microVoxels.Remove(index);
-        _voxels[index] = snapshot.RegularBlockId;
+        ushort oldBlock = _storage.GetBlock(snapshot.X, snapshot.Y, snapshot.Z);
+        _storage.SetBlock(
+            snapshot.X, snapshot.Y, snapshot.Z, snapshot.RegularBlockId, out _, out _);
         if (snapshot.MicroVoxels is not null && snapshot.MicroVoxels.Boxes.Count > 0)
         {
-            _voxels[index] = 0;
-            _microVoxels[index] = new MicroVoxelContainer(snapshot.MicroVoxels);
+            _storage.SetMicroVoxels(
+                snapshot.X, snapshot.Y, snapshot.Z, new MicroVoxelContainer(snapshot.MicroVoxels));
         }
-        if (oldBlock != _voxels[index])
+        ushort newBlock = _storage.GetBlock(snapshot.X, snapshot.Y, snapshot.Z);
+        if (oldBlock != newBlock)
         {
-            VoxelChanged?.Invoke(snapshot.X, snapshot.Y, snapshot.Z, (VoxelMaterial)_voxels[index]);
-            DetailedVoxelChanged?.Invoke(new VoxelChangedEvent(snapshot.X, snapshot.Y, snapshot.Z, oldBlock, _voxels[index]));
+            VoxelChanged?.Invoke(snapshot.X, snapshot.Y, snapshot.Z, (VoxelMaterial)newBlock);
+            DetailedVoxelChanged?.Invoke(new VoxelChangedEvent(snapshot.X, snapshot.Y, snapshot.Z, oldBlock, newBlock));
         }
-        MicroVoxelsChanged?.Invoke();
+        PublishMicroVoxelCellChanged(snapshot.X, snapshot.Y, snapshot.Z);
         return true;
     }
 
     public bool SetMicroVoxels(int x, int y, int z, MicroVoxelContainer? container)
     {
         if (!IsInside(x, y, z)) return false;
-        int index = Index(x, y, z);
-        ushort oldBlock = _voxels[index];
+        ChunkCoordinate chunk = ChunkCoordinate.FromVoxel(x, z);
+        if (_proceduralGenerationEnabled) EnsureChunkGenerated(chunk);
+        else _generatedChunks.Add(chunk);
+        ushort oldBlock = _storage.GetBlock(x, y, z);
         if (container is null || container.IsEmpty)
         {
-            bool removed = _microVoxels.Remove(index);
-            if (removed) MicroVoxelsChanged?.Invoke();
+            bool removed = _storage.RemoveMicroVoxels(x, y, z);
+            if (removed) PublishMicroVoxelCellChanged(x, y, z);
             return removed;
         }
 
@@ -236,62 +299,60 @@ public sealed class VoxelWorld : IVoxelWorld
             return SetBlockId(x, y, z, fullMaterial);
         }
 
-        _voxels[index] = 0;
-        _microVoxels[index] = new MicroVoxelContainer(container.Snapshot());
+        _storage.SetMicroVoxels(x, y, z, new MicroVoxelContainer(container.Snapshot()));
         if (oldBlock != 0)
         {
             VoxelChanged?.Invoke(x, y, z, VoxelMaterial.Air);
             DetailedVoxelChanged?.Invoke(new VoxelChangedEvent(x, y, z, oldBlock, 0));
         }
-        MicroVoxelsChanged?.Invoke();
+        PublishMicroVoxelCellChanged(x, y, z);
         return true;
     }
 
     public IReadOnlyList<(int X, int Y, int Z, MicroVoxelSnapshot Snapshot)> SnapshotMicroVoxels()
     {
-        var snapshots = new List<(int X, int Y, int Z, MicroVoxelSnapshot Snapshot)>(_microVoxels.Count);
-        foreach ((int index, MicroVoxelContainer container) in _microVoxels.OrderBy(pair => pair.Key))
-        {
-            int x = index % Width;
-            int yz = index / Width;
-            int y = yz % Height;
-            int z = yz / Height;
+        var snapshots = new List<(int X, int Y, int Z, MicroVoxelSnapshot Snapshot)>(MicroVoxelContainerCount);
+        foreach ((int x, int y, int z, MicroVoxelContainer container) in _storage.EnumerateMicroVoxels())
             snapshots.Add((x, y, z, container.Snapshot()));
-        }
         return snapshots;
     }
 
     public void LoadMicroVoxels(IEnumerable<(int X, int Y, int Z, MicroVoxelSnapshot Snapshot)> snapshots)
     {
-        _microVoxels.Clear();
+        _storage.ClearMicroVoxels();
         foreach ((int x, int y, int z, MicroVoxelSnapshot snapshot) in snapshots)
         {
             if (!IsInside(x, y, z)) throw new InvalidDataException("Micro voxel cell is outside the world.");
             var container = new MicroVoxelContainer(snapshot);
             if (container.IsEmpty) continue;
-            int index = Index(x, y, z);
-            _voxels[index] = 0;
-            _microVoxels[index] = container;
+            _storage.SetMicroVoxels(x, y, z, container);
         }
+        MicroVoxelsReloaded?.Invoke();
+        MicroVoxelsChanged?.Invoke();
+    }
+
+    private void PublishMicroVoxelCellChanged(int x, int y, int z)
+    {
+        MicroVoxelCellChanged?.Invoke(x, y, z);
         MicroVoxelsChanged?.Invoke();
     }
 
     public void GetCollisionBoxes(int x, int y, int z, List<VoxelAabb> destination)
     {
         GetStaticCollisionBoxes(x, y, z, destination);
-        if (y >= 0 && y < Height && x >= 0 && x < Width && z >= 0 && z < Depth)
+        if (y >= MinimumY && y < MaximumY)
             PhysicsGrids.AppendCollisionAabbs(x, y, z, destination);
     }
 
     internal void GetStaticCollisionBoxes(int x, int y, int z, List<VoxelAabb> destination)
     {
         ArgumentNullException.ThrowIfNull(destination);
-        if (y < 0 || x < 0 || x >= Width || z < 0 || z >= Depth)
+        if (y < MinimumY)
         {
             destination.Add(new VoxelAabb(new Vector3(x, y, z), new Vector3(x + 1f, y + 1f, z + 1f), (ushort)VoxelMaterial.Bedrock));
             return;
         }
-        if (y >= Height) return;
+        if (y >= MaximumY) return;
 
         ushort regular = GetBlockId(x, y, z);
         if (regular != 0 && _blocks.Get(regular).IsCollidable)
@@ -308,6 +369,12 @@ public sealed class VoxelWorld : IVoxelWorld
     }
 
     public bool IntersectsSolid(Vector3 minimum, Vector3 maximum)
+        => IntersectsSolid(minimum, maximum, includeDynamicGrids: true);
+
+    public bool IntersectsStaticSolid(Vector3 minimum, Vector3 maximum)
+        => IntersectsSolid(minimum, maximum, includeDynamicGrids: false);
+
+    private bool IntersectsSolid(Vector3 minimum, Vector3 maximum, bool includeDynamicGrids)
     {
         const float epsilon = 0.0001f;
         int minX = (int)MathF.Floor(minimum.X);
@@ -323,7 +390,8 @@ public sealed class VoxelWorld : IVoxelWorld
         for (int x = minX; x <= maxX; x++)
         {
             boxes.Clear();
-            GetCollisionBoxes(x, y, z, boxes);
+            if (includeDynamicGrids) GetCollisionBoxes(x, y, z, boxes);
+            else GetStaticCollisionBoxes(x, y, z, boxes);
             if (boxes.Any(box => box.Intersects(minimum, maximum)))
             {
                 return true;
@@ -335,24 +403,322 @@ public sealed class VoxelWorld : IVoxelWorld
 
     private void GenerateWorld()
     {
+        _generatedChunks.Clear();
+        foreach (ChunkCoordinate chunk in ChunkCoordinate.CoveringArea(Width, Depth))
+            GenerateChunk(chunk, publishEvent: false);
+
+        if (GenerationSettings.Preset == WorldPreset.Void)
+        {
+            GenerateVoid();
+        }
+        else if (GenerationSettings.Preset == WorldPreset.Showcase)
+        {
+            BuildShowcaseFeatures();
+        }
+    }
+
+    public int EnsureChunksAround(Vector3 worldPosition, int radius = DefaultGenerationRadiusChunks)
+    {
+        ChunkCoordinate center = ChunkCoordinate.FromVoxel(
+            (int)MathF.Floor(worldPosition.X), (int)MathF.Floor(worldPosition.Z));
+        int generated = 0;
+        foreach (ChunkCoordinate chunk in ChunkCoordinate.Around(center, radius)
+                     .OrderBy(chunk => Math.Max(Math.Abs(chunk.X - center.X), Math.Abs(chunk.Z - center.Z))))
+        {
+            if (EnsureChunkGenerated(chunk)) generated++;
+        }
+        return generated;
+    }
+
+    /// <summary>
+    /// Schedules missing chunks nearest-first. Generation happens in an isolated world on
+    /// a worker thread, so terrain noise and cave construction never stall the game frame.
+    /// Completed chunks are published only by <see cref="ProcessPendingChunkGeneration"/>
+    /// on the owning thread.
+    /// </summary>
+    public int QueueChunksAround(Vector3 worldPosition, int radius = DefaultGenerationRadiusChunks)
+    {
+        ChunkCoordinate center = ChunkCoordinate.FromVoxel(
+            (int)MathF.Floor(worldPosition.X), (int)MathF.Floor(worldPosition.Z));
+        ChunkCoordinate[] wanted = ChunkCoordinate.Around(center, radius)
+            .OrderBy(chunk => Math.Max(Math.Abs(chunk.X - center.X), Math.Abs(chunk.Z - center.Z)))
+            .ToArray();
+        var wantedSet = wanted.ToHashSet();
+        // A teleport or fast flight must not leave the single terrain worker spending
+        // seconds on chunks around an old player position. Queue entries are cheap to
+        // skip; removing them from this live set also makes the pending count truthful.
+        foreach (ChunkCoordinate stale in _queuedChunkGeneration.Keys.Where(chunk => !wantedSet.Contains(chunk)))
+            _queuedChunkGeneration.TryRemove(stale, out _);
+
+        int queued = 0;
+        foreach (ChunkCoordinate chunk in wanted)
+        {
+            if (_generatedChunks.Contains(chunk) || !_queuedChunkGeneration.TryAdd(chunk, 0)) continue;
+            _pendingChunkGeneration.Enqueue(new ChunkGenerationRequest(
+                chunk,
+                GenerationSettings.Clone(),
+                _chunkGenerationVersion));
+            queued++;
+        }
+        StartChunkGenerationWorker();
+        return queued;
+    }
+
+    /// <summary>Commits at most <paramref name="maximumChunks"/> completed worker results.</summary>
+    public int ProcessPendingChunkGeneration(int maximumChunks = 1)
+    {
+        maximumChunks = Math.Max(0, maximumChunks);
+        int committed = 0;
+        while (committed < maximumChunks &&
+               _completedChunkGeneration.TryDequeue(out ChunkGenerationResult? result))
+        {
+            if (result is null) continue;
+            ChunkCoordinate coordinate = result.Coordinate;
+            if (result.Version != _chunkGenerationVersion) continue;
+            if (!_queuedChunkGeneration.TryRemove(coordinate, out _)) continue;
+            if (result.Error is not null)
+            {
+                Console.Error.WriteLine($"Chunk generation failed for {coordinate}: {result.Error.Message}");
+                continue;
+            }
+            if (result.Snapshot is not null && _generatedChunks.Add(coordinate))
+            {
+                _storage.StoreChunk(result.Snapshot);
+                ChunkGenerated?.Invoke(coordinate);
+                committed++;
+            }
+        }
+        return committed;
+    }
+
+    public bool EnsureChunkGenerated(ChunkCoordinate chunk)
+    {
+        if (_generatedChunks.Contains(chunk)) return false;
+        GenerateChunk(chunk, publishEvent: true);
+        // A direct edit may synchronously materialize a chunk that was waiting for the
+        // worker. Its eventual queued result is now obsolete and must not keep the world
+        // in a false "generation pending" state.
+        _queuedChunkGeneration.TryRemove(chunk, out _);
+        return true;
+    }
+
+    private void GenerateChunk(ChunkCoordinate chunk, bool publishEvent)
+    {
+        if (!_generatedChunks.Add(chunk)) return;
         switch (GenerationSettings.Preset)
         {
             case WorldPreset.Flat:
-                GenerateFlat();
+            case WorldPreset.Showcase:
+                GenerateFlatChunk(chunk);
                 break;
             case WorldPreset.Natural:
-                GenerateNatural(pureNature: false);
+                GenerateNaturalChunk(chunk, pureNature: false);
                 break;
             case WorldPreset.PureNature:
-                GenerateNatural(pureNature: true);
+                GenerateNaturalChunk(chunk, pureNature: true);
                 break;
             case WorldPreset.Void:
-                GenerateVoid();
-                break;
-            case WorldPreset.Showcase:
-                GenerateShowcase();
                 break;
         }
+        if (publishEvent) ChunkGenerated?.Invoke(chunk);
+    }
+
+    private void StartChunkGenerationWorker()
+    {
+        if (_pendingChunkGeneration.IsEmpty ||
+            Interlocked.CompareExchange(ref _chunkGenerationWorkerRunning, 1, 0) != 0) return;
+        BlockRegistry registry = _blocks;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                while (_pendingChunkGeneration.TryDequeue(out ChunkGenerationRequest? request))
+                {
+                    if (request is null) continue;
+                    if (request.Version != _chunkGenerationVersion ||
+                        !_queuedChunkGeneration.ContainsKey(request.Coordinate))
+                        continue;
+                    try
+                    {
+                        // The worker owns this temporary storage completely. The live
+                        // world and renderer/physics events stay on the game thread.
+                        var generator = new VoxelWorld(
+                            generate: false,
+                            registry,
+                            seed: request.Settings.Seed,
+                            generationSettings: request.Settings);
+                        generator.EnsureChunkGenerated(request.Coordinate);
+                        _completedChunkGeneration.Enqueue(new ChunkGenerationResult(
+                            request.Coordinate,
+                            generator.SnapshotChunk(request.Coordinate),
+                            request.Version,
+                            null));
+                    }
+                    catch (Exception error)
+                    {
+                        _completedChunkGeneration.Enqueue(new ChunkGenerationResult(
+                            request.Coordinate, null, request.Version, error));
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _chunkGenerationWorkerRunning, 0);
+                // Close the enqueue/worker-exit race without running more than one
+                // generator at a time.
+                if (!_pendingChunkGeneration.IsEmpty) StartChunkGenerationWorker();
+            }
+        });
+    }
+
+    private void ClearPendingChunkGeneration()
+    {
+        Interlocked.Increment(ref _chunkGenerationVersion);
+        while (_pendingChunkGeneration.TryDequeue(out _)) { }
+        while (_completedChunkGeneration.TryDequeue(out _)) { }
+        _queuedChunkGeneration.Clear();
+        // An isolated in-flight request may finish naturally, but its versioned result
+        // can no longer be committed into a reloaded/regenerated live world.
+    }
+
+    private void GenerateFlatChunk(ChunkCoordinate chunk)
+    {
+        int surfaceY = Math.Clamp(
+            GenerationSettings.Preset == WorldPreset.Showcase ? 4 : GenerationSettings.FlatSurfaceHeight,
+            MinimumY + 1, 256);
+        ushort surface = ResolveBlock(GenerationSettings.SurfaceBlockKey, VoxelMaterial.Grass);
+        ushort underground = ResolveBlock(GenerationSettings.UndergroundBlockKey, VoxelMaterial.Stone);
+        for (int z = chunk.MinimumZ; z < chunk.MinimumZ + ChunkCoordinate.Size; z++)
+        for (int x = chunk.MinimumX; x < chunk.MinimumX + ChunkCoordinate.Size; x++)
+        {
+            SetSilently(x, MinimumY, z, VoxelMaterial.Bedrock);
+            for (int y = MinimumY + 1; y < surfaceY; y++) SetSilently(x, y, z, underground);
+            SetSilently(x, surfaceY, z, surface);
+        }
+    }
+
+    private void GenerateNaturalChunk(ChunkCoordinate chunk, bool pureNature)
+    {
+        const int waterLevel = 7;
+        ushort grass = ResolveBlock("rtxsandbox:grass", VoxelMaterial.Grass);
+        ushort dirt = ResolveBlock("rtxsandbox:dirt", VoxelMaterial.Dirt);
+        ushort sand = ResolveBlock("rtxsandbox:sand", VoxelMaterial.Sand);
+        ushort snow = ResolveBlock("rtxsandbox:snow", VoxelMaterial.Snow);
+        ushort mud = ResolveBlock("rtxsandbox:swamp_mud", VoxelMaterial.Mud);
+        ushort stone = ResolveBlock("rtxsandbox:stone", VoxelMaterial.Stone);
+        ushort granite = ResolveBlock("rtxsandbox:granite", VoxelMaterial.Stone);
+        ushort limestone = ResolveBlock("rtxsandbox:limestone", VoxelMaterial.Stone);
+        ushort slate = ResolveBlock("rtxsandbox:slate", VoxelMaterial.Stone);
+        ushort volcanic = ResolveBlock("rtxsandbox:volcanic_rock", VoxelMaterial.Stone);
+
+        for (int z = chunk.MinimumZ; z < chunk.MinimumZ + ChunkCoordinate.Size; z++)
+        for (int x = chunk.MinimumX; x < chunk.MinimumX + ChunkCoordinate.Size; x++)
+        {
+            TerrainSample sample = SampleTerrain(x, z, pureNature, waterLevel);
+            if (GenerationSettings.Biome != BiomePreset.Auto)
+            {
+                sample = sample with { Biome = GenerationSettings.Biome };
+                sample = sample with
+                {
+                    Surface = SurfaceForBiome(sample, GenerationSettings.Biome, waterLevel)
+                };
+            }
+            int surface = Math.Clamp(sample.Surface, MinimumY + 4, 256);
+            int slope = TerrainSlopeAt(x, z, pureNature, waterLevel, surface);
+            ushort top = slope >= 4
+                ? sample.Geology < 0.35f ? granite : slate
+                : sample.Biome switch
+                {
+                    BiomePreset.Desert => sand,
+                    BiomePreset.Snow => snow,
+                    BiomePreset.Mountains when surface >= 18 => snow,
+                    BiomePreset.Mountains => granite,
+                    BiomePreset.Swamp => mud,
+                    _ => grass,
+                };
+            ushort subsoil = sample.Biome is BiomePreset.Desert ? sand :
+                sample.Biome is BiomePreset.Swamp ? mud : dirt;
+
+            SetSilently(x, MinimumY, z, VoxelMaterial.Bedrock);
+            for (int y = MinimumY + 1; y <= surface; y++)
+            {
+                int depth = surface - y;
+                ushort material = y == surface ? top : depth <= 3 ? subsoil :
+                    GeologicalLayer(x, y, z, surface, sample.Geology,
+                        stone, granite, limestone, slate, volcanic);
+                SetSilently(x, y, z, material);
+            }
+            for (int y = MinimumY + 4; y < surface - 3; y++)
+            {
+                float cave = FractalNoise3D(x * 0.105f, y * 0.13f, z * 0.105f, 1223);
+                float tunnel = 1f - MathF.Abs(
+                    FractalNoiseSigned(x * 0.038f + y * 0.012f, z * 0.038f - y * 0.014f, 1297));
+                if (cave * 0.76f + tunnel * 0.24f > 0.82f)
+                    SetSilently(x, y, z, VoxelMaterial.Air);
+            }
+            if (GenerationSettings.GenerateLakes)
+                for (int y = surface + 1; y <= waterLevel; y++) SetSilently(x, y, z, VoxelMaterial.Water);
+        }
+
+        if (GenerationSettings.GenerateVegetation) GenerateChunkVegetation(chunk, pureNature, waterLevel);
+    }
+
+    private int TerrainSlopeAt(int x, int z, bool pureNature, int waterLevel, int center)
+    {
+        int maximum = 0;
+        ReadOnlySpan<(int X, int Z)> offsets = stackalloc (int, int)[]
+            { (-1, 0), (1, 0), (0, -1), (0, 1) };
+        foreach ((int offsetX, int offsetZ) in offsets)
+        {
+            int neighbor = Math.Clamp(
+                SampleTerrain(x + offsetX, z + offsetZ, pureNature, waterLevel).Surface,
+                MinimumY + 4,
+                256);
+            maximum = Math.Max(maximum, Math.Abs(center - neighbor));
+        }
+        return maximum;
+    }
+
+    private void GenerateChunkVegetation(ChunkCoordinate chunk, bool pureNature, int waterLevel)
+    {
+        ushort oak = ResolveBlock("rtxsandbox:oak_log", VoxelMaterial.Wood);
+        for (int z = chunk.MinimumZ + 2; z < chunk.MinimumZ + ChunkCoordinate.Size - 2; z++)
+        for (int x = chunk.MinimumX + 2; x < chunk.MinimumX + ChunkCoordinate.Size - 2; x++)
+        {
+            uint hash = HashCoordinates(x, z);
+            if (hash % 83u != 0u) continue;
+            TerrainSample sample = SampleTerrain(x, z, pureNature, waterLevel);
+            if (sample.Biome is BiomePreset.Desert or BiomePreset.Mountains) continue;
+            int groundY = sample.Surface;
+            if (_storage.GetBlock(x, groundY, z) == 0 || _storage.GetBlock(x, groundY + 1, z) != 0) continue;
+            int trunkHeight = 3 + (int)((hash >> 8) % 3u);
+            for (int y = groundY + 1; y <= groundY + trunkHeight; y++) SetSilently(x, y, z, oak);
+            int crownY = groundY + trunkHeight;
+            for (int oz = -2; oz <= 2; oz++)
+            for (int oy = -1; oy <= 2; oy++)
+            for (int ox = -2; ox <= 2; ox++)
+            {
+                if (Math.Abs(ox) + Math.Abs(oz) + Math.Max(oy, 0) > 4) continue;
+                if (_storage.GetBlock(x + ox, crownY + oy, z + oz) == 0)
+                    SetSilently(x + ox, crownY + oy, z + oz, VoxelMaterial.Leaves);
+            }
+        }
+    }
+
+    private void BuildShowcaseFeatures()
+    {
+        for (int z = 5; z <= 17; z++)
+        for (int x = 5; x <= 17; x++)
+        {
+            SetSilently(x, 4, z, VoxelMaterial.Water);
+            if (x is 5 or 17 || z is 5 or 17) SetSilently(x, 5, z, VoxelMaterial.Marble);
+        }
+        for (int z = 7; z <= 15; z += 4)
+        for (int x = 25; x <= 41; x += 4)
+        for (int y = 5; y <= 12; y++)
+            SetSilently(x, y, z, (x + z) % 8 == 0 ? VoxelMaterial.Crystal : VoxelMaterial.Glass);
+        BuildMaterialGallery();
+        BuildLightingLab();
     }
 
     private void GenerateFlat()
@@ -513,7 +879,7 @@ public sealed class VoxelWorld : IVoxelWorld
             river,
             detail);
         int surface = SurfaceForBiome(preliminary, biome, waterLevel, height);
-        return preliminary with { Surface = Math.Clamp(surface, 3, Height - 7) };
+        return preliminary with { Surface = Math.Clamp(surface, MinimumY + 4, 256) };
     }
 
     private int SurfaceForBiome(TerrainSample sample, BiomePreset biome, int waterLevel, float? sourceHeight = null)
@@ -531,7 +897,7 @@ public sealed class VoxelWorld : IVoxelWorld
         {
             height = Lerp(height, waterLevel - 2f + sample.Detail * 0.7f, sample.River);
         }
-        return Math.Clamp((int)MathF.Round(height), 3, Height - 7);
+        return Math.Clamp((int)MathF.Round(height), MinimumY + 4, 256);
     }
 
     private BiomePreset DetermineBiome(
@@ -545,11 +911,16 @@ public sealed class VoxelWorld : IVoxelWorld
 
         if (pureNature)
         {
-            float position = x / (float)(Width - 1) + (moisture - 0.5f) * 0.16f;
+            // A broad, noise-warped climate cycle guarantees long-range biome variety
+            // without tying the result to the old 64-block prototype boundary.
+            float position = x / 2048f +
+                             FractalNoiseSigned(x * 0.004f, z * 0.004f, 3907) * 0.10f +
+                             (moisture - 0.5f) * 0.06f;
+            position -= MathF.Floor(position);
             if (position < 0.16f) return BiomePreset.Desert;
             if (position < 0.34f) return BiomePreset.Plains;
             if (position < 0.56f) return BiomePreset.Forest;
-            if (position < 0.72f) return z < Depth / 2 ? BiomePreset.BambooForest : BiomePreset.Swamp;
+            if (position < 0.72f) return temperature > 0.5f ? BiomePreset.BambooForest : BiomePreset.Swamp;
             if (position < 0.86f) return BiomePreset.Snow;
             return BiomePreset.Mountains;
         }
@@ -916,7 +1287,7 @@ public sealed class VoxelWorld : IVoxelWorld
     {
         if (IsInside(x, y, z))
         {
-            _voxels[Index(x, y, z)] = blockId;
+            _storage.SetBlock(x, y, z, blockId, out _, out _);
         }
     }
 
@@ -929,8 +1300,6 @@ public sealed class VoxelWorld : IVoxelWorld
         return value;
     }
 
-    private static int Index(int x, int y, int z) => x + Width * (y + Height * z);
-
     private readonly record struct TerrainSample(
         BiomePreset Biome,
         int Surface,
@@ -942,4 +1311,15 @@ public sealed class VoxelWorld : IVoxelWorld
         float Geology,
         float River,
         float Detail);
+
+    private sealed record ChunkGenerationRequest(
+        ChunkCoordinate Coordinate,
+        WorldGenerationSettings Settings,
+        int Version);
+
+    private sealed record ChunkGenerationResult(
+        ChunkCoordinate Coordinate,
+        VoxelChunkSnapshot? Snapshot,
+        int Version,
+        Exception? Error);
 }

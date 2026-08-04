@@ -2,10 +2,12 @@ using ImGuiNET;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 using RTXSandbox.Rendering;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace RTXSandbox.UI;
 
-internal sealed class ImGuiController : IDisposable
+internal sealed unsafe class ImGuiController : IDisposable
 {
     private const int ImDrawVertexSize = 20;
 
@@ -15,28 +17,42 @@ internal sealed class ImGuiController : IDisposable
     private readonly int _indexBuffer;
     private readonly int _fontTexture;
     private bool _disposed;
+    private static IntPtr s_imeWindowHandle;
+    private static int s_imePositionUpdateCount;
 
-    public unsafe ImGuiController()
+    internal bool ImePositionUpdated =>
+        !OperatingSystem.IsWindows() || Volatile.Read(ref s_imePositionUpdateCount) > 0;
+
+    internal bool IsImeCompositionActive => IsImeComposing();
+
+    internal bool WantsTextEntry
+    {
+        get
+        {
+            if (ImGui.GetCurrentContext() == IntPtr.Zero) return IsImeComposing();
+            return ImGui.GetIO().WantTextInput || IsImeComposing();
+        }
+    }
+
+    internal bool WantsKeyboardInput
+    {
+        get
+        {
+            if (ImGui.GetCurrentContext() == IntPtr.Zero) return IsImeComposing();
+            ImGuiIOPtr io = ImGui.GetIO();
+            return io.WantCaptureKeyboard || io.WantTextInput || IsImeComposing();
+        }
+    }
+
+    public ImGuiController(IntPtr nativeWindowHandle)
     {
         ImGui.CreateContext();
         ImGui.StyleColorsDark();
         ImGuiIOPtr io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
 
-        string[] chineseFonts =
-        {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts", "msjh.ttc"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts", "msyh.ttc"),
-        };
-        string? chineseFont = chineseFonts.FirstOrDefault(File.Exists);
-        if (chineseFont is not null)
-        {
-            io.Fonts.AddFontFromFileTTF(chineseFont, 18f, null, io.Fonts.GetGlyphRangesChineseFull());
-        }
-        else
-        {
-            io.Fonts.AddFontDefault();
-        }
+        LoadInternationalFonts(io.Fonts);
+        ConfigureIme(nativeWindowHandle);
 
         ImGuiStylePtr style = ImGui.GetStyle();
         style.WindowRounding = 14f;
@@ -122,8 +138,15 @@ internal sealed class ImGuiController : IDisposable
         io.AddKeyEvent(ImGuiKey.Backspace, keyboard.IsKeyDown(Keys.Backspace));
         io.AddKeyEvent(ImGuiKey.Delete, keyboard.IsKeyDown(Keys.Delete));
         io.AddKeyEvent(ImGuiKey.Enter, keyboard.IsKeyDown(Keys.Enter));
+        io.AddKeyEvent(ImGuiKey.Space, keyboard.IsKeyDown(Keys.Space));
+        io.AddKeyEvent(ImGuiKey.Escape, keyboard.IsKeyDown(Keys.Escape));
+        io.AddKeyEvent(ImGuiKey.Tab, keyboard.IsKeyDown(Keys.Tab));
         io.AddKeyEvent(ImGuiKey.LeftArrow, keyboard.IsKeyDown(Keys.Left));
         io.AddKeyEvent(ImGuiKey.RightArrow, keyboard.IsKeyDown(Keys.Right));
+        io.AddKeyEvent(ImGuiKey.UpArrow, keyboard.IsKeyDown(Keys.Up));
+        io.AddKeyEvent(ImGuiKey.DownArrow, keyboard.IsKeyDown(Keys.Down));
+        io.AddKeyEvent(ImGuiKey.PageUp, keyboard.IsKeyDown(Keys.PageUp));
+        io.AddKeyEvent(ImGuiKey.PageDown, keyboard.IsKeyDown(Keys.PageDown));
         io.AddKeyEvent(ImGuiKey.Home, keyboard.IsKeyDown(Keys.Home));
         io.AddKeyEvent(ImGuiKey.End, keyboard.IsKeyDown(Keys.End));
         io.AddKeyEvent(ImGuiKey.A, keyboard.IsKeyDown(Keys.A));
@@ -135,8 +158,11 @@ internal sealed class ImGuiController : IDisposable
 
     public void AddInputCharacter(uint codepoint)
     {
-        if (codepoint > 0) ImGui.GetIO().AddInputCharacter(codepoint);
+        if (IsUnicodeScalar(codepoint)) ImGui.GetIO().AddInputCharacter(codepoint);
     }
+
+    internal static bool IsUnicodeScalar(uint codepoint) =>
+        codepoint is > 0 and <= 0x10FFFF && codepoint is not (>= 0xD800 and <= 0xDFFF);
 
     public void EndFrame(int framebufferWidth, int framebufferHeight)
     {
@@ -223,6 +249,10 @@ internal sealed class ImGuiController : IDisposable
             return;
         }
         _disposed = true;
+        ImGuiPlatformIOPtr platformIO = ImGui.GetPlatformIO();
+        platformIO.Platform_SetImeDataFn = IntPtr.Zero;
+        platformIO.Platform_ImeUserData = IntPtr.Zero;
+        s_imeWindowHandle = IntPtr.Zero;
         GL.DeleteTexture(_fontTexture);
         GL.DeleteBuffer(_vertexBuffer);
         GL.DeleteBuffer(_indexBuffer);
@@ -230,6 +260,180 @@ internal sealed class ImGuiController : IDisposable
         _shader.Dispose();
         ImGui.DestroyContext();
     }
+
+    private static void LoadInternationalFonts(ImFontAtlasPtr fonts)
+    {
+        string fontDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts");
+        string? baseFont = FirstExisting(fontDirectory, "segoeui.ttf", "arial.ttf");
+        if (baseFont is null)
+        {
+            fonts.AddFontDefault();
+            return;
+        }
+
+        const float size = 18f;
+        fonts.AddFontFromFileTTF(baseFont, size, null, fonts.GetGlyphRangesDefault());
+        ImFontConfigPtr merge = ImGuiNative.ImFontConfig_ImFontConfig();
+        merge.MergeMode = true;
+        merge.PixelSnapH = true;
+        try
+        {
+            MergeFont(fonts, baseFont, size, merge, fonts.GetGlyphRangesGreek());
+            MergeFont(fonts, baseFont, size, merge, fonts.GetGlyphRangesCyrillic());
+            MergeFont(fonts, baseFont, size, merge, fonts.GetGlyphRangesThai());
+            MergeFont(fonts, baseFont, size, merge, fonts.GetGlyphRangesVietnamese());
+            string? chinese = FirstExisting(fontDirectory,
+                "NotoSansTC-VF.ttf", "msjh.ttc", "msyh.ttc");
+            string? japanese = FirstExisting(fontDirectory, "msgothic.ttc", "meiryo.ttc");
+            string? korean = FirstExisting(fontDirectory, "malgun.ttf");
+            if (chinese is not null)
+                MergeFont(fonts, chinese, size, merge, fonts.GetGlyphRangesChineseFull());
+            if (japanese is not null)
+                MergeFont(fonts, japanese, size, merge, fonts.GetGlyphRangesJapanese());
+            if (korean is not null)
+                MergeFont(fonts, korean, size, merge, fonts.GetGlyphRangesKorean());
+        }
+        finally
+        {
+            merge.Destroy();
+        }
+    }
+
+    private static void MergeFont(
+        ImFontAtlasPtr fonts,
+        string path,
+        float size,
+        ImFontConfigPtr config,
+        IntPtr ranges) => fonts.AddFontFromFileTTF(path, size, config, ranges);
+
+    private static string? FirstExisting(string directory, params string[] names) => names
+        .Select(name => Path.Combine(directory, name))
+        .FirstOrDefault(File.Exists);
+
+    private static void ConfigureIme(IntPtr nativeWindowHandle)
+    {
+        if (!OperatingSystem.IsWindows() || nativeWindowHandle == IntPtr.Zero) return;
+        s_imeWindowHandle = nativeWindowHandle;
+        Volatile.Write(ref s_imePositionUpdateCount, 0);
+        ImGuiViewportPtr viewport = ImGui.GetMainViewport();
+        viewport.PlatformHandle = nativeWindowHandle;
+        viewport.PlatformHandleRaw = nativeWindowHandle;
+        ImGuiPlatformIOPtr platformIO = ImGui.GetPlatformIO();
+        platformIO.Platform_ImeUserData = nativeWindowHandle;
+        platformIO.Platform_SetImeDataFn = (IntPtr)(delegate* unmanaged[Cdecl]<
+            void*, ImGuiViewport*, ImGuiPlatformImeData*, void>)&SetImeData;
+    }
+
+    public void HandleWindowFocusChanged(bool focused, IntPtr nativeWindowHandle)
+    {
+        if (!focused || !OperatingSystem.IsWindows() || nativeWindowHandle == IntPtr.Zero) return;
+        ImmAssociateContextEx(nativeWindowHandle, IntPtr.Zero, IaceDefault);
+        ConfigureIme(nativeWindowHandle);
+    }
+
+    private static bool IsImeComposing()
+    {
+        if (!OperatingSystem.IsWindows() || s_imeWindowHandle == IntPtr.Zero) return false;
+        IntPtr inputContext = ImmGetContext(s_imeWindowHandle);
+        if (inputContext == IntPtr.Zero) return false;
+        try
+        {
+            return ImmGetCompositionStringW(inputContext, CompositionString, IntPtr.Zero, 0) > 0;
+        }
+        finally
+        {
+            ImmReleaseContext(s_imeWindowHandle, inputContext);
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void SetImeData(
+        void* context,
+        ImGuiViewport* viewport,
+        ImGuiPlatformImeData* data)
+    {
+        if (s_imeWindowHandle == IntPtr.Zero || data is null || data->WantVisible == 0) return;
+        Interlocked.Increment(ref s_imePositionUpdateCount);
+        IntPtr inputContext = ImmGetContext(s_imeWindowHandle);
+        if (inputContext == IntPtr.Zero) return;
+        try
+        {
+            float viewportX = viewport is null ? 0f : viewport->Pos.X;
+            float viewportY = viewport is null ? 0f : viewport->Pos.Y;
+            int x = (int)MathF.Round(data->InputPos.X - viewportX);
+            int inputTop = (int)MathF.Round(data->InputPos.Y - viewportY);
+            int y = (int)MathF.Round(data->InputPos.Y - viewportY + data->InputLineHeight);
+            var composition = new CompositionForm
+            {
+                Style = CompositionFormPoint,
+                CurrentPosition = new NativePoint(x, y),
+            };
+            ImmSetCompositionWindow(inputContext, ref composition);
+            var candidate = new CandidateForm
+            {
+                Index = 0,
+                Style = CandidateFormExclude,
+                CurrentPosition = new NativePoint(x, y),
+                ExcludedArea = new NativeRectangle(x, inputTop, x + 1, y),
+            };
+            ImmSetCandidateWindow(inputContext, ref candidate);
+        }
+        finally
+        {
+            ImmReleaseContext(s_imeWindowHandle, inputContext);
+        }
+    }
+
+    private const int CompositionFormPoint = 0x0002;
+    private const int CandidateFormExclude = 0x0080;
+    private const uint CompositionString = 0x0008;
+    private const uint IaceDefault = 0x0010;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly record struct NativePoint(int X, int Y);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly record struct NativeRectangle(int Left, int Top, int Right, int Bottom);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CompositionForm
+    {
+        public int Style;
+        public NativePoint CurrentPosition;
+        public NativeRectangle Area;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CandidateForm
+    {
+        public int Index;
+        public int Style;
+        public NativePoint CurrentPosition;
+        public NativeRectangle ExcludedArea;
+    }
+
+    [DllImport("imm32.dll")]
+    private static extern IntPtr ImmGetContext(IntPtr windowHandle);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmReleaseContext(IntPtr windowHandle, IntPtr inputContext);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmSetCompositionWindow(IntPtr inputContext, ref CompositionForm form);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmSetCandidateWindow(IntPtr inputContext, ref CandidateForm form);
+
+    [DllImport("imm32.dll")]
+    private static extern int ImmGetCompositionStringW(
+        IntPtr inputContext,
+        uint index,
+        IntPtr buffer,
+        int bufferLength);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmAssociateContextEx(IntPtr windowHandle, IntPtr inputContext, uint flags);
 
     private const string VertexShaderSource = """
         #version 430 core

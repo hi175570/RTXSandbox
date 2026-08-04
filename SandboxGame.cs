@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using BepInEx.Configuration;
 using ImGuiNET;
 using OpenTK.Graphics.OpenGL4;
@@ -12,6 +13,7 @@ using RTXSandbox.ModAPI;
 using RTXSandbox.Modding;
 using RTXSandbox.Persistence;
 using RTXSandbox.Rendering;
+using RTXSandbox.Rendering.Backends;
 using RTXSandbox.UI;
 using RTXSandbox.World;
 using NumericsVector2 = System.Numerics.Vector2;
@@ -101,15 +103,38 @@ public sealed partial class SandboxGame : GameWindow
     private bool _toolboxVisible;
     private bool _worldCreationVisible;
     private bool _mainMenuVisible;
+    private bool _pauseMenuVisible;
+    private bool _modsVisible;
+    private bool _settingsOpenedFromPause;
     private string _worldNameDraft = "world1";
     private WorldGenerationSettings _worldDraft = null!;
-    private bool _confirmWorldReplacement;
+    private bool _advancedWorldCreation;
     private string _worldCreationStatus = string.Empty;
+    private string _mainMenuStatus = string.Empty;
+    private IReadOnlyList<WorldSaveSummary> _knownWorlds = Array.Empty<WorldSaveSummary>();
+    private string _selectedWorldStorage = string.Empty;
+    private string _worldRenameDraft = string.Empty;
+    private string? _deleteWorldConfirmation;
+    private string? _rebuildWorldStorage;
     private float _lastAccumulatedTime;
-    private double _titleTimer;
-    private int _framesSinceTitle;
     private string _saveStatus = "Not saved this session";
     private string _modStatus = "Configuration changes are saved by BepInEx.";
+    private ModWorkspace? _modWorkspace;
+    private IReadOnlyList<ModWorkspaceEntry> _modWorkspaceEntries = Array.Empty<ModWorkspaceEntry>();
+    private bool _modWorkspaceLoaded;
+    private string? _modSelectedPath;
+    private Task<ModCompilationResult>? _modCompilationTask;
+    private string? _modCompilationSource;
+    private string _modCompilationLog = string.Empty;
+    private bool _modEditorVisible;
+    private string? _modEditorPath;
+    private string _modEditorText = string.Empty;
+    private string _modEditorSavedText = string.Empty;
+    private string? _modMoveSource;
+    private string _modMoveDestination = string.Empty;
+    private bool _modMovePopupRequested;
+    private string? _modDeleteSource;
+    private bool _modDeletePopupRequested;
     private double _autosaveTimer;
     private string _paletteSearch = string.Empty;
     private string _paletteCategory = "All";
@@ -117,9 +142,19 @@ public sealed partial class SandboxGame : GameWindow
     private readonly List<string> _recentBlocks = new();
     private bool _favoritesOnly;
     private bool _gpuSmoke;
+    private bool _gpuSmokeUnderwater;
+    private bool _gpuSmokeIme;
+    private bool _gpuSmokePause;
+    private string _gpuSmokeShortcut = string.Empty;
+    private bool _gpuSmokeShortcutTriggered;
+    private int _pauseMenuButtonCountThisFrame;
+    private bool _hardwareSmokeEdited;
+    private bool _hardwareSmokeValidated;
+    private int _imeSmokeStage;
     private int _gpuSmokeFrames;
     private bool _debugVisible;
     private long _lastSpacePressTimestamp;
+    private ChunkCoordinate? _streamedPlayerChunk;
 
     public GameSettings Settings => _settings;
     public BlockRegistry Blocks => _blocks;
@@ -148,7 +183,7 @@ public sealed partial class SandboxGame : GameWindow
 
     private SandboxGame(GameSettings settings)
         : base(
-            new GameWindowSettings { UpdateFrequency = 120.0 },
+            new GameWindowSettings { UpdateFrequency = settings.FpsLimit },
             CreateNativeWindowSettings(settings))
     {
         _settings = settings;
@@ -163,6 +198,27 @@ public sealed partial class SandboxGame : GameWindow
         Console.WriteLine($"GPU: {rendererName}");
         Console.WriteLine($"OpenGL: {version}");
         _gpuSmoke = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE") == "1";
+        _gpuSmokeUnderwater = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_UNDERWATER") == "1";
+        _gpuSmokeIme = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_IME") == "1";
+        _gpuSmokePause = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_PAUSE_MENU") == "1";
+        _gpuSmokeShortcut = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_SHORTCUT") ?? string.Empty;
+        if (_gpuSmoke && Enum.TryParse(
+                Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEFERRED_DEBUG"),
+                ignoreCase: true, out DeferredDebugView smokeDebugView))
+            _settings.DeferredDebugView = smokeDebugView;
+        if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEFERRED_MAX_QUALITY") == "1")
+        {
+            _settings.DeferredRendererQuality = 3;
+            _settings.DeferredGBufferQuality = 3;
+            _settings.DeferredLightingQuality = 3;
+            _settings.DeferredShadowQuality = 3;
+            _settings.DeferredReflectionQuality = 3;
+            _settings.DeferredAmbientOcclusionQuality = 3;
+            _settings.DeferredWaterQuality = 3;
+            _settings.DeferredTransparencyQuality = 3;
+            _settings.DeferredFogQuality = 3;
+            _settings.DeferredPostProcessingQuality = 3;
+        }
         Console.WriteLine("操作：左鍵破壞 | 右鍵放置 | E 方塊庫 | B 建造工具 | V 精密模式 | F3 除錯資訊");
 
         GL.ClearColor(0.05f, 0.08f, 0.12f, 1f);
@@ -174,6 +230,14 @@ public sealed partial class SandboxGame : GameWindow
         _modHost = new ModHost(this, _blocks, _items, _recipes, _toolRegistry, _world);
         _modHost.RegisterService(_settings);
         _modHost.AttachApi();
+        if (Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_MOD") == "1")
+        {
+            if (!_blocks.TryGet("examplepack:cyan_lamp", out _))
+                throw new InvalidOperationException("GPU mod smoke could not find the Example Content Pack block.");
+            if (!_blocks.TryGet("examplemod:signal_block", out _))
+                throw new InvalidOperationException("GPU mod smoke loaded no block from RTX Sandbox Example Mod.");
+            Console.WriteLine("Content pack and external ModAPI registration verified.");
+        }
         _worldSaves = new WorldSaveService(
             _blocks,
             preferredSeed: _settings.WorldSeed,
@@ -196,6 +260,7 @@ public sealed partial class SandboxGame : GameWindow
             ? savedState.PlayerPosition
             : new NumericsVector3(spawnX + 0.5f, spawnY, spawnZ + 0.5f);
         _player = new PlayerController(_world, spawnPosition);
+        StreamWorldAroundPlayer();
         _player.FlightMode = _settings.StartInFlightMode;
         _player.NoClip = _settings.StartWithNoClip;
         _buildTools = new BuildToolSystem(_world, _blocks, _toolRegistry, _player.WouldIntersectBlock);
@@ -219,8 +284,7 @@ public sealed partial class SandboxGame : GameWindow
         {
             if (_blocks.TryGet(key, out BlockDefinition? recent) && recent!.IsPlaceable) _recentBlocks.Add(recent.Key);
         }
-        _physics = new VoxelPhysicsSimulator(_world, _blocks, _settings.PhysicsMode);
-        _physics.ImpactFractureEnabled = _settings.ImpactFracture;
+        _physics = new VoxelPhysicsSimulator(_world, _blocks);
         _inventory = new PlayerInventory(_items);
         if (loadedSave && savedState.Inventory.Count > 0)
         {
@@ -259,18 +323,49 @@ public sealed partial class SandboxGame : GameWindow
             _progression.Restore(savedState.CompletedObjectives, savedState.SawNight);
         }
         _camera = new Camera { FieldOfViewDegrees = _settings.FieldOfView };
-        if (_gpuSmoke)
+        if (_gpuSmokeUnderwater)
         {
+            SetUpUnderwaterSmokeScene();
+        }
+        else if (_gpuSmoke)
+        {
+            // GPU smoke uses a deterministic showcase and never saves it. Persisted user
+            // terrain/Physics Grids can otherwise make strict per-pixel evidence depend
+            // on unrelated save history. Streaming is re-queued so the test still covers
+            // asynchronous generation and renderer invalidation.
+            _world.Regenerate(new WorldGenerationSettings
+            {
+                Preset = WorldPreset.Showcase,
+                Seed = 1337,
+                FlatSurfaceHeight = 4,
+                SurfaceBlockKey = "rtxsandbox:white_concrete",
+                UndergroundBlockKey = "rtxsandbox:stone",
+                GenerateLakes = false,
+                GenerateVegetation = false,
+            });
+            _player.Teleport(new NumericsVector3(VoxelWorld.Width / 2f + 0.5f, 6.001f,
+                VoxelWorld.Depth / 2f + 8.5f));
+            _streamedPlayerChunk = null;
+            StreamWorldAroundPlayer();
             NumericsVector3 probe = _player.EyePosition + _camera.Forward * 3f;
-            int probeX = Math.Clamp((int)MathF.Floor(probe.X), 0, VoxelWorld.Width - 1);
-            int probeY = Math.Clamp((int)MathF.Floor(probe.Y), 0, VoxelWorld.Height - 1);
-            int probeZ = Math.Clamp((int)MathF.Floor(probe.Z), 0, VoxelWorld.Depth - 1);
+            int probeX = (int)MathF.Floor(probe.X);
+            int probeY = Math.Clamp((int)MathF.Floor(probe.Y), VoxelWorld.MinimumY, VoxelWorld.MaximumY - 1);
+            int probeZ = (int)MathF.Floor(probe.Z);
             var smokeMicro = new MicroVoxelContainer(2);
             smokeMicro.Fill((ushort)VoxelMaterial.Stone);
             smokeMicro.PaintCell(2, 0, 0, 0, 0);
             _world.SetMicroVoxels(probeX, probeY, probeZ, smokeMicro);
-            _world.SetBlockId(2, VoxelWorld.Height - 5, 2, (ushort)VoxelMaterial.Brick);
-            _world.SetBlockId(3, VoxelWorld.Height - 5, 2, (ushort)VoxelMaterial.Glass);
+            // Keep a second precision cell face-connected to terrain. The first cell is
+            // intentionally allowed to detach into a Physics Grid; this one proves that
+            // static micro geometry reaches the DXR static BLAS as well.
+            const int staticMicroX = 20;
+            const int staticMicroZ = 20;
+            int staticMicroY = _world.FindSurfaceY(staticMicroX, staticMicroZ) + 1;
+            _world.SetMicroVoxels(staticMicroX, staticMicroY, staticMicroZ, smokeMicro);
+            _world.SetBlockId(2, 250, 2, (ushort)VoxelMaterial.Brick);
+            _world.SetBlockId(3, 250, 2, (ushort)VoxelMaterial.Glass);
+            int glowY = Math.Clamp(_world.FindTopVoxelY(4, 2), VoxelWorld.MinimumY, 255);
+            _world.SetBlockId(4, glowY, 2, (ushort)VoxelMaterial.Glow);
             _physics.AnalyzeNow();
             if (_world.PhysicsGrids.Grids.LastOrDefault() is PhysicsGrid smokeGrid)
                 smokeGrid.AngularVelocity = new NumericsVector3(0.25f, 0.45f, 0.12f);
@@ -306,16 +401,23 @@ public sealed partial class SandboxGame : GameWindow
             ClientSize.Y,
             _settings.RenderScale,
             startupRenderer);
-        _ui = new ImGuiController();
+        if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") == "1" &&
+            _renderer.Kind != RenderBackendKind.HardwareRayTracing)
+            throw new InvalidOperationException($"Hardware RT smoke refused fallback: {_renderer.Status}");
+        _ui = new ImGuiController(GetNativeWindowHandle());
         _modHost.RegisterService(_renderer);
         _modHost.RegisterService(_ui);
         _settingsVisible = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_SETTINGS") == "1";
         _inventoryVisible = (Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_EDITOR") == "1" ||
                              Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_INVENTORY") == "1") && !_settingsVisible;
         _worldCreationVisible = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_WORLD_CREATOR") == "1" && !_settingsVisible;
+        _modsVisible = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_MODS") == "1" &&
+                       !_settingsVisible && !_worldCreationVisible;
+        _pauseMenuVisible = (_gpuSmokePause || _modsVisible) && !_settingsVisible && !_worldCreationVisible;
         if (_worldCreationVisible) _inventoryVisible = false;
         _worldDraft = _world.GenerationSettings.Clone();
         _worldNameDraft = _settings.WorldName;
+        RefreshWorldList();
         bool forceMainMenu = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_MAIN_MENU") == "1";
         _mainMenuVisible = forceMainMenu ||
                            (!_gpuSmoke && !_settingsVisible && !_inventoryVisible && !_worldCreationVisible);
@@ -323,7 +425,7 @@ public sealed partial class SandboxGame : GameWindow
         _loaded = true;
         _modHost.PublishWorldReady();
         UpdateSelection();
-        UpdateTitle(rendererName, 0.0);
+        UpdateTitle();
     }
 
     protected override void OnUpdateFrame(FrameEventArgs args)
@@ -335,6 +437,12 @@ public sealed partial class SandboxGame : GameWindow
         }
 
         HandleSystemAndRenderSettings();
+        _world.ProcessPendingChunkGeneration(maximumChunks: 1);
+        if (_ui.WantsKeyboardInput)
+        {
+            ResetMining();
+            return;
+        }
         if (!AnyInterfaceVisible())
         {
             HandleTimeControls();
@@ -349,6 +457,7 @@ public sealed partial class SandboxGame : GameWindow
 
         _clock.Update((float)args.Time);
         _modHost.Update((float)args.Time);
+        StreamWorldAroundPlayer();
         if (!_clock.Paused && _clock.CircularDistanceFrom(_lastAccumulatedTime) >= 0.012f)
         {
             _lastAccumulatedTime = _clock.TimeOfDayHours;
@@ -380,6 +489,9 @@ public sealed partial class SandboxGame : GameWindow
                        (KeyboardState.IsKeyDown(Keys.LeftControl) || KeyboardState.IsKeyDown(Keys.RightControl));
         _player.Update((float)args.Time, movement, _camera.Forward, sprint, jump, descend);
 
+        _physics.Update((float)args.Time);
+        _player.ResolveExternalPenetration((float)args.Time);
+
         NumericsVector3 attemptedPosition = _player.Position;
         if (NumericsVector3.DistanceSquared(oldPosition, attemptedPosition) > 0.0000001f)
         {
@@ -393,8 +505,6 @@ public sealed partial class SandboxGame : GameWindow
                 _player.Teleport(moveEvent.NewPosition);
             }
         }
-
-        _physics.Update((float)args.Time);
 
         _autosaveTimer += args.Time;
         if (_autosaveTimer >= _settings.AutosaveMinutes * 60.0)
@@ -500,6 +610,16 @@ public sealed partial class SandboxGame : GameWindow
         }
     }
 
+    private void StreamWorldAroundPlayer()
+    {
+        ChunkCoordinate center = ChunkCoordinate.FromVoxel(
+            (int)MathF.Floor(_player.Position.X),
+            (int)MathF.Floor(_player.Position.Z));
+        if (_streamedPlayerChunk == center) return;
+        _world.QueueChunksAround(_player.Position, VoxelWorld.DefaultGenerationRadiusChunks);
+        _streamedPlayerChunk = center;
+    }
+
     protected override void OnRenderFrame(FrameEventArgs args)
     {
         base.OnRenderFrame(args);
@@ -516,8 +636,114 @@ public sealed partial class SandboxGame : GameWindow
                 _camera,
                 RenderSelection(),
                 _clock.TimeOfDayHours,
-                _settings.PathBounces,
+                new RenderQualitySettings(
+                    _settings.PathBounces,
+                    _settings.PathSamplesPerFrame,
+                    _settings.PathMaxAccumulatedSamples,
+                    _settings.DeferredSpecularQuality,
+                    _settings.DeferredReflectionQuality,
+                    _settings.DeferredRendererQuality,
+                    _settings.DeferredGBufferQuality,
+                    _settings.DeferredLightingQuality,
+                    _settings.DeferredShadowQuality,
+                    _settings.DeferredAmbientOcclusionQuality,
+                    _settings.DeferredWaterQuality,
+                    _settings.DeferredTransparencyQuality,
+                    _settings.DeferredFogQuality,
+                    _settings.DeferredPostProcessingQuality,
+                    _settings.DeferredHdr,
+                    _settings.DeferredBloom,
+                    _settings.DeferredToneMapping,
+                    _settings.DeferredDebugView,
+                    _settings.PbrSpecularQuality,
+                    _settings.PbrReflectionQuality,
+                    _settings.ClassicLightingQuality,
+                    _settings.HardwareRayTracingQuality,
+                    _settings.HardwareRayTracingRenderStyle),
                 _settings.Exposure);
+        }
+        if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") == "1")
+        {
+            if (!_hardwareSmokeEdited &&
+                (_world.PendingChunkGenerationCount == 0 || _gpuSmokeFrames >= 35))
+            {
+                _hardwareSmokeEdited = true;
+                _settings.HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.WaxMode;
+                int editX = VoxelWorld.Width / 2;
+                int editZ = VoxelWorld.Depth / 2;
+                int editY = _world.FindSurfaceY(editX, editZ);
+                ushort previous = _world.GetBlockId(editX, editY, editZ);
+                ushort replacement = previous == (ushort)VoxelMaterial.Brick
+                    ? (ushort)VoxelMaterial.Stone
+                    : (ushort)VoxelMaterial.Brick;
+                if (!_world.SetBlockId(editX, editY, editZ, replacement))
+                    throw new InvalidOperationException("DXR smoke could not apply its deterministic world edit.");
+                // Keep the smoke Grid in the center of view without overlapping the
+                // player collider, which would push the camera away before the trace.
+                NumericsVector3 gridCenter = _player.EyePosition + _camera.Forward * 2f;
+                NumericsVector3 gridOrigin = gridCenter - new NumericsVector3(0.5f);
+                _world.PhysicsGrids.Create(new[]
+                {
+                    // Put water on the optical axis so the strict smoke test proves
+                    // that primary DXR rays execute the transmission/refraction path.
+                    new PhysicsGridElement(0, 0, 0, NumericsVector3.Zero, NumericsVector3.One,
+                        (ushort)VoxelMaterial.Water),
+                    new PhysicsGridElement(-1, 0, 0, new NumericsVector3(-0.78f, 0f, 0f),
+                        new NumericsVector3(-0.10f, 1f, 1f), (ushort)VoxelMaterial.Stone),
+                    new PhysicsGridElement(1, 0, 0, new NumericsVector3(1.10f, 0f, 0f),
+                        new NumericsVector3(1.78f, 1f, 1f), (ushort)VoxelMaterial.Glow),
+                }, gridOrigin);
+            }
+            if (_gpuSmokeFrames + 1 >= 3)
+            {
+                if (_renderer.ActiveBackend is not DxrHardwareRenderer dxr)
+                    throw new InvalidOperationException("DXR smoke lost the Hardware RT backend.");
+                bool evidenceIncomplete = dxr.TracedTriangleCount <= 0 || dxr.LastHitPixelCount <= 0 ||
+                    dxr.LastShadowRayPixelCount <= 0 || dxr.LastShadowOccludedPixelCount <= 0 ||
+                    dxr.LastReflectionRayPixelCount <= 0 || dxr.LastWaxReflectionPixelCount <= 0 ||
+                    dxr.LastTransparentHitPixelCount <= 0 || dxr.EmissiveLightCount <= 0 ||
+                    dxr.VisibleDxrChunkCount <= 0 || dxr.ViewCullingExpansion < 1.6f ||
+                    dxr.TracedPhysicsGridCount <= 0 || dxr.TracedPhysicsGridTriangleCount <= 0 ||
+                    dxr.TracedMicroVoxelTriangleCount <= 0 || dxr.DynamicTopologyBuildCount <= 0 ||
+                    dxr.LastPhysicsGridHitPixelCount <= 0 || dxr.LastTexturedHitPixelCount <= 0 ||
+                    dxr.AccelerationStructureBuildCount < 3 ||
+                    dxr.StaticAccelerationStructureBuildCount < 2 ||
+                    dxr.DynamicAccelerationStructureBuildCount < 1 || dxr.TlasUpdateCount < 1 ||
+                    dxr.LastHardwareQuality < 2 ||
+                    !dxr.GlobalRayGeometryRetained;
+                if (evidenceIncomplete && _gpuSmokeFrames + 1 >= 60)
+                    throw new InvalidOperationException(
+                        $"DXR smoke evidence incomplete: triangles={dxr.TracedTriangleCount}, hits={dxr.LastHitPixelCount}, " +
+                        $"shadow={dxr.LastShadowRayPixelCount}, occluded={dxr.LastShadowOccludedPixelCount}, reflection={dxr.LastReflectionRayPixelCount}, wax={dxr.LastWaxReflectionPixelCount}, transparent={dxr.LastTransparentHitPixelCount}, emissiveLights={dxr.EmissiveLightCount}, " +
+                        $"grids={dxr.TracedPhysicsGridCount}, gridTriangles={dxr.TracedPhysicsGridTriangleCount}, " +
+                        $"gridHits={dxr.LastPhysicsGridHitPixelCount}, texturedHits={dxr.LastTexturedHitPixelCount}, " +
+                        $"asBuilds={dxr.AccelerationStructureBuildCount}, staticBuilds={dxr.StaticAccelerationStructureBuildCount}, " +
+                        $"dynamicRefits={dxr.DynamicAccelerationStructureBuildCount}, tlasUpdates={dxr.TlasUpdateCount}, " +
+                        $"microTriangles={dxr.TracedMicroVoxelTriangleCount}, topologyBuilds={dxr.DynamicTopologyBuildCount}, visibleChunks={dxr.VisibleDxrChunkCount}, " +
+                        $"shadowCasterChunks={dxr.ShadowCasterDxrChunkCount}, quality={dxr.LastHardwareQuality}.");
+                if (!evidenceIncomplete)
+                {
+                    Console.WriteLine($"DXR evidence: tier {dxr.RaytracingTier}, triangles {dxr.TracedTriangleCount:N0}, " +
+                                  $"hit pixels {dxr.LastHitPixelCount:N0}, AS builds {dxr.AccelerationStructureBuildCount}, " +
+                                  $"static builds {dxr.StaticAccelerationStructureBuildCount}, " +
+                                   $"dynamic refits {dxr.DynamicAccelerationStructureBuildCount}, TLAS updates {dxr.TlasUpdateCount}, " +
+                                  $"last static/refit {dxr.LastStaticAccelerationStructureBuildMilliseconds:0.00}/" +
+                                  $"{dxr.LastDynamicAccelerationStructureBuildMilliseconds:0.00} ms, " +
+                                   $"quality {dxr.LastHardwareQuality}, shadow rays {dxr.LastShadowRayPixelCount:N0}, " +
+                                   $"culling expansion {dxr.ViewCullingExpansion:0.0}x, " +
+                                  $"occluded {dxr.LastShadowOccludedPixelCount:N0}, reflection rays {dxr.LastReflectionRayPixelCount:N0}, " +
+                                  $"wax reflections {dxr.LastWaxReflectionPixelCount:N0}, " +
+                                  $"transparent hits {dxr.LastTransparentHitPixelCount:N0}, emissive lights {dxr.EmissiveLightCount}, " +
+                                   $"visible chunks {dxr.VisibleDxrChunkCount}/{_world.LoadedChunkCount}, " +
+                                   $"global ray geometry {dxr.GlobalRayGeometryRetained}, " +
+                                  $"offscreen shadow casters {dxr.ShadowCasterDxrChunkCount}, " +
+                                   $"grid triangles {dxr.TracedPhysicsGridTriangleCount:N0}, micro triangles {dxr.TracedMicroVoxelTriangleCount:N0}, " +
+                                   $"topology builds {dxr.DynamicTopologyBuildCount}, grid hits {dxr.LastPhysicsGridHitPixelCount:N0}, " +
+                                      $"textured hits {dxr.LastTexturedHitPixelCount:N0}.");
+                    ValidateHardwareRtFramebuffer();
+                    _hardwareSmokeValidated = true;
+                }
+            }
         }
         _modHost.Publish(new AfterRenderEvent((float)args.Time));
 
@@ -535,6 +761,10 @@ public sealed partial class SandboxGame : GameWindow
         {
             DrawSettingsInterface();
         }
+        if (_modsVisible)
+        {
+            DrawModsInterface();
+        }
         if (_worldCreationVisible)
         {
             DrawCreateWorldInterface();
@@ -543,23 +773,217 @@ public sealed partial class SandboxGame : GameWindow
         {
             DrawMainMenu();
         }
-        _ui.EndFrame(ClientSize.X, ClientSize.Y);
-        SwapBuffers();
-        if (_gpuSmoke && ++_gpuSmokeFrames >= 3)
+        if (_pauseMenuVisible && !_settingsVisible && !_modsVisible && !_mainMenuVisible)
         {
+            DrawPauseMenu();
+        }
+        _ui.EndFrame(ClientSize.X, ClientSize.Y);
+        if (_gpuSmokePause && _gpuSmokeFrames + 1 >= 3 &&
+            (!_pauseMenuVisible || _pauseMenuButtonCountThisFrame != 8))
+            throw new InvalidOperationException(
+                $"Pause menu smoke expected 8 controls, rendered {_pauseMenuButtonCountThisFrame}.");
+        if (_gpuSmokeFrames + 1 >= 3 && !string.IsNullOrEmpty(_gpuSmokeShortcut))
+        {
+            bool stillOpen = _gpuSmokeShortcut == "inventory" ? _inventoryVisible : _settingsVisible;
+            if (!_gpuSmokeShortcutTriggered || stillOpen)
+                throw new InvalidOperationException(
+                    $"UI shortcut smoke did not close {_gpuSmokeShortcut}; triggered={_gpuSmokeShortcutTriggered}, open={stillOpen}.");
+            Console.WriteLine($"UI shortcut verified: {_gpuSmokeShortcut} closed after ImGui captured keyboard focus.");
+        }
+        if (_gpuSmokeUnderwater && _gpuSmokeFrames + 1 >= 3)
+        {
+            ValidateUnderwaterSmokeFrame();
+        }
+        if (_gpuSmoke && _gpuSmokeFrames + 1 >= 3 &&
+            _world.PendingChunkGenerationCount == 0 &&
+            _renderer.ActiveBackend is RasterVoxelRenderer deferredReady &&
+            deferredReady.PendingVisibleMeshRebuildCount == 0 &&
+            (_renderer.Kind == RenderBackendKind.DeferredLighting ||
+             _renderer.Kind == RenderBackendKind.HybridPbrRaster))
+        {
+            ValidateDeferredSmokeFrame();
+        }
+        if (_gpuSmoke && _gpuSmokeFrames + 1 >= 3 &&
+            _world.PendingChunkGenerationCount == 0 &&
+            _renderer.ActiveBackend is RasterVoxelRenderer raster &&
+            (_renderer.Kind == RenderBackendKind.Classic || _renderer.Kind == RenderBackendKind.PbrForward))
+        {
+            if (raster.VisibleChunkCount <= 0 || raster.CulledChunkCount <= 0)
+                throw new InvalidOperationException(
+                    $"Raster culling evidence incomplete: visible={raster.VisibleChunkCount}, culled={raster.CulledChunkCount}.");
+            Console.WriteLine($"Raster culling evidence: {raster.VisibleChunkCount} visible chunks, " +
+                              $"{raster.CulledChunkCount} culled chunks.");
+        }
+        SwapBuffers();
+        if (_gpuSmoke && ++_gpuSmokeFrames >= 3 &&
+            _world.PendingChunkGenerationCount == 0 &&
+            (_renderer.ActiveBackend is not RasterVoxelRenderer closingRaster ||
+             (closingRaster.Kind != RenderBackendKind.DeferredLighting &&
+              closingRaster.Kind != RenderBackendKind.HybridPbrRaster) ||
+             closingRaster.PendingVisibleMeshRebuildCount == 0) &&
+            (Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") != "1" ||
+             _hardwareSmokeValidated))
+        {
+            if (_gpuSmokeIme && (_imeSmokeStage < 3 || !_ui.ImePositionUpdated))
+                throw new InvalidOperationException("Unicode/IME smoke did not commit multilingual text or position the IME window.");
             Console.WriteLine($"GPU smoke test passed: rendered {_gpuSmokeFrames} frames with {_renderer.Name}.");
             Close();
         }
 
-        _titleTimer += args.Time;
-        _framesSinceTitle++;
-        if (_titleTimer >= 0.5)
+    }
+
+    private void SetUpUnderwaterSmokeScene()
+    {
+        _world.LoadRawData(new ushort[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth]);
+        const int centerX = VoxelWorld.Width / 2;
+        const int centerZ = VoxelWorld.Depth / 2;
+
+        // A deterministic submerged camera facing a textured, emissive wall. The scene
+        // makes a zero-distance water-ray regression produce a truly black readback.
+        for (int x = centerX - 8; x <= centerX + 8; x++)
+        for (int z = centerZ - 12; z <= centerZ + 6; z++)
+            _world.SetBlockId(x, 0, z, (ushort)VoxelMaterial.Bedrock);
+
+        for (int x = centerX - 7; x <= centerX + 7; x++)
+        for (int y = 1; y <= 8; y++)
+            _world.SetBlockId(
+                x,
+                y,
+                centerZ - 11,
+                (ushort)(((x + y) & 1) == 0 ? VoxelMaterial.Glow : VoxelMaterial.Marble));
+
+        for (int x = centerX - 7; x <= centerX + 7; x++)
+        for (int y = 1; y <= 7; y++)
+        for (int z = centerZ - 10; z <= centerZ + 5; z++)
+            _world.SetBlockId(x, y, z, (ushort)VoxelMaterial.Water);
+
+        _player.Teleport(new NumericsVector3(centerX + 0.5f, 3f, centerZ + 0.5f));
+        _player.FlightMode = true;
+        _player.NoClip = false;
+    }
+
+    private void ValidateUnderwaterSmokeFrame()
+    {
+        const int sampleSize = 64;
+        int width = Math.Min(sampleSize, Math.Max(1, ClientSize.X));
+        int height = Math.Min(sampleSize, Math.Max(1, ClientSize.Y));
+        // Sample the optical axis: every renderer points it at the submerged
+        // checker wall, while the right side may contain a uniform water surface or UI.
+        int x = Math.Clamp(ClientSize.X / 2 - width / 2, 0, Math.Max(0, ClientSize.X - width));
+        int y = Math.Clamp(ClientSize.Y / 2 - height / 2, 0, Math.Max(0, ClientSize.Y - height));
+        var pixels = new byte[width * height * 3];
+        GL.Finish();
+        GL.ReadPixels(x, y, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, pixels);
+
+        double luminance = 0.0;
+        byte minimum = byte.MaxValue;
+        byte maximum = byte.MinValue;
+        for (int index = 0; index < pixels.Length; index += 3)
         {
-            double fps = _framesSinceTitle / _titleTimer;
-            UpdateTitle(GL.GetString(StringName.Renderer) ?? "GPU", fps);
-            _titleTimer = 0.0;
-            _framesSinceTitle = 0;
+            byte red = pixels[index];
+            byte green = pixels[index + 1];
+            byte blue = pixels[index + 2];
+            byte value = (byte)Math.Clamp((int)Math.Round(red * 0.2126 + green * 0.7152 + blue * 0.0722), 0, 255);
+            luminance += value;
+            minimum = Math.Min(minimum, value);
+            maximum = Math.Max(maximum, value);
         }
+        double average = luminance / Math.Max(1, width * height);
+        if (average < 4.0 || maximum - minimum < 3)
+            throw new InvalidOperationException(
+                $"Underwater render is black or blank (average luminance {average:0.00}, range {minimum}-{maximum}).");
+        Console.WriteLine($"Underwater framebuffer passed: average luminance {average:0.00}, range {minimum}-{maximum}.");
+    }
+
+    private void ValidateHardwareRtFramebuffer()
+    {
+        const int sampleSize = 64;
+        int width = Math.Min(sampleSize, Math.Max(1, ClientSize.X));
+        int height = Math.Min(sampleSize, Math.Max(1, ClientSize.Y));
+        int x = Math.Max(0, ClientSize.X / 2 - width / 2);
+        int y = Math.Max(0, ClientSize.Y / 2 - height / 2);
+        var pixels = new byte[width * height * 3];
+        GL.Finish();
+        GL.ReadPixels(x, y, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, pixels);
+        byte minimum = byte.MaxValue;
+        byte maximum = byte.MinValue;
+        double total = 0;
+        for (int index = 0; index < pixels.Length; index += 3)
+        {
+            byte value = (byte)Math.Clamp((int)Math.Round(
+                pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722), 0, 255);
+            minimum = Math.Min(minimum, value);
+            maximum = Math.Max(maximum, value);
+            total += value;
+        }
+        double average = total / Math.Max(1, width * height);
+        if (average < 4 || maximum - minimum < 3)
+            throw new InvalidOperationException(
+                $"DXR framebuffer is black, blank, or constant (average {average:0.00}, range {minimum}-{maximum}).");
+        Console.WriteLine($"DXR OpenGL framebuffer passed: average {average:0.00}, range {minimum}-{maximum}.");
+    }
+
+    private void ValidateDeferredSmokeFrame()
+    {
+        if (_renderer.ActiveBackend is not RasterVoxelRenderer deferred ||
+            (deferred.Kind != RenderBackendKind.DeferredLighting &&
+             deferred.Kind != RenderBackendKind.HybridPbrRaster))
+            throw new InvalidOperationException("Deferred/Hybrid smoke lost its raster backend.");
+        const int requiredFeatures = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512;
+        if ((deferred.DeferredFeatureMask & requiredFeatures) != requiredFeatures ||
+            deferred.DeferredPointLightCount <= 0 || deferred.DeferredSpotLightCount <= 0 ||
+            deferred.VisibleChunkCount <= 0 || deferred.DirectionalShadowDrawCount <= 0 ||
+            deferred.DirectionalShadowMapUpdateCount <= 0 || deferred.ViewCullingExpansion < 1.6f)
+            throw new InvalidOperationException(
+                $"Deferred feature evidence incomplete: mask={deferred.DeferredFeatureMask}, " +
+                $"pointLights={deferred.DeferredPointLightCount}, spotLights={deferred.DeferredSpotLightCount}, " +
+                $"visibleChunks={deferred.VisibleChunkCount}, culledChunks={deferred.CulledChunkCount}, " +
+                $"shadowCasterChunks={deferred.ShadowCasterChunkCount}, " +
+                $"directionalShadowDraws={deferred.DirectionalShadowDrawCount}.");
+
+        (float shadowMinimum, float shadowMaximum) = deferred.ReadDirectionalShadowDepthRange(dynamicLayer: false);
+        if (shadowMinimum >= 0.9999f || shadowMaximum - shadowMinimum < 0.0001f)
+            throw new InvalidOperationException(
+                $"Deferred shadow texture is empty or constant: {shadowMinimum:0.000000}-{shadowMaximum:0.000000}.");
+        if (_world.PhysicsGrids.Count > 0 &&
+            (deferred.PhysicsGridMeshUploadCount <= 0 || deferred.DynamicShadowMapUpdateCount <= 0))
+            throw new InvalidOperationException(
+                $"Deferred Physics Grid evidence incomplete: uploads={deferred.PhysicsGridMeshUploadCount}, " +
+                $"dynamicShadowUpdates={deferred.DynamicShadowMapUpdateCount}.");
+
+        const int sampleSize = 64;
+        int width = Math.Min(sampleSize, Math.Max(1, ClientSize.X));
+        int height = Math.Min(sampleSize, Math.Max(1, ClientSize.Y));
+        int x = Math.Max(0, ClientSize.X / 2 - width / 2);
+        int y = Math.Max(0, ClientSize.Y / 2 - height / 2);
+        var pixels = new byte[width * height * 3];
+        GL.Finish();
+        GL.ReadPixels(x, y, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, pixels);
+        double sum = 0.0;
+        byte minimum = byte.MaxValue;
+        byte maximum = byte.MinValue;
+        foreach (byte value in pixels)
+        {
+            sum += value;
+            minimum = Math.Min(minimum, value);
+            maximum = Math.Max(maximum, value);
+        }
+        double average = sum / Math.Max(1, pixels.Length);
+        if (average < 4.0 || maximum - minimum < 3)
+            throw new InvalidOperationException(
+                $"Deferred framebuffer is black or blank (average {average:0.00}, range {minimum}-{maximum}).");
+        Console.WriteLine($"Deferred evidence: feature mask {deferred.DeferredFeatureMask}, " +
+                          $"point lights {deferred.DeferredPointLightCount}, spot lights {deferred.DeferredSpotLightCount}, " +
+                           $"shadow quality {_settings.DeferredShadowQuality}, " +
+                           $"culling expansion {deferred.ViewCullingExpansion:0.0}x, " +
+                           $"directional shadow draws {deferred.DirectionalShadowDrawCount}, " +
+                           $"shadow depth {shadowMinimum:0.000000}-{shadowMaximum:0.000000}, " +
+                           $"static/dynamic shadow updates {deferred.StaticShadowMapUpdateCount}/" +
+                           $"{deferred.DynamicShadowMapUpdateCount}, Grid mesh uploads {deferred.PhysicsGridMeshUploadCount}, " +
+                           $"chunks {deferred.VisibleChunkCount} visible/{deferred.CulledChunkCount} culled, " +
+                          $"offscreen shadow casters {deferred.ShadowCasterChunkCount}, " +
+                          $"debug view {_settings.DeferredDebugView}, " +
+                          $"framebuffer average {average:0.00}, range {minimum}-{maximum}.");
     }
 
     protected override void OnResize(ResizeEventArgs e)
@@ -568,6 +992,18 @@ public sealed partial class SandboxGame : GameWindow
         if (_loaded && e.Width > 0 && e.Height > 0)
         {
             _renderer.Resize(e.Width, e.Height, _settings.RenderScale);
+        }
+    }
+
+    protected override void OnFocusedChanged(FocusedChangedEventArgs e)
+    {
+        base.OnFocusedChanged(e);
+        if (!_loaded) return;
+        _ui.HandleWindowFocusChanged(e.IsFocused, GetNativeWindowHandle());
+        if (!e.IsFocused && !_gpuSmoke && !_mainMenuVisible)
+        {
+            _pauseMenuVisible = true;
+            SetMouseCaptured(false);
         }
     }
 
@@ -605,15 +1041,26 @@ public sealed partial class SandboxGame : GameWindow
         NumberOfSamples = 0,
     };
 
+    private unsafe IntPtr GetNativeWindowHandle() =>
+        OperatingSystem.IsWindows() ? GLFW.GetWin32Window(WindowPtr) : IntPtr.Zero;
+
     private void HandleSystemAndRenderSettings()
     {
-        bool typingText = _loaded && ImGui.GetCurrentContext() != IntPtr.Zero && ImGui.GetIO().WantTextInput;
-        if (KeyboardState.IsKeyPressed(Keys.Escape))
+        // ImGui captures the keyboard whenever a window is focused. That must not
+        // disable global close shortcuts; only an active IME composition owns Escape.
+        bool imeComposing = _loaded && _ui.IsImeCompositionActive;
+        bool enteringText = _loaded && _ui.WantsTextEntry;
+        bool simulateShortcut = _gpuSmoke && !_gpuSmokeShortcutTriggered &&
+                                _gpuSmokeFrames >= 1 && !string.IsNullOrEmpty(_gpuSmokeShortcut);
+        bool escapePressed = KeyboardState.IsKeyPressed(Keys.Escape) ||
+                             (simulateShortcut && _gpuSmokeShortcut == "settings");
+        if (!imeComposing && escapePressed)
         {
+            if (simulateShortcut) _gpuSmokeShortcutTriggered = true;
             if (_worldCreationVisible)
             {
                 _worldCreationVisible = false;
-                _confirmWorldReplacement = false;
+                _advancedWorldCreation = false;
             }
             else if (_inventoryVisible)
             {
@@ -626,27 +1073,45 @@ public sealed partial class SandboxGame : GameWindow
             else if (_settingsVisible)
             {
                 _settingsVisible = false;
+                if (_settingsOpenedFromPause) _pauseMenuVisible = true;
+                _settingsOpenedFromPause = false;
+            }
+            else if (_modsVisible)
+            {
+                _modsVisible = false;
+            }
+            else if (_pauseMenuVisible)
+            {
+                if (SaveWorld())
+                {
+                    _pauseMenuVisible = false;
+                }
             }
             else if (_mainMenuVisible)
             {
-                // The main menu is already the top-level screen.
+                // World selection is already the top-level screen.
             }
             else
             {
-                _settingsVisible = true;
+                _pauseMenuVisible = true;
             }
             SetMouseCaptured(!AnyInterfaceVisible());
         }
 
-        if (!typingText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible &&
-            (KeyboardState.IsKeyPressed(Keys.Tab) || KeyboardState.IsKeyPressed(Keys.I) || KeyboardState.IsKeyPressed(Keys.E)))
+        bool inventoryTogglePressed = KeyboardState.IsKeyPressed(Keys.Tab) ||
+                                      KeyboardState.IsKeyPressed(Keys.I) ||
+                                      KeyboardState.IsKeyPressed(Keys.E) ||
+                                      (simulateShortcut && _gpuSmokeShortcut == "inventory");
+        if (!enteringText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible &&
+            inventoryTogglePressed)
         {
+            if (simulateShortcut) _gpuSmokeShortcutTriggered = true;
             _inventoryVisible = !_inventoryVisible;
             if (_inventoryVisible) _toolboxVisible = false;
             SetMouseCaptured(!AnyInterfaceVisible());
         }
 
-        if (!typingText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible && KeyboardState.IsKeyPressed(Keys.B))
+        if (!enteringText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible && KeyboardState.IsKeyPressed(Keys.B))
         {
             _toolboxVisible = !_toolboxVisible;
             if (_toolboxVisible) _inventoryVisible = false;
@@ -897,7 +1362,7 @@ public sealed partial class SandboxGame : GameWindow
             _miningProgress = 0f;
         }
 
-        float speed = _settings.GameMode == GameMode.Creative ? 8f : MiningSpeedFor(definition);
+        const float speed = 8f;
         _miningProgress += deltaSeconds * speed / Math.Max(0.05f, definition.HardnessSeconds);
         if (_miningProgress < 1f)
         {
@@ -926,33 +1391,13 @@ public sealed partial class SandboxGame : GameWindow
 
         if (_world.SetBlockId(breakEvent.X, breakEvent.Y, breakEvent.Z, 0))
         {
-            bool canHarvest = CanHarvest(brokenDefinition);
-            BlockBrokenEvent broken = _modHost.Publish(new BlockBrokenEvent(
+            _modHost.Publish(new BlockBrokenEvent(
                 _world,
                 breakEvent.X,
                 breakEvent.Y,
                 breakEvent.Z,
                 brokenId,
-                canHarvest ? brokenDefinition.DropItemKey : null));
-            if (_settings.GameMode == GameMode.Survival &&
-                _settings.EnableItemDrops &&
-                !string.IsNullOrWhiteSpace(broken.DropItemKey) &&
-                broken.DropCount > 0)
-            {
-                _droppedItems.Spawn(
-                    broken.DropItemKey!,
-                    broken.DropCount,
-                    new NumericsVector3(breakEvent.X + 0.5f, breakEvent.Y + 0.55f, breakEvent.Z + 0.5f));
-            }
-            if (_settings.GameMode == GameMode.Survival &&
-                _inventory.DamageSelectedTool(1, out string? brokenToolKey) &&
-                brokenToolKey is not null)
-            {
-                string toolName = _items.TryGet(brokenToolKey, out ItemDefinition? brokenTool)
-                    ? brokenTool!.DisplayName
-                    : brokenToolKey;
-            }
-            _survival.AddExhaustion(0.018f);
+                brokenDefinition.DropItemKey));
         }
         ResetMining();
         UpdateSelection();
@@ -971,6 +1416,7 @@ public sealed partial class SandboxGame : GameWindow
         }
 
         VoxelHit hit = _selection.Value;
+        if (!PlacementRules.IsFarEnough(hit.Distance)) return;
         BlockDefinition hitDefinition = _blocks.Get(hit.MaterialId);
         (int x, int y, int z) = hitDefinition.IsReplaceable && hit.MaterialId != selectedBlock.Id
             ? (hit.X, hit.Y, hit.Z)
@@ -1000,12 +1446,7 @@ public sealed partial class SandboxGame : GameWindow
 
         if (_world.SetBlockId(x, y, z, placeEvent.NewBlockId))
         {
-            if (_settings.GameMode == GameMode.Survival)
-            {
-                _inventory.ConsumeSelected();
-            }
             _progression.NotifyBlockPlaced(_blocks.Get(placeEvent.NewBlockId));
-            _survival.AddExhaustion(0.006f);
             UpdateSelection();
         }
     }
@@ -1138,7 +1579,7 @@ public sealed partial class SandboxGame : GameWindow
     }
 
     private bool AnyInterfaceVisible() =>
-        _mainMenuVisible || _settingsVisible || _inventoryVisible || _toolboxVisible || _worldCreationVisible;
+        _mainMenuVisible || _pauseMenuVisible || _settingsVisible || _modsVisible || _inventoryVisible || _toolboxVisible || _worldCreationVisible;
 
     private void DrawHud()
     {
@@ -1160,7 +1601,7 @@ public sealed partial class SandboxGame : GameWindow
             ImGui.Text($"鏡頭 {(_player.NoClip ? "自由鏡頭" : _player.FlightMode ? "飛行（碰撞）" : "行走（碰撞）")}");
             ImGui.Text($"{_physics.BackendName} | Grid {_physics.ActiveGridCount} | " +
                        $"碰撞步 {_physics.SimulationSubstepsLastStep} | 時間 {_clock.DisplayTime}");
-            ImGui.Text($"世界 {_world.GenerationSettings.Preset} | 種子 {_world.Seed}");
+            ImGui.Text($"世界 {_world.GenerationSettings.Preset} | 種子 {_world.Seed} | Chunk {_world.LoadedChunkCount}");
             if (_microBuild.Enabled)
                 ImGui.Text($"精密網格 1/{_microBuild.GridDivisor} | {_world.MicroVoxelContainerCount:N0} cells");
             ImGui.End();
@@ -1344,7 +1785,8 @@ public sealed partial class SandboxGame : GameWindow
         NumericsVector2 center = new(ClientSize.X * 0.5f, ClientSize.Y * 0.5f);
         float size = _settings.CrosshairSize;
         float gap = MathF.Max(2f, size * 0.28f);
-        System.Numerics.Vector4 color = new(0.96f, 0.98f, 1f, _settings.CrosshairOpacity);
+        System.Numerics.Vector4 color = CrosshairColor();
+        color.W = _settings.CrosshairOpacity;
 
         ImDrawListPtr foreground = ImGui.GetForegroundDrawList();
         uint outline = ImGui.ColorConvertFloat4ToU32(new System.Numerics.Vector4(0f, 0f, 0f, _settings.CrosshairOpacity * 0.88f));
@@ -1372,11 +1814,43 @@ public sealed partial class SandboxGame : GameWindow
         foreground.AddCircleFilled(center, 0.85f, foregroundColor, 12);
     }
 
+    private System.Numerics.Vector4 CrosshairColor()
+    {
+        if (!_settings.ContextualCrosshairColor)
+            return new System.Numerics.Vector4(0.96f, 0.98f, 1f, 1f);
+        if (!_selection.HasValue)
+            return new System.Numerics.Vector4(0.62f, 0.67f, 0.72f, 1f);
+        if (MouseState.IsButtonDown(MouseButton.Right))
+            return (_gridSelection.HasValue
+                    ? _physics.CanPlaceOnGrid(_gridSelection.Value, _buildTools.SelectedBlockId)
+                    : CanQuickPlaceAtSelection())
+                ? new System.Numerics.Vector4(0.34f, 0.93f, 0.56f, 1f)
+                : new System.Numerics.Vector4(1f, 0.28f, 0.24f, 1f);
+        return _buildTools.ToolMode switch
+        {
+            EditorToolMode.SelectA or EditorToolMode.SelectB =>
+                new System.Numerics.Vector4(0.30f, 0.82f, 1f, 1f),
+            EditorToolMode.Pick => new System.Numerics.Vector4(0.72f, 0.48f, 1f, 1f),
+            EditorToolMode.BrushAdd => new System.Numerics.Vector4(0.34f, 0.93f, 0.56f, 1f),
+            EditorToolMode.GridAssign => new System.Numerics.Vector4(0.35f, 0.66f, 1f, 1f),
+            EditorToolMode.Erase or EditorToolMode.BrushErase or EditorToolMode.Explode =>
+                new System.Numerics.Vector4(1f, 0.36f, 0.24f, 1f),
+            _ => _blocks.Get(_selection.Value.MaterialId).IsUnbreakable
+                ? new System.Numerics.Vector4(1f, 0.28f, 0.24f, 1f)
+                : new System.Numerics.Vector4(1f, 0.72f, 0.24f, 1f),
+        };
+    }
+
     private bool CanQuickPlaceAtSelection()
     {
-        if (_microBuild.Enabled) return CurrentPrecisionHit().HasValue;
+        if (_microBuild.Enabled)
+        {
+            PrecisionHit? precision = CurrentPrecisionHit();
+            return precision.HasValue && PlacementRules.IsFarEnough(precision.Value.Distance);
+        }
         if (!_selection.HasValue) return false;
         VoxelHit hit = _selection.Value;
+        if (!PlacementRules.IsFarEnough(hit.Distance)) return false;
         BlockDefinition hitDefinition = _blocks.Get(hit.MaterialId);
         (int x, int y, int z) = hitDefinition.IsReplaceable && hit.MaterialId != _buildTools.SelectedBlockId
             ? (hit.X, hit.Y, hit.Z)
@@ -1459,14 +1933,21 @@ public sealed partial class SandboxGame : GameWindow
 
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 3f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 3f);
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, new System.Numerics.Vector4(0.43f, 0.43f, 0.43f, 0.99f));
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new NumericsVector2(14f, 14f));
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new NumericsVector2(8f, 8f));
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new System.Numerics.Vector4(0.36f, 0.36f, 0.36f, 0.99f));
         ImGui.PushStyleColor(ImGuiCol.Border, new System.Numerics.Vector4(0.08f, 0.08f, 0.08f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new System.Numerics.Vector4(0.24f, 0.24f, 0.24f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.FrameBg, new System.Numerics.Vector4(0.17f, 0.17f, 0.17f, 1f));
         bool open = _inventoryVisible;
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize |
                                  ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoCollapse;
         if (ImGui.Begin("##creative-inventory", ref open, flags))
         {
-            ImGui.SetCursorPosY(10f);
+            const string inventoryTitle = "方塊與物品";
+            ImGui.SetCursorPosX((ImGui.GetWindowWidth() - ImGui.CalcTextSize(inventoryTitle).X) * 0.5f);
+            ImGui.Text(inventoryTitle);
+            ImGui.Separator();
 
             IReadOnlyList<BlockDefinition> palette = _blocks.PlaceableDefinitions();
             for (int slot = 0; slot < CreativeHotbar.SlotCount; slot++)
@@ -1536,8 +2017,8 @@ public sealed partial class SandboxGame : GameWindow
             ImGui.EndChild();
         }
         ImGui.End();
-        ImGui.PopStyleColor(2);
-        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor(4);
+        ImGui.PopStyleVar(4);
 
         if (!open)
         {
@@ -1628,8 +2109,9 @@ public sealed partial class SandboxGame : GameWindow
             if (ImGui.Button("建立／重新生成世界", new NumericsVector2(205f, 34f)))
             {
                 _worldDraft = _world.GenerationSettings.Clone();
+                _worldNameDraft = NextWorldName(_knownWorlds);
                 _worldCreationStatus = string.Empty;
-                _confirmWorldReplacement = false;
+                _advancedWorldCreation = false;
                 _worldCreationVisible = true;
                 open = false;
             }
@@ -1862,12 +2344,6 @@ public sealed partial class SandboxGame : GameWindow
 
                     ImGui.Separator();
                     ImGui.TextWrapped("Structural Grid physics is part of the world: unsupported six-face components become continuous moving and rotating local grids.");
-                    bool impactFracture = _physics.ImpactFractureEnabled;
-                    if (ImGui.Checkbox("Experimental impact fracture", ref impactFracture))
-                    {
-                        _physics.ImpactFractureEnabled = impactFracture;
-                        _settings.ImpactFracture = impactFracture;
-                    }
                     ImGui.TextDisabled(_physics.Status);
                     ImGui.EndTabItem();
                 }
@@ -1877,15 +2353,17 @@ public sealed partial class SandboxGame : GameWindow
                     WorldGenerationSettings generation = _world.GenerationSettings;
                     ImGui.Text($"Preset: {generation.Preset}");
                     ImGui.Text($"Biome: {generation.Biome} | Seed: {generation.Seed}");
-                    ImGui.Text($"World size: {VoxelWorld.Width} x {VoxelWorld.Height} x {VoxelWorld.Depth}");
+                    ImGui.Text($"World: infinite X/Z, Y {VoxelWorld.MinimumY}..{VoxelWorld.MaximumY - 1}");
+                    ImGui.Text($"Loaded chunks: {_world.LoadedChunkCount:N0}");
                     ImGui.TextWrapped(WorldPresetDescription(generation.Preset));
                     ImGui.Separator();
-                    ImGui.TextWrapped("Creating a world first saves the current one, then regenerates this workspace. The previous chunk remains in the .bak backup.");
+                    ImGui.TextWrapped("Creating a world saves the current one, then opens a separate named save directory.");
                     if (ImGui.Button("Create / regenerate world", new NumericsVector2(230f, 0f)))
                     {
                         _worldDraft = generation.Clone();
+                        _worldNameDraft = NextWorldName(_knownWorlds);
                         _worldCreationStatus = string.Empty;
-                        _confirmWorldReplacement = false;
+                        _advancedWorldCreation = false;
                         _worldCreationVisible = true;
                     }
                     ImGui.SameLine();
@@ -1893,8 +2371,9 @@ public sealed partial class SandboxGame : GameWindow
                     {
                         _worldDraft = generation.Clone();
                         _worldDraft.Seed = Random.Shared.Next(int.MinValue, int.MaxValue);
+                        _worldNameDraft = NextWorldName(_knownWorlds);
                         _worldCreationStatus = string.Empty;
-                        _confirmWorldReplacement = false;
+                        _advancedWorldCreation = false;
                         _worldCreationVisible = true;
                     }
                     ImGui.Separator();
@@ -1977,40 +2456,183 @@ public sealed partial class SandboxGame : GameWindow
             ImGuiCond.Always,
             new NumericsVector2(0.5f, 0.5f));
         ImGui.SetNextWindowBgAlpha(0.82f);
-        ImGui.SetNextWindowSize(new NumericsVector2(370f, 330f), ImGuiCond.Always);
+        float menuWidth = Math.Clamp(ClientSize.X - 70f, 390f, 560f);
+        float menuHeight = Math.Clamp(ClientSize.Y - 70f, 390f, 570f);
+        ImGui.SetNextWindowSize(new NumericsVector2(menuWidth, menuHeight), ImGuiCond.Always);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 3f);
         if (ImGui.Begin("##main-menu", ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize))
         {
-            ImGui.Dummy(new NumericsVector2(0f, 18f));
+            ImGui.Dummy(new NumericsVector2(0f, 10f));
             float titleWidth = ImGui.CalcTextSize("RTX SANDBOX").X;
             ImGui.SetCursorPosX((ImGui.GetWindowWidth() - titleWidth) * 0.5f);
             ImGui.Text("RTX SANDBOX");
-            ImGui.SetCursorPosX(35f);
-            ImGui.TextDisabled("光線追蹤體素建造與物理實驗平台");
-            ImGui.Dummy(new NumericsVector2(0f, 24f));
+            string subtitle = "光線追蹤體素建造與物理實驗平台";
+            ImGui.SetCursorPosX((ImGui.GetWindowWidth() - ImGui.CalcTextSize(subtitle).X) * 0.5f);
+            ImGui.TextDisabled(subtitle);
+            ImGui.Dummy(new NumericsVector2(0f, 12f));
 
-            NumericsVector2 buttonSize = new(290f, 42f);
-            ImGui.SetCursorPosX(40f);
-            if (ImGui.Button("進入世界", buttonSize))
+            float contentWidth = ImGui.GetContentRegionAvail().X;
+            if (ImGui.Button($"繼續：{_worldSaves.DisplayName}", new NumericsVector2(contentWidth, 42f)))
             {
                 _mainMenuVisible = false;
+                _mainMenuStatus = string.Empty;
                 SetMouseCaptured(true);
             }
-            ImGui.SetCursorPosX(40f);
-            if (ImGui.Button("建立新世界", buttonSize))
+
+            ImGui.SeparatorText("世界");
+            IReadOnlyList<WorldSaveSummary> worlds = _knownWorlds;
+            float listHeight = Math.Max(92f, menuHeight - 315f);
+            if (ImGui.BeginChild("SavedWorlds", new NumericsVector2(0f, listHeight), ImGuiChildFlags.Borders))
+            {
+                if (worlds.Count == 0)
+                {
+                    ImGui.TextDisabled("尚未有保存的世界");
+                }
+                foreach (WorldSaveSummary world in worlds)
+                {
+                    bool current = string.Equals(world.StorageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase);
+                    bool selected = string.Equals(world.StorageName, _selectedWorldStorage, StringComparison.OrdinalIgnoreCase);
+                    string label = current
+                        ? $"● {world.DisplayName}##world-{world.StorageName}"
+                        : $"{world.DisplayName}##world-{world.StorageName}";
+                    if (ImGui.Selectable(label, selected, ImGuiSelectableFlags.None, new NumericsVector2(0f, 34f)))
+                    {
+                        _selectedWorldStorage = world.StorageName;
+                        _worldRenameDraft = world.DisplayName;
+                        _deleteWorldConfirmation = null;
+                    }
+                    ImGui.SameLine(Math.Max(205f, contentWidth * 0.48f));
+                    ImGui.TextDisabled(
+                        $"{WorldPresetDisplayName(world.Preset)} · Seed {world.Seed}" +
+                        (world.HasBackup ? " · 有備份" : string.Empty));
+                }
+            }
+            ImGui.EndChild();
+
+            WorldSaveSummary? selectedWorld = worlds.FirstOrDefault(world =>
+                string.Equals(world.StorageName, _selectedWorldStorage, StringComparison.OrdinalIgnoreCase));
+            if (selectedWorld is not null)
+            {
+                bool selectedCurrent = string.Equals(selectedWorld.StorageName, _worldSaves.WorldName,
+                    StringComparison.OrdinalIgnoreCase);
+                float quarter = (contentWidth - ImGui.GetStyle().ItemSpacing.X * 3f) * 0.25f;
+                if (selectedCurrent) ImGui.BeginDisabled();
+                if (ImGui.Button("開啟", new NumericsVector2(quarter, 34f))) OpenWorldFromMenu(selectedWorld.StorageName);
+                if (selectedCurrent) ImGui.EndDisabled();
+                ImGui.SameLine();
+                if (ImGui.Button("重新生成", new NumericsVector2(quarter, 34f))) BeginRebuildWorld(selectedWorld);
+                ImGui.SameLine();
+                if (ImGui.Button("重新命名", new NumericsVector2(quarter, 34f)))
+                {
+                    if (_worldSaves.TryRenameWorld(selectedWorld.StorageName, _worldRenameDraft, out string? renameError))
+                    {
+                        _mainMenuStatus = "世界名稱已更新；Seed 與世界內容沒有變更。";
+                        RefreshWorldList();
+                        if (selectedCurrent) UpdateTitle();
+                    }
+                    else _mainMenuStatus = $"重新命名失敗：{renameError}";
+                }
+                ImGui.SameLine();
+                if (selectedCurrent) ImGui.BeginDisabled();
+                string deleteLabel = _deleteWorldConfirmation == selectedWorld.StorageName ? "確認刪除" : "刪除";
+                if (ImGui.Button(deleteLabel, new NumericsVector2(quarter, 34f)))
+                {
+                    if (_deleteWorldConfirmation != selectedWorld.StorageName)
+                    {
+                        _deleteWorldConfirmation = selectedWorld.StorageName;
+                        _mainMenuStatus = "再次按下「確認刪除」才會永久刪除此世界。";
+                    }
+                    else if (_worldSaves.TryDeleteWorld(selectedWorld.StorageName, out string? deleteError))
+                    {
+                        _mainMenuStatus = $"已刪除世界「{selectedWorld.DisplayName}」。";
+                        _deleteWorldConfirmation = null;
+                        RefreshWorldList();
+                    }
+                    else _mainMenuStatus = $"刪除失敗：{deleteError}";
+                }
+                if (selectedCurrent) ImGui.EndDisabled();
+                ImGui.SetNextItemWidth(contentWidth);
+                ImGui.InputText("##world-rename", ref _worldRenameDraft, 64);
+            }
+
+            if (!string.IsNullOrWhiteSpace(_mainMenuStatus))
+                ImGui.TextWrapped(_mainMenuStatus);
+            if (ImGui.Button("建立新世界", new NumericsVector2(contentWidth, 38f)))
             {
                 _worldDraft = WorldGenerationSettings.Natural(Random.Shared.Next(int.MinValue, int.MaxValue));
-                _worldNameDraft = "新的世界";
+                _worldNameDraft = NextWorldName(worlds);
                 _worldCreationStatus = string.Empty;
+                _advancedWorldCreation = false;
                 _worldCreationVisible = true;
             }
-            ImGui.SetCursorPosX(40f);
-            if (ImGui.Button("設定", buttonSize)) _settingsVisible = true;
-            ImGui.SetCursorPosX(40f);
-            if (ImGui.Button("離開遊戲", buttonSize)) Close();
+            float halfButton = (contentWidth - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+            if (ImGui.Button("設定", new NumericsVector2(halfButton, 38f))) _settingsVisible = true;
+            ImGui.SameLine();
+            if (ImGui.Button("離開遊戲", new NumericsVector2(halfButton, 38f))) Close();
         }
         ImGui.End();
         ImGui.PopStyleVar();
+    }
+
+    private void DrawPauseMenu()
+    {
+        _pauseMenuButtonCountThisFrame = 0;
+        ImGui.SetNextWindowPos(new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y * 0.5f),
+            ImGuiCond.Always, new NumericsVector2(0.5f));
+        ImGui.SetNextWindowSize(new NumericsVector2(520f, 500f), ImGuiCond.Always);
+        ImGui.SetNextWindowBgAlpha(0.94f);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 2f);
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 1f);
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new NumericsVector2(12f, 12f));
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new System.Numerics.Vector4(0.08f, 0.09f, 0.10f, 0.96f));
+        ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.28f, 0.29f, 0.30f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0.42f, 0.44f, 0.46f, 1f));
+        if (ImGui.Begin("##pause-menu", ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize))
+        {
+            float width = ImGui.GetContentRegionAvail().X;
+            ImGui.Dummy(new NumericsVector2(0f, 10f));
+            if (PauseMenuButton("繼續遊戲", new NumericsVector2(width, 58f)))
+            {
+                _pauseMenuVisible = false;
+                SetMouseCaptured(true);
+            }
+            ImGui.Separator();
+            float half = (width - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+            if (PauseMenuButton("設定", new NumericsVector2(half, 54f)))
+            {
+                _settingsOpenedFromPause = true;
+                _settingsVisible = true;
+            }
+            ImGui.SameLine();
+            PauseMenuButton("成就", new NumericsVector2(half, 54f));
+            PauseMenuButton("統計", new NumericsVector2(half, 54f));
+            ImGui.SameLine();
+            if (PauseMenuButton("模組", new NumericsVector2(half, 54f)))
+                _modsVisible = true;
+            PauseMenuButton("語言（之後）", new NumericsVector2(half, 54f));
+            ImGui.SameLine();
+            PauseMenuButton("按鍵（之後）", new NumericsVector2(half, 54f));
+            ImGui.Separator();
+            if (PauseMenuButton("離開世界", new NumericsVector2(width, 58f)))
+            {
+                if (SaveWorld())
+                {
+                    _pauseMenuVisible = false;
+                    _settingsOpenedFromPause = false;
+                    _mainMenuVisible = true;
+                    RefreshWorldList();
+                }
+            }
+        }
+        ImGui.End();
+        ImGui.PopStyleColor(3);
+        ImGui.PopStyleVar(3);
+    }
+
+    private bool PauseMenuButton(string label, NumericsVector2 size)
+    {
+        _pauseMenuButtonCountThisFrame++;
+        return ImGui.Button(label, size);
     }
 
     private void DrawCreateWorldInterface()
@@ -2019,19 +2641,91 @@ public sealed partial class SandboxGame : GameWindow
             new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y * 0.5f),
             ImGuiCond.Always,
             new NumericsVector2(0.5f, 0.5f));
-        ImGui.SetNextWindowSize(new NumericsVector2(470f, 260f), ImGuiCond.Always);
+        float height = _advancedWorldCreation
+            ? Math.Clamp(ClientSize.Y - 50f, 440f, 650f)
+            : 285f;
+        ImGui.SetNextWindowSize(new NumericsVector2(540f, height), ImGuiCond.Always);
         bool open = _worldCreationVisible;
-        if (ImGui.Begin("建立世界", ref open, ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
+        if (ImGui.Begin(_rebuildWorldStorage is null ? "建立世界" : "重新生成世界", ref open,
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
         {
+            if (_gpuSmokeIme && _imeSmokeStage == 0)
+            {
+                ImGui.SetKeyboardFocusHere();
+                _imeSmokeStage = 1;
+            }
             ImGui.InputText("世界名稱", ref _worldNameDraft, 64);
+            if (_gpuSmokeIme && _imeSmokeStage == 1 && ImGui.IsItemActive())
+            {
+                if (!_ui.WantsKeyboardInput)
+                    throw new InvalidOperationException("Focused text input did not take keyboard ownership from gameplay.");
+                foreach (System.Text.Rune rune in "中文_日本語_한국어_ไทย_Русский".EnumerateRunes())
+                    _ui.AddInputCharacter((uint)rune.Value);
+                _imeSmokeStage = 2;
+            }
+            if (_gpuSmokeIme && _imeSmokeStage == 2 &&
+                _worldNameDraft.Contains("中文_日本語_한국어_ไทย_Русский", StringComparison.Ordinal))
+            {
+                _imeSmokeStage = 3;
+                Console.WriteLine("Unicode input, IME candidate positioning, and UI keyboard ownership verified.");
+            }
             int seed = _worldDraft.Seed;
             if (ImGui.InputInt("種子", ref seed)) _worldDraft.Seed = seed;
             ImGui.SameLine();
             if (ImGui.Button("隨機")) _worldDraft.Seed = Random.Shared.Next(int.MinValue, int.MaxValue);
-            ImGui.TextDisabled("自然世界 · 無生物 · 無建築 · 建立後可立即開始建造");
-            ImGui.Dummy(new NumericsVector2(0f, 12f));
+
+            ImGui.Checkbox("更多世界選項", ref _advancedWorldCreation);
+            if (_advancedWorldCreation)
+            {
+                ImGui.Separator();
+                int preset = (int)_worldDraft.Preset;
+                string[] presets = Enum.GetValues<WorldPreset>().Select(WorldPresetDisplayName).ToArray();
+                if (ImGui.Combo("世界模板", ref preset, presets, presets.Length))
+                {
+                    _worldDraft.Preset = (WorldPreset)preset;
+                    ApplyPresetDefaults(_worldDraft);
+                }
+                ImGui.TextWrapped(WorldPresetDescription(_worldDraft.Preset));
+
+                bool naturalOptions = _worldDraft.Preset is WorldPreset.Natural or WorldPreset.PureNature;
+                bool flatOptions = _worldDraft.Preset == WorldPreset.Flat;
+                if (!naturalOptions) ImGui.BeginDisabled();
+                int biome = (int)_worldDraft.Biome;
+                string[] biomes = Enum.GetValues<BiomePreset>().Select(BiomeDisplayName).ToArray();
+                if (ImGui.Combo("生態域", ref biome, biomes, biomes.Length))
+                    _worldDraft.Biome = (BiomePreset)biome;
+                if (!naturalOptions) ImGui.EndDisabled();
+
+                if (!flatOptions) ImGui.BeginDisabled();
+                int surfaceHeight = _worldDraft.FlatSurfaceHeight;
+                if (ImGui.SliderInt("平坦地表高度", ref surfaceHeight, VoxelWorld.MinimumY + 1, 256))
+                    _worldDraft.FlatSurfaceHeight = surfaceHeight;
+                string surfaceBlockKey = _worldDraft.SurfaceBlockKey;
+                DrawGenerationBlockPicker("地表材質", ref surfaceBlockKey);
+                _worldDraft.SurfaceBlockKey = surfaceBlockKey;
+                string undergroundBlockKey = _worldDraft.UndergroundBlockKey;
+                DrawGenerationBlockPicker("地下材質", ref undergroundBlockKey);
+                _worldDraft.UndergroundBlockKey = undergroundBlockKey;
+                if (!flatOptions) ImGui.EndDisabled();
+
+                bool supportsNatureOptions = flatOptions || naturalOptions;
+                if (!supportsNatureOptions) ImGui.BeginDisabled();
+                bool lakes = _worldDraft.GenerateLakes;
+                if (ImGui.Checkbox("生成湖泊／水系", ref lakes)) _worldDraft.GenerateLakes = lakes;
+                bool vegetation = _worldDraft.GenerateVegetation;
+                if (ImGui.Checkbox("生成樹木與植物", ref vegetation))
+                    _worldDraft.GenerateVegetation = vegetation;
+                if (!supportsNatureOptions) ImGui.EndDisabled();
+            }
+            else
+            {
+                ImGui.TextDisabled("Natural · 無生物 · 無人工建築 · 建立後直接開始建造");
+            }
+
+            ImGui.Dummy(new NumericsVector2(0f, 8f));
             if (string.IsNullOrWhiteSpace(_worldNameDraft)) ImGui.BeginDisabled();
-            if (ImGui.Button("建立", new NumericsVector2(150f, 40f))) CreateWorldFromDraft();
+            if (ImGui.Button(_rebuildWorldStorage is null ? "建立" : "覆蓋並重新生成", new NumericsVector2(180f, 40f)))
+                CreateWorldFromDraft();
             if (string.IsNullOrWhiteSpace(_worldNameDraft)) ImGui.EndDisabled();
             ImGui.SameLine();
             if (ImGui.Button("取消", new NumericsVector2(150f, 40f))) open = false;
@@ -2041,88 +2735,8 @@ public sealed partial class SandboxGame : GameWindow
         if (!open)
         {
             _worldCreationVisible = false;
-            SetMouseCaptured(!AnyInterfaceVisible());
-        }
-    }
-
-    private void DrawAdvancedCreateWorldInterface()
-    {
-        ImGui.SetNextWindowPos(
-            new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y * 0.5f),
-            ImGuiCond.Appearing,
-            new NumericsVector2(0.5f, 0.5f));
-        ImGui.SetNextWindowSize(new NumericsVector2(570f, 520f), ImGuiCond.Appearing);
-        bool open = _worldCreationVisible;
-        if (ImGui.Begin("建立世界場景", ref open, ImGuiWindowFlags.NoCollapse))
-        {
-            int preset = (int)_worldDraft.Preset;
-            string[] presets = Enum.GetNames<WorldPreset>();
-            if (ImGui.Combo("世界模板", ref preset, presets, presets.Length))
-            {
-                _worldDraft.Preset = (WorldPreset)preset;
-                ApplyPresetDefaults(_worldDraft);
-                _confirmWorldReplacement = false;
-            }
-            ImGui.TextWrapped(WorldPresetDescription(_worldDraft.Preset));
-
-            int seed = _worldDraft.Seed;
-            if (ImGui.InputInt("種子", ref seed)) _worldDraft.Seed = seed;
-            ImGui.SameLine();
-            if (ImGui.Button("隨機種子")) _worldDraft.Seed = Random.Shared.Next(int.MinValue, int.MaxValue);
-
-            bool naturalOptions = _worldDraft.Preset is WorldPreset.Natural or WorldPreset.PureNature;
-            bool flatOptions = _worldDraft.Preset == WorldPreset.Flat;
-            if (!naturalOptions) ImGui.BeginDisabled();
-            int biome = (int)_worldDraft.Biome;
-            string[] biomes = Enum.GetNames<BiomePreset>();
-            if (ImGui.Combo("生態域", ref biome, biomes, biomes.Length)) _worldDraft.Biome = (BiomePreset)biome;
-            if (!naturalOptions) ImGui.EndDisabled();
-
-            if (!flatOptions) ImGui.BeginDisabled();
-            int height = _worldDraft.FlatSurfaceHeight;
-            if (ImGui.SliderInt("平坦地表高度", ref height, 1, VoxelWorld.Height - 6))
-                _worldDraft.FlatSurfaceHeight = height;
-            string surfaceBlockKey = _worldDraft.SurfaceBlockKey;
-            DrawGenerationBlockPicker("地表材質", ref surfaceBlockKey);
-            _worldDraft.SurfaceBlockKey = surfaceBlockKey;
-            string undergroundBlockKey = _worldDraft.UndergroundBlockKey;
-            DrawGenerationBlockPicker("地下材質", ref undergroundBlockKey);
-            _worldDraft.UndergroundBlockKey = undergroundBlockKey;
-            if (!flatOptions) ImGui.EndDisabled();
-
-            bool supportsNatureOptions = flatOptions || naturalOptions;
-            if (!supportsNatureOptions) ImGui.BeginDisabled();
-            bool lakes = _worldDraft.GenerateLakes;
-            if (ImGui.Checkbox("生成湖泊／水系", ref lakes)) _worldDraft.GenerateLakes = lakes;
-            bool vegetation = _worldDraft.GenerateVegetation;
-            if (ImGui.Checkbox("生成樹木與植物", ref vegetation)) _worldDraft.GenerateVegetation = vegetation;
-            if (!supportsNatureOptions) ImGui.EndDisabled();
-
-            ImGui.Separator();
-            ImGui.Text($"世界尺寸：{VoxelWorld.Width} × {VoxelWorld.Height} × {VoxelWorld.Depth}");
-            ImGui.TextDisabled("目前是固定高度的單區域世界；更大型世界會隨 Chunk Streaming 加入。");
-            if (_worldDraft.Preset == WorldPreset.Natural)
-                ImGui.TextWrapped("自然世界只生成地形、生態材質、植物、水與洞穴，不包含村莊、道路、地牢或 NPC 建築。");
-            if (_worldDraft.Preset == WorldPreset.PureNature)
-                ImGui.TextWrapped("純自然會建立沙漠 → 草原 → 森林 → 濕地／竹林 → 雪地 → 山脈的連續過渡，並生成相連河帶。");
-
-            ImGui.Separator();
-            bool confirmation = _confirmWorldReplacement;
-            if (ImGui.Checkbox("我了解系統會先備份，然後取代目前世界", ref confirmation))
-                _confirmWorldReplacement = confirmation;
-            if (!_confirmWorldReplacement) ImGui.BeginDisabled();
-            if (ImGui.Button("建立", new NumericsVector2(130f, 36f))) CreateWorldFromDraft();
-            if (!_confirmWorldReplacement) ImGui.EndDisabled();
-            ImGui.SameLine();
-            if (ImGui.Button("取消", new NumericsVector2(130f, 36f))) open = false;
-            if (!string.IsNullOrWhiteSpace(_worldCreationStatus)) ImGui.TextWrapped(_worldCreationStatus);
-        }
-        ImGui.End();
-
-        if (!open)
-        {
-            _worldCreationVisible = false;
-            _confirmWorldReplacement = false;
+            _advancedWorldCreation = false;
+            _rebuildWorldStorage = null;
             SetMouseCaptured(!AnyInterfaceVisible());
         }
     }
@@ -2147,30 +2761,52 @@ public sealed partial class SandboxGame : GameWindow
             if (string.IsNullOrWhiteSpace(requestedName))
                 throw new InvalidOperationException("請輸入世界名稱。");
             _worldDraft.Validate();
-            SaveWorld();
-            _settings.WorldName = requestedName;
-            _settings.WorldSeed = _worldDraft.Seed;
-            _worldSaves = new WorldSaveService(
+            string storageName = _rebuildWorldStorage ?? requestedName;
+            var newWorldSaves = new WorldSaveService(
                 _blocks,
                 preferredSeed: _worldDraft.Seed,
-                worldName: requestedName);
+                worldName: storageName,
+                saveRoot: _worldSaves.WorldsRoot);
+            if (_rebuildWorldStorage is null && Directory.Exists(newWorldSaves.SaveDirectory))
+                throw new InvalidOperationException($"世界「{newWorldSaves.WorldName}」已存在，請使用另一個名稱。");
+            if (!SaveWorld())
+                throw new InvalidOperationException("目前世界無法保存，因此沒有切換到新世界。");
+
+            _settings.WorldName = newWorldSaves.WorldName;
+            _settings.WorldSeed = _worldDraft.Seed;
+            _worldSaves = newWorldSaves;
             _modHost.RegisterService(_worldSaves);
             _world.Regenerate(_worldDraft);
             _buildTools.ResetForNewWorld();
             _microBuild.ResetForNewWorld();
+            _droppedItems.Clear();
+            SeedStartingInventory();
+            _progression.Restore(Array.Empty<string>(), sawNight: false);
+            _survival.Restore(
+                PlayerSurvival.MaximumHealth,
+                PlayerSurvival.MaximumOxygen,
+                PlayerSurvival.MaximumHunger);
             _physics.RequestEvaluation();
             NumericsVector3 spawn = FindWorldSpawn();
             _player.Teleport(spawn);
+            _streamedPlayerChunk = null;
+            StreamWorldAroundPlayer();
+            _survival.SetSpawn(spawn);
             _clock.SetTime(_worldDraft.Preset == WorldPreset.Showcase ? 14f : 9f);
             _lastAccumulatedTime = _clock.TimeOfDayHours;
             _renderer.ResetAccumulation();
             UpdateSelection();
             _modHost.PublishWorldReady();
-            SaveWorld();
+            if (!SaveWorld())
+                throw new IOException("新世界已建立，但第一次保存失敗；請檢查磁碟與權限後按 F5 重試。");
+            if (!newWorldSaves.TryRenameWorld(newWorldSaves.WorldName, requestedName, out string? renameError))
+                throw new IOException($"世界已生成，但顯示名稱更新失敗：{renameError}");
             _worldCreationStatus = $"Created {_worldDraft.Preset} / {_worldDraft.Biome} with seed {_worldDraft.Seed}.";
+            _rebuildWorldStorage = null;
             _worldCreationVisible = false;
             _mainMenuVisible = false;
-            _confirmWorldReplacement = false;
+            _advancedWorldCreation = false;
+            UpdateTitle();
             SetMouseCaptured(true);
         }
         catch (Exception exception)
@@ -2178,6 +2814,92 @@ public sealed partial class SandboxGame : GameWindow
             _worldCreationStatus = $"World creation failed: {exception.Message}";
             Console.Error.WriteLine(_worldCreationStatus);
         }
+    }
+
+    private void BeginRebuildWorld(WorldSaveSummary world)
+    {
+        if (!_worldSaves.TryGetWorldGeneration(world.StorageName, out WorldGenerationSettings generation, out string? error))
+        {
+            _mainMenuStatus = $"無法讀取世界設定：{error}";
+            return;
+        }
+        _rebuildWorldStorage = world.StorageName;
+        _worldDraft = generation;
+        _worldDraft.Seed = world.Seed;
+        _worldNameDraft = world.DisplayName;
+        _advancedWorldCreation = true;
+        _worldCreationStatus = "重新生成會保留名稱與 Seed，但清除全部玩家修改並覆蓋世界。";
+        _worldCreationVisible = true;
+    }
+
+    private void OpenWorldFromMenu(string storageName)
+    {
+        if (string.Equals(storageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase))
+        {
+            _mainMenuVisible = false;
+            SetMouseCaptured(true);
+            return;
+        }
+        if (!SaveWorld())
+        {
+            _mainMenuStatus = "目前世界保存失敗，已取消切換以保護資料。";
+            return;
+        }
+
+        var selectedSaves = new WorldSaveService(
+            _blocks,
+            preferredSeed: _settings.WorldSeed,
+            worldName: storageName,
+            saveRoot: _worldSaves.WorldsRoot);
+        if (!selectedSaves.TryLoad(_world, out SavedWorldState state, out string? error))
+        {
+            _mainMenuStatus = error is null
+                ? $"找不到世界「{storageName}」的有效存檔。"
+                : $"世界載入失敗：{error}";
+            return;
+        }
+
+        _worldSaves = selectedSaves;
+        _modHost.RegisterService(_worldSaves);
+        _settings.WorldName = selectedSaves.WorldName;
+        _settings.WorldSeed = state.Seed;
+        ApplyLoadedWorldState(state);
+        _saveStatus = $"Loaded {_worldSaves.WorldName} at {DateTime.Now:HH:mm:ss}";
+            _mainMenuStatus = string.Empty;
+            _mainMenuVisible = false;
+            RefreshWorldList();
+            SetMouseCaptured(true);
+    }
+
+    private static string NextWorldName(IReadOnlyList<WorldSaveSummary> worlds)
+    {
+        var occupied = worlds.Select(world => world.StorageName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        const string baseName = "新的世界";
+        if (!occupied.Contains(baseName)) return baseName;
+        for (int suffix = 2; suffix < 10_000; suffix++)
+        {
+            string candidate = $"{baseName} {suffix}";
+            if (!occupied.Contains(candidate)) return candidate;
+        }
+        return $"{baseName} {DateTime.Now:yyyyMMdd-HHmmss}";
+    }
+
+    private void RefreshWorldList()
+    {
+        _knownWorlds = _worldSaves.DiscoverWorlds();
+        if (_knownWorlds.Count == 0)
+        {
+            _selectedWorldStorage = string.Empty;
+            return;
+        }
+        if (_knownWorlds.All(world => !string.Equals(world.StorageName, _selectedWorldStorage,
+                StringComparison.OrdinalIgnoreCase)))
+            _selectedWorldStorage = _knownWorlds.FirstOrDefault(world =>
+                string.Equals(world.StorageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase))?.StorageName
+                ?? _knownWorlds[0].StorageName;
+        WorldSaveSummary selected = _knownWorlds.First(world =>
+            string.Equals(world.StorageName, _selectedWorldStorage, StringComparison.OrdinalIgnoreCase));
+        _worldRenameDraft = selected.DisplayName;
     }
 
     private NumericsVector3 FindWorldSpawn()
@@ -2190,10 +2912,10 @@ public sealed partial class SandboxGame : GameWindow
         {
             if (radius > 0 && Math.Abs(x - centerX) != radius && Math.Abs(z - centerZ) != radius) continue;
             int surface = _world.FindSurfaceY(x, z);
-            if (surface <= 0 || surface + 2 >= VoxelWorld.Height || _world.IsFluid(x, surface + 1, z)) continue;
+            if (surface <= VoxelWorld.MinimumY || surface + 2 >= VoxelWorld.MaximumY || _world.IsFluid(x, surface + 1, z)) continue;
             return new NumericsVector3(x + 0.5f, surface + 1.001f, z + 0.5f);
         }
-        return new NumericsVector3(centerX + 0.5f, VoxelWorld.Height - 3f, centerZ + 0.5f);
+        return new NumericsVector3(centerX + 0.5f, 260f, centerZ + 0.5f);
     }
 
     private static void ApplyPresetDefaults(WorldGenerationSettings settings)
@@ -2228,6 +2950,29 @@ public sealed partial class SandboxGame : GameWindow
         WorldPreset.Void => "虛空測試：只有一座受光的 9×9 平台與天空。",
         WorldPreset.Showcase => "RTX 展示：水池、玻璃森林、材質展廳與 RGB 光照實驗室。",
         _ => preset.ToString(),
+    };
+
+    private static string WorldPresetDisplayName(WorldPreset preset) => preset switch
+    {
+        WorldPreset.Flat => "平坦",
+        WorldPreset.Natural => "自然",
+        WorldPreset.PureNature => "純自然",
+        WorldPreset.Void => "虛空測試",
+        WorldPreset.Showcase => "RTX 展示",
+        _ => preset.ToString(),
+    };
+
+    private static string BiomeDisplayName(BiomePreset biome) => biome switch
+    {
+        BiomePreset.Auto => "自動",
+        BiomePreset.Plains => "草原",
+        BiomePreset.Forest => "森林",
+        BiomePreset.BambooForest => "竹林",
+        BiomePreset.Desert => "沙漠",
+        BiomePreset.Snow => "雪地",
+        BiomePreset.Mountains => "山地",
+        BiomePreset.Swamp => "沼澤",
+        _ => biome.ToString(),
     };
 
     private string HotbarLabel(int slot)
@@ -2339,7 +3084,7 @@ public sealed partial class SandboxGame : GameWindow
     {
         System.Numerics.Vector2 center = new(ClientSize.X * 0.5f, ClientSize.Y * 0.5f);
         ImGui.SetNextWindowPos(center, ImGuiCond.FirstUseEver, new System.Numerics.Vector2(0.5f, 0.5f));
-        ImGui.SetNextWindowSize(new System.Numerics.Vector2(640f, 500f), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(680f, 640f), ImGuiCond.FirstUseEver);
 
         bool open = _settingsVisible;
         if (ImGui.Begin("RTX Sandbox 設定", ref open, ImGuiWindowFlags.NoCollapse))
@@ -2354,46 +3099,8 @@ public sealed partial class SandboxGame : GameWindow
                     DrawRendererSelector();
                     ImGui.TextDisabled("所有材質都有 Fresnel 反射；粗糙度控制反射的清晰程度。");
                     ImGui.Separator();
-                    bool pathTraceSettings = _renderer.Kind == RenderBackendKind.SoftwareRayTracing;
-                    if (!pathTraceSettings) ImGui.BeginDisabled();
-                    int bounces = _settings.PathBounces;
-                    if (ImGui.SliderInt("最大光線反彈次數", ref bounces, 1, 12))
-                    {
-                        _settings.PathBounces = bounces;
-                        _renderer.ResetAccumulation();
-                    }
-                    ImGui.TextWrapped("提高數值會增加深層反射與間接光；8～12 次的 GPU 負擔較高。");
-
-                    if (!pathTraceSettings) ImGui.EndDisabled();
-
-                    float scale = _settings.RenderScale;
-                    if (ImGui.SliderFloat("渲染比例", ref scale, 0.35f, 1f, "%.2f"))
-                    {
-                        _settings.RenderScale = scale;
-                        _renderer.Resize(ClientSize.X, ClientSize.Y, scale);
-                    }
-
-                    float exposure = _settings.Exposure;
-                    if (ImGui.SliderFloat("曝光", ref exposure, 0.35f, 3f, "%.2f"))
-                    {
-                        _settings.Exposure = exposure;
-                        _renderer.ResetAccumulation();
-                    }
-
-                    float fieldOfView = _camera.FieldOfViewDegrees;
-                    if (ImGui.SliderFloat("視野角度", ref fieldOfView, 45f, 105f, "%.0f°"))
-                    {
-                        _camera.FieldOfViewDegrees = fieldOfView;
-                        _settings.FieldOfView = fieldOfView;
-                        _renderer.ResetAccumulation();
-                    }
-
-                    bool vsync = VSync == VSyncMode.On;
-                    if (ImGui.Checkbox("VSync", ref vsync))
-                    {
-                        VSync = vsync ? VSyncMode.On : VSyncMode.Off;
-                        _settings.VSync = vsync;
-                    }
+                    DrawActivePipelineAdvancedSettings();
+                    DrawCommonPipelineSettings();
                     ImGui.EndTabItem();
                 }
 
@@ -2471,16 +3178,12 @@ public sealed partial class SandboxGame : GameWindow
                     float crosshairOpacity = _settings.CrosshairOpacity;
                     if (ImGui.SliderFloat("準星透明度", ref crosshairOpacity, 0.2f, 1f, "%.2f"))
                         _settings.CrosshairOpacity = crosshairOpacity;
+                    bool contextualCrosshair = _settings.ContextualCrosshairColor;
+                    if (ImGui.Checkbox("依操作顯示情境顏色", ref contextualCrosshair))
+                        _settings.ContextualCrosshairColor = contextualCrosshair;
 
                     ImGui.SeparatorText("結構物理");
                     ImGui.TextWrapped("六面失去支撐的結構會自動成為可移動、旋轉的局部 Grid。斜邊與斜角不傳遞支撐。此核心規則沒有關閉開關。");
-                    bool impactFracture = _physics.ImpactFractureEnabled;
-                    if (ImGui.Checkbox("實驗性撞擊二次斷裂", ref impactFracture))
-                    {
-                        _physics.ImpactFractureEnabled = impactFracture;
-                        _settings.ImpactFracture = impactFracture;
-                    }
-
                     float autosave = _settings.AutosaveMinutes;
                     if (ImGui.SliderFloat("自動保存間隔", ref autosave, 0.5f, 30f, "%.1f 分"))
                     {
@@ -2506,11 +3209,6 @@ public sealed partial class SandboxGame : GameWindow
                     ImGui.EndTabItem();
                 }
 
-                if (ImGui.BeginTabItem("模組"))
-                {
-                    DrawModsPanel();
-                    ImGui.EndTabItem();
-                }
                 ImGui.EndTabBar();
             }
 
@@ -2520,7 +3218,7 @@ public sealed partial class SandboxGame : GameWindow
                 SaveCurrentSettings();
             }
             ImGui.SameLine();
-            if (ImGui.Button("返回遊戲"))
+            if (ImGui.Button("完成"))
             {
                 open = false;
             }
@@ -2530,40 +3228,62 @@ public sealed partial class SandboxGame : GameWindow
         if (!open)
         {
             _settingsVisible = false;
+            _settingsOpenedFromPause = false;
             SetMouseCaptured(!AnyInterfaceVisible());
         }
+    }
+
+    private void DrawModsInterface()
+    {
+        ImGui.SetNextWindowPos(new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y * 0.5f),
+            ImGuiCond.Always, new NumericsVector2(0.5f));
+        ImGui.SetNextWindowSize(new NumericsVector2(
+            MathF.Min(820f, MathF.Max(620f, ClientSize.X - 40f)),
+            MathF.Min(720f, MathF.Max(560f, ClientSize.Y - 40f))), ImGuiCond.Always);
+        bool open = _modsVisible;
+        if (ImGui.Begin("模組", ref open, ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
+        {
+            DrawModsPanel();
+            ImGui.Separator();
+            if (ImGui.Button("完成", new NumericsVector2(150f, 38f))) open = false;
+        }
+        ImGui.End();
+        DrawModTextEditor();
+        if (!open) _modsVisible = false;
     }
 
     private void DrawModsPanel()
     {
         ImGui.Text(BepInExBootstrap.Started
-            ? $"BepInEx 6 CoreCLR: active ({BepInExBootstrap.LoadedPlugins.Count} loaded)"
-            : "BepInEx 6 CoreCLR: unavailable");
-        ImGui.TextDisabled("Built in: HarmonyX patching, dependency resolution, logging and persistent configuration.");
+            ? $"BepInEx 6 CoreCLR：已啟動（載入 {BepInExBootstrap.LoadedPlugins.Count} 個插件）"
+            : "BepInEx 6 CoreCLR：無法使用");
+        ImGui.TextDisabled("Loader 內建 HarmonyX 修補、相依解析、日誌與設定保存；這些不會列成 Mod。");
         if (!string.IsNullOrWhiteSpace(BepInExBootstrap.FailureMessage))
         {
             ImGui.TextWrapped(BepInExBootstrap.FailureMessage);
         }
 
-        if (ImGui.Button("Open plugin folder"))
+        if (ImGui.Button("開啟插件資料夾"))
         {
             OpenFolder(BepInExBootstrap.PluginDirectory);
         }
         ImGui.SameLine();
-        if (ImGui.Button("Open config folder"))
+        if (ImGui.Button("開啟設定資料夾"))
         {
             OpenFolder(BepInExBootstrap.ConfigDirectory);
         }
 
+        DrawModWorkspace();
+
         foreach (string error in BepInExBootstrap.DependencyErrors)
         {
-            ImGui.TextWrapped($"Dependency error: {error}");
+            ImGui.TextWrapped($"相依錯誤：{error}");
         }
 
-        ImGui.SeparatorText("Loaded plugins");
+        ImGui.SeparatorText("已載入插件");
         if (BepInExBootstrap.LoadedPlugins.Count == 0)
         {
-            ImGui.TextDisabled("No plugins loaded.");
+            ImGui.TextDisabled("目前沒有任何 Mod；本體方塊與功能不會出現在這裡。");
         }
         foreach (LoadedPluginInfo plugin in BepInExBootstrap.LoadedPlugins)
         {
@@ -2576,13 +3296,13 @@ public sealed partial class SandboxGame : GameWindow
             ImGui.TextDisabled(plugin.Location);
             if (plugin.Dependencies.Count > 0)
             {
-                ImGui.TextWrapped($"Dependencies: {string.Join(", ", plugin.Dependencies)}");
+                ImGui.TextWrapped($"相依項目：{string.Join(", ", plugin.Dependencies)}");
             }
 
             ConfigFile? config = plugin.Instance?.Config;
             if (config is null || config.Count == 0)
             {
-                ImGui.TextDisabled("This plugin has no exposed configuration entries.");
+                ImGui.TextDisabled("這個插件沒有公開設定項目。");
             }
             else
             {
@@ -2594,29 +3314,29 @@ public sealed partial class SandboxGame : GameWindow
                 }
 
                 ImGui.PushID(plugin.Guid);
-                if (ImGui.SmallButton("Save config"))
+                if (ImGui.SmallButton("保存設定"))
                 {
                     try
                     {
                         config.Save();
-                        _modStatus = $"Saved {plugin.Name} configuration.";
+                        _modStatus = $"已保存 {plugin.Name} 的設定。";
                     }
                     catch (Exception exception)
                     {
-                        _modStatus = $"Config save failed: {exception.Message}";
+                        _modStatus = $"設定保存失敗：{exception.Message}";
                     }
                 }
                 ImGui.SameLine();
-                if (ImGui.SmallButton("Reload config"))
+                if (ImGui.SmallButton("重新載入設定"))
                 {
                     try
                     {
                         config.Reload();
-                        _modStatus = $"Reloaded {plugin.Name} configuration from disk.";
+                        _modStatus = $"已從磁碟重新載入 {plugin.Name} 的設定。";
                     }
                     catch (Exception exception)
                     {
-                        _modStatus = $"Config reload failed: {exception.Message}";
+                        _modStatus = $"設定重新載入失敗：{exception.Message}";
                     }
                 }
                 ImGui.PopID();
@@ -2626,8 +3346,346 @@ public sealed partial class SandboxGame : GameWindow
 
         ImGui.Separator();
         ImGui.TextDisabled(_modStatus);
-        ImGui.TextDisabled("Restart the game after adding or removing plugin DLLs. Last forced registration wins.");
+        ImGui.TextDisabled("新增或移除插件 DLL 後請重新啟動遊戲；強制註冊以最後載入者為準。");
     }
+
+    private void DrawModWorkspace()
+    {
+        CompleteModCompilationIfReady();
+        if (!_modWorkspaceLoaded) RefreshModWorkspace();
+
+        ImGui.SeparatorText("模組工作區（右鍵操作）");
+        ImGui.TextDisabled("不會自動編譯或刪除；文字內容可使用任意副檔名，編譯目標固定為 net6.0。");
+        if (ImGui.SmallButton("重新整理")) RefreshModWorkspace();
+        ImGui.SameLine();
+        bool compilationActive = _modCompilationTask is not null;
+        if (compilationActive)
+        {
+            ImGui.TextDisabled("正在編譯；遊戲仍可繼續操作……");
+        }
+        else
+        {
+            ImGui.TextDisabled($"{_modWorkspaceEntries.Count} 個檔案；右鍵文字檔可編輯或編譯。");
+        }
+
+        if (ImGui.BeginChild("mod-workspace-files", new NumericsVector2(0f, 178f), ImGuiChildFlags.Borders))
+        {
+            if (_modWorkspaceEntries.Count == 0)
+            {
+                ImGui.TextDisabled("插件資料夾是空的。可先放入 .cs、.txt 或其他文字檔。");
+            }
+            foreach (ModWorkspaceEntry entry in _modWorkspaceEntries)
+            {
+                ImGui.PushID(entry.RelativePath);
+                string type = entry.IsText ? "文字" : "檔案";
+                string label = $"{entry.RelativePath}  [{type}，{FormatFileSize(entry.Length)}]";
+                if (ImGui.Selectable(label, string.Equals(_modSelectedPath, entry.FullPath,
+                        StringComparison.OrdinalIgnoreCase)))
+                {
+                    _modSelectedPath = entry.FullPath;
+                }
+
+                if (ImGui.BeginPopupContextItem("mod-file-context"))
+                {
+                    ImGui.TextDisabled(entry.RelativePath);
+                    if (!entry.IsText) ImGui.BeginDisabled();
+                    if (ImGui.MenuItem("編輯文字")) OpenModTextEditor(entry.FullPath);
+                    if (!entry.IsText) ImGui.EndDisabled();
+
+                    if (!entry.IsText || compilationActive) ImGui.BeginDisabled();
+                    if (ImGui.MenuItem("編譯")) StartModCompilation(entry.FullPath);
+                    if (!entry.IsText || compilationActive) ImGui.EndDisabled();
+
+                    if (compilationActive) ImGui.BeginDisabled();
+                    if (ImGui.MenuItem("移動……"))
+                    {
+                        _modMoveSource = entry.FullPath;
+                        string? directory = Path.GetDirectoryName(entry.RelativePath);
+                        _modMoveDestination = directory is null or "." ? string.Empty : directory;
+                        _modMovePopupRequested = true;
+                    }
+                    if (ImGui.MenuItem("刪除……"))
+                    {
+                        _modDeleteSource = entry.FullPath;
+                        _modDeletePopupRequested = true;
+                    }
+                    if (compilationActive) ImGui.EndDisabled();
+                    ImGui.EndPopup();
+                }
+                ImGui.PopID();
+            }
+        }
+        ImGui.EndChild();
+
+        if (_modMovePopupRequested)
+        {
+            ImGui.OpenPopup("移動模組檔案");
+            _modMovePopupRequested = false;
+        }
+        if (ImGui.BeginPopupModal("移動模組檔案", ImGuiWindowFlags.AlwaysAutoResize))
+        {
+            ImGui.TextWrapped(_modMoveSource is null
+                ? "沒有選取檔案。"
+                : Path.GetRelativePath(BepInExBootstrap.PluginDirectory, _modMoveSource));
+            ImGui.InputText("目標子資料夾", ref _modMoveDestination, 512);
+            ImGui.TextDisabled("請輸入 plugins 內的相對資料夾；不會覆寫同名檔案。");
+            if (ImGui.Button("移動", new NumericsVector2(110f, 0f)))
+            {
+                MoveModFile();
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("取消", new NumericsVector2(110f, 0f))) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+
+        if (_modDeletePopupRequested)
+        {
+            ImGui.OpenPopup("確認刪除模組檔案");
+            _modDeletePopupRequested = false;
+        }
+        if (ImGui.BeginPopupModal("確認刪除模組檔案", ImGuiWindowFlags.AlwaysAutoResize))
+        {
+            ImGui.TextWrapped(_modDeleteSource is null
+                ? "沒有選取檔案。"
+                : $"確定刪除 {Path.GetRelativePath(BepInExBootstrap.PluginDirectory, _modDeleteSource)}？");
+            ImGui.TextDisabled("確認後會移出 plugins 並保存到 BepInEx/trash，不會無提示永久清除。");
+            if (ImGui.Button("確認刪除", new NumericsVector2(120f, 0f)))
+            {
+                DeleteModFile();
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("取消", new NumericsVector2(120f, 0f))) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+
+        if (!string.IsNullOrWhiteSpace(_modCompilationLog) && ImGui.TreeNode("最近一次編譯輸出"))
+        {
+            ImGui.TextWrapped(_modCompilationLog);
+            ImGui.TreePop();
+        }
+    }
+
+    private void DrawModTextEditor()
+    {
+        if (!_modEditorVisible || _modEditorPath is null) return;
+        ImGui.SetNextWindowSize(new NumericsVector2(760f, 560f), ImGuiCond.FirstUseEver);
+        bool editorOpen = _modEditorVisible;
+        string title = $"文字編輯器 — {Path.GetFileName(_modEditorPath)}###mod-text-editor";
+        if (ImGui.Begin(title, ref editorOpen, ImGuiWindowFlags.NoCollapse))
+        {
+            ImGui.TextDisabled(Path.GetRelativePath(BepInExBootstrap.PluginDirectory, _modEditorPath));
+            bool changed = !string.Equals(_modEditorText, _modEditorSavedText, StringComparison.Ordinal);
+            if (changed) ImGui.TextColored(new System.Numerics.Vector4(1f, 0.78f, 0.2f, 1f), "尚未保存");
+            else ImGui.TextDisabled("已保存");
+
+            NumericsVector2 available = ImGui.GetContentRegionAvail();
+            float editorHeight = MathF.Max(220f, available.Y - 92f);
+            ImGui.InputTextMultiline(
+                "##mod-editor-text",
+                ref _modEditorText,
+                4u * 1024u * 1024u,
+                new NumericsVector2(-1f, editorHeight),
+                ImGuiInputTextFlags.AllowTabInput);
+
+            bool compilationActive = _modCompilationTask is not null;
+            if (compilationActive) ImGui.BeginDisabled();
+            if (ImGui.Button("保存", new NumericsVector2(105f, 0f))) SaveModEditor();
+            ImGui.SameLine();
+            if (!changed || compilationActive) ImGui.BeginDisabled();
+            if (ImGui.Button("撤銷未保存", new NumericsVector2(125f, 0f))) _modEditorText = _modEditorSavedText;
+            if (!changed || compilationActive) ImGui.EndDisabled();
+            ImGui.SameLine();
+            if (ImGui.Button("回滾上次保存", new NumericsVector2(135f, 0f)))
+                ImGui.OpenPopup("確認回滾文字");
+            if (compilationActive) ImGui.EndDisabled();
+            ImGui.SameLine();
+            if (compilationActive) ImGui.BeginDisabled();
+            if (ImGui.Button("編譯已保存版本", new NumericsVector2(155f, 0f)))
+                StartModCompilation(_modEditorPath);
+            if (compilationActive) ImGui.EndDisabled();
+
+            if (ImGui.BeginPopupModal("確認回滾文字", ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                ImGui.TextWrapped("將磁碟內容回滾到這個檔案上次保存前的備份？目前未保存文字也會被捨棄。");
+                if (ImGui.Button("確認回滾", new NumericsVector2(115f, 0f)))
+                {
+                    RollbackModEditor();
+                    ImGui.CloseCurrentPopup();
+                }
+                ImGui.SameLine();
+                if (ImGui.Button("取消", new NumericsVector2(115f, 0f))) ImGui.CloseCurrentPopup();
+                ImGui.EndPopup();
+            }
+        }
+        ImGui.End();
+        _modEditorVisible = editorOpen;
+    }
+
+    private ModWorkspace GetModWorkspace() => _modWorkspace ??= new ModWorkspace(
+        BepInExBootstrap.PluginDirectory,
+        Infrastructure.RuntimePaths.ManagedDirectory);
+
+    private void RefreshModWorkspace()
+    {
+        try
+        {
+            _modWorkspaceEntries = GetModWorkspace().EnumerateFiles();
+            _modWorkspaceLoaded = true;
+        }
+        catch (Exception exception)
+        {
+            _modWorkspaceEntries = Array.Empty<ModWorkspaceEntry>();
+            _modWorkspaceLoaded = true;
+            _modStatus = $"讀取模組工作區失敗：{exception.Message}";
+        }
+    }
+
+    private void OpenModTextEditor(string path)
+    {
+        try
+        {
+            string text = GetModWorkspace().ReadText(path);
+            _modEditorPath = path;
+            _modEditorText = text;
+            _modEditorSavedText = text;
+            _modEditorVisible = true;
+            _modSelectedPath = path;
+        }
+        catch (Exception exception)
+        {
+            _modStatus = $"開啟文字失敗：{exception.Message}";
+        }
+    }
+
+    private void SaveModEditor()
+    {
+        if (_modEditorPath is null) return;
+        try
+        {
+            string backup = GetModWorkspace().SaveText(_modEditorPath, _modEditorText);
+            _modEditorSavedText = _modEditorText;
+            _modStatus = $"已保存文字；回滾備份：{backup}";
+            RefreshModWorkspace();
+        }
+        catch (Exception exception)
+        {
+            _modStatus = $"保存文字失敗：{exception.Message}";
+        }
+    }
+
+    private void RollbackModEditor()
+    {
+        if (_modEditorPath is null) return;
+        try
+        {
+            _modEditorText = GetModWorkspace().RollbackText(_modEditorPath);
+            _modEditorSavedText = _modEditorText;
+            _modStatus = "已回滾到上次保存前的版本。";
+            RefreshModWorkspace();
+        }
+        catch (Exception exception)
+        {
+            _modStatus = $"回滾失敗：{exception.Message}";
+        }
+    }
+
+    private void StartModCompilation(string path)
+    {
+        if (_modCompilationTask is not null) return;
+        _modCompilationSource = path;
+        _modCompilationLog = string.Empty;
+        _modStatus = $"正在手動編譯 {Path.GetFileName(path)}……";
+        _modCompilationTask = Task.Run(() => GetModWorkspace().Compile(path));
+    }
+
+    private void CompleteModCompilationIfReady()
+    {
+        if (_modCompilationTask is null || !_modCompilationTask.IsCompleted) return;
+        try
+        {
+            ModCompilationResult result = _modCompilationTask.GetAwaiter().GetResult();
+            _modCompilationLog = result.Log;
+            if (result.OrganizedLooseFiles)
+            {
+                if (string.Equals(_modEditorPath, _modCompilationSource, StringComparison.OrdinalIgnoreCase))
+                    _modEditorPath = result.SourcePath;
+                _modSelectedPath = result.SourcePath;
+            }
+            _modStatus = result.Success
+                ? $"編譯完成：{result.AssemblyPath}。重新啟動遊戲後載入。"
+                : $"編譯失敗，原始碼仍保留：{result.Log}";
+        }
+        catch (Exception exception)
+        {
+            _modCompilationLog = exception.ToString();
+            _modStatus = $"編譯失敗，原始碼仍保留：{exception.Message}";
+        }
+        finally
+        {
+            _modCompilationTask = null;
+            _modCompilationSource = null;
+            RefreshModWorkspace();
+        }
+    }
+
+    private void MoveModFile()
+    {
+        if (_modMoveSource is null) return;
+        try
+        {
+            string oldPath = _modMoveSource;
+            string movedPath = GetModWorkspace().MoveToFolder(oldPath, _modMoveDestination);
+            if (string.Equals(_modEditorPath, oldPath, StringComparison.OrdinalIgnoreCase))
+                _modEditorPath = movedPath;
+            _modSelectedPath = movedPath;
+            _modStatus = $"已移動到 {Path.GetRelativePath(BepInExBootstrap.PluginDirectory, movedPath)}";
+            RefreshModWorkspace();
+        }
+        catch (Exception exception)
+        {
+            _modStatus = $"移動失敗：{exception.Message}";
+        }
+        finally
+        {
+            _modMoveSource = null;
+        }
+    }
+
+    private void DeleteModFile()
+    {
+        if (_modDeleteSource is null) return;
+        try
+        {
+            string oldPath = _modDeleteSource;
+            string trashPath = GetModWorkspace().MoveToTrash(oldPath);
+            if (string.Equals(_modEditorPath, oldPath, StringComparison.OrdinalIgnoreCase))
+            {
+                _modEditorVisible = false;
+                _modEditorPath = null;
+            }
+            if (string.Equals(_modSelectedPath, oldPath, StringComparison.OrdinalIgnoreCase))
+                _modSelectedPath = null;
+            _modStatus = $"已從 plugins 刪除；可復原檔案位於 {trashPath}";
+            RefreshModWorkspace();
+        }
+        catch (Exception exception)
+        {
+            _modStatus = $"刪除失敗：{exception.Message}";
+        }
+        finally
+        {
+            _modDeleteSource = null;
+        }
+    }
+
+    private static string FormatFileSize(long bytes) => bytes switch
+    {
+        >= 1024L * 1024L => $"{bytes / (1024f * 1024f):0.0} MiB",
+        >= 1024L => $"{bytes / 1024f:0.0} KiB",
+        _ => $"{bytes} B",
+    };
 
     private void DrawConfigEntry(LoadedPluginInfo plugin, ConfigEntryBase entry)
     {
@@ -2705,13 +3763,7 @@ public sealed partial class SandboxGame : GameWindow
     private void SeedStartingInventory()
     {
         _inventory.Restore(Array.Empty<ItemStack>());
-        if (_settings.GameMode == GameMode.Creative)
-        {
-            FillCreativeInventory();
-            return;
-        }
-
-        AddStarter("rtxsandbox:apple", 2);
+        FillCreativeInventory();
     }
 
     private void FillCreativeInventory()
@@ -2738,13 +3790,6 @@ public sealed partial class SandboxGame : GameWindow
         }
     }
 
-    private void UpdateSurvivalSettings()
-    {
-        _survival.Enabled = _settings.GameMode == GameMode.Survival &&
-                            _settings.Difficulty != GameDifficulty.Peaceful;
-        _survival.DamageMultiplier = _settings.Difficulty == GameDifficulty.Hard ? 1.5f : 1f;
-    }
-
     private void OnItemPickedUp(string itemKey, int count)
     {
         string name = _items.TryGet(itemKey, out ItemDefinition? item) ? item!.DisplayName : itemKey;
@@ -2769,10 +3814,7 @@ public sealed partial class SandboxGame : GameWindow
         }
         if (_survival.Eat(item.FoodValue, item.HealValue))
         {
-            if (_settings.GameMode == GameMode.Survival)
-            {
-                _inventory.ConsumeSelected();
-            }
+            // Legacy item hooks may still call this method, but creative inventory is unlimited.
         }
     }
 
@@ -2819,9 +3861,6 @@ public sealed partial class SandboxGame : GameWindow
         _settings.TimeOfDay = _clock.TimeOfDayHours;
         _settings.DayLengthMinutes = _clock.DayLengthMinutes;
         _settings.PauseTime = _clock.Paused;
-        _settings.GameMode = GameMode.Creative;
-        _settings.EnableItemDrops = false;
-        _settings.ImpactFracture = _physics.ImpactFractureEnabled;
         _settings.StartInFlightMode = _player.FlightMode;
         _settings.StartWithNoClip = _player.NoClip;
         _settings.SelectedBlockKey = _blocks.Get(_buildTools.SelectedBlockId).Key;
@@ -2836,7 +3875,7 @@ public sealed partial class SandboxGame : GameWindow
         _settings.Save();
     }
 
-    public void SaveWorld()
+    public bool SaveWorld()
     {
         try
         {
@@ -2852,12 +3891,15 @@ public sealed partial class SandboxGame : GameWindow
                 _progression.SawNight);
             _saveStatus = $"Saved at {DateTime.Now:HH:mm:ss}";
             _autosaveTimer = 0.0;
+            RefreshWorldList();
+            return true;
         }
         catch (Exception exception)
         {
             _saveStatus = $"Save failed: {exception.Message}";
             _autosaveTimer = 0.0;
             Console.Error.WriteLine(_saveStatus);
+            return false;
         }
     }
 
@@ -2865,24 +3907,8 @@ public sealed partial class SandboxGame : GameWindow
     {
         if (_worldSaves.TryLoad(_world, out SavedWorldState state, out string? error))
         {
-            _player.Teleport(state.PlayerPosition);
-            _inventory.Restore(state.Inventory, state.SelectedHotbarSlot);
-            if (state.Inventory.Count == 0)
-            {
-                SeedStartingInventory();
-            }
-            _survival.Restore(state.Health, state.Oxygen, state.Hunger);
-            _progression.Restore(state.CompletedObjectives, state.SawNight);
-            _microBuild.ResetForNewWorld();
-            _droppedItems.Clear();
-            _clock.SetTime(state.TimeOfDay);
-            _lastAccumulatedTime = state.TimeOfDay;
-            _renderer.ResetAccumulation();
-            _physics.RequestEvaluation();
-            _worldDraft = _world.GenerationSettings.Clone();
-            _modHost.PublishWorldReady();
+            ApplyLoadedWorldState(state);
             _saveStatus = $"Reloaded at {DateTime.Now:HH:mm:ss}";
-            _autosaveTimer = 0.0;
         }
         else
         {
@@ -2890,13 +3916,33 @@ public sealed partial class SandboxGame : GameWindow
         }
     }
 
-    private void UpdateTitle(string rendererName, double fps)
+    private void ApplyLoadedWorldState(SavedWorldState state)
     {
-        string timeState = _clock.Paused ? "paused" : $"{_clock.DayLengthMinutes:0.#}m/day";
-        string cameraMode = _player.NoClip ? "Noclip" : _player.FlightMode ? "Flight" : "Walk";
-        string selectedName = BlockDisplayName(_blocks.Get(_buildTools.SelectedBlockId));
-        Title = $"RTX Sandbox | {fps,4:0} FPS | {_renderer.AccumulatedSamples} spp | " +
-                $"{_clock.DisplayTime} {timeState} | {_world.GenerationSettings.Preset} | {ToolLabel(_buildTools.ToolMode)}：{selectedName} | {cameraMode} / Grid {_physics.ActiveGridCount} | " +
-                $"Q{_settings.PathBounces} {_settings.RenderScale * 100f:0}% | {rendererName}";
+        _player.Teleport(state.PlayerPosition);
+        _streamedPlayerChunk = null;
+        StreamWorldAroundPlayer();
+        _inventory.Restore(state.Inventory, state.SelectedHotbarSlot);
+        if (state.Inventory.Count == 0) SeedStartingInventory();
+        _survival.Restore(state.Health, state.Oxygen, state.Hunger);
+        _survival.SetSpawn(FindWorldSpawn());
+        _progression.Restore(state.CompletedObjectives, state.SawNight);
+        _buildTools.ResetForNewWorld();
+        _microBuild.ResetForNewWorld();
+        _droppedItems.Clear();
+        _clock.SetTime(state.TimeOfDay);
+        _lastAccumulatedTime = state.TimeOfDay;
+        _renderer.ResetAccumulation();
+        _physics.RequestEvaluation();
+        _worldDraft = _world.GenerationSettings.Clone();
+        _worldNameDraft = _worldSaves.DisplayName;
+        _autosaveTimer = 0.0;
+        UpdateTitle();
+        UpdateSelection();
+        _modHost.PublishWorldReady();
+    }
+
+    private void UpdateTitle()
+    {
+        Title = $"RTX Sandbox — {_worldSaves.DisplayName}";
     }
 }

@@ -4,6 +4,8 @@ namespace RTXSandbox.Rendering;
 
 internal sealed class ShaderProgram : IDisposable
 {
+    private readonly Dictionary<string, int> _uniformLocations = new(StringComparer.Ordinal);
+
     public int Handle { get; }
 
     public ShaderProgram(params (ShaderType Type, string Source)[] stages)
@@ -48,11 +50,13 @@ internal sealed class ShaderProgram : IDisposable
 
     public int Uniform(string name)
     {
+        if (_uniformLocations.TryGetValue(name, out int cached)) return cached;
         int location = GL.GetUniformLocation(Handle, name);
         if (location < 0)
         {
             throw new InvalidOperationException($"Required shader uniform '{name}' was optimized out or is missing.");
         }
+        _uniformLocations.Add(name, location);
         return location;
     }
 

@@ -6,7 +6,23 @@ RTX Sandbox hosts the BepInEx 6 CoreCLR chainloader itself. No Unity injection f
 <game directory>/BepInEx/plugins/
 ```
 
-The game currently uses BepInEx `6.0.0-be.785` on .NET 6. HarmonyX patching, plugin dependency ordering, logging and per-plugin `.cfg` files are included with the game. The in-game Mods tab lists loaded plugins and dependency failures, opens both plugin folders, and can edit/save/reload common configuration values.
+The game currently uses BepInEx `6.0.0-be.785` on .NET 6. HarmonyX patching, plugin dependency ordering, logging and per-plugin `.cfg` files are included with the game. The in-game Mods page lists loaded plugins and dependency failures, opens both plugin folders, and can edit/save/reload common configuration values.
+
+## In-game manual workspace
+
+The Mods page also contains a player-driven file workspace. It never watches or automatically compiles files. Right-click a file to edit text, compile, move, or delete it; delete always asks for confirmation and moves the file to `BepInEx/trash` so it remains recoverable.
+
+Any file detected as UTF text (up to 4 MiB) can be treated as one C# source unit, regardless of whether its extension is `.cs`, `.txt`, or something else. **Compile** targets `net6.0` and references:
+
+- the .NET 6 SDK reference assemblies;
+- every compatible managed assembly in the game's `Managed` directory;
+- compatible managed DLLs recursively discovered under `BepInEx/plugins`, including prerequisite mods.
+
+Native DLLs and assemblies targeting a runtime newer than .NET 6 are not valid compiler references and are skipped. Compilation requires a locally installed .NET SDK capable of building `net6.0`; having only the runtime is not enough.
+
+If the selected source is loose in the root of `plugins`, explicit compilation first creates a same-name folder and moves the source plus matching DLL/PDB/deps files into it. Sources already inside a folder stay there. The source is never deleted by compilation. Build scratch files use the system temporary directory, and the resulting DLL is placed beside the source. Restart the game to load a newly compiled or replaced DLL.
+
+The built-in editor is deliberately plain: type, save, discard unsaved changes, or roll back to the copy retained before the latest save. Closing it never saves implicitly.
 
 ## Empty by default
 
@@ -95,7 +111,7 @@ This is deliberately not a security boundary. Load order can change the winning 
 - `IVoxelWorld`: bounded read/write access plus seed, generation preset and biome metadata.
 - `IMicroVoxelService`: optional precision API from `context.GetService<IMicroVoxelService>()`; exposes grid selection, sparse cell queries, exact-grid painting, and Undo/Redo. `force: true` permits protected/direct replacement for trusted mods.
 - `IRenderBackendService`: lists every renderer and whether it is actually available, switches the active backend by ID, and resets progressive history without referencing the game assembly.
-- `IVoxelPhysicsService`: reads or changes `Off` / `Simple` / `Full` physics by name and requests a new structural evaluation.
+- `IVoxelPhysicsService`: reports the BEPU structural-grid backend, active Grid／substep counts and requests a new structural evaluation. Six-face structural fracture is an always-on world rule, not a user or Mod mode switch.
 - `WorldReady`: runs after registered blocks and a saved world have been loaded.
 - `Updating`: per-frame game-thread callback.
 - `VoxelChanged`: reports the position and old/new block IDs.

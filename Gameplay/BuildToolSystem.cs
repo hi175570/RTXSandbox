@@ -202,7 +202,7 @@ public sealed class BuildToolSystem
             return false;
         }
 
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         for (int z = 0; z < _clipboardDepth; z++)
         for (int y = 0; y < _clipboardHeight; y++)
         for (int x = 0; x < _clipboardWidth; x++)
@@ -318,25 +318,30 @@ public sealed class BuildToolSystem
 
     private bool Place(VoxelHit hit)
     {
+        if (!PlacementRules.IsFarEnough(hit.Distance))
+        {
+            Status = $"Place voxel: target must be at least {PlacementRules.MinimumEyeDistance:0.0} blocks from the eye";
+            return false;
+        }
         BlockDefinition hitBlock = _blocks.Get(hit.MaterialId);
         (int x, int y, int z) = hitBlock.IsReplaceable && hit.MaterialId != SelectedBlockId
             ? (hit.X, hit.Y, hit.Z)
             : hit.Adjacent;
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         AddPending(requested, x, y, z, SelectedBlockId);
         return Commit(requested, "Place voxel");
     }
 
     private bool Erase(VoxelHit hit)
     {
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         AddPending(requested, hit.X, hit.Y, hit.Z, 0);
         return Commit(requested, "Erase voxel");
     }
 
     private bool Replace(VoxelHit hit)
     {
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         AddPending(requested, hit.X, hit.Y, hit.Z, SelectedBlockId);
         return Commit(requested, "Replace voxel");
     }
@@ -357,7 +362,7 @@ public sealed class BuildToolSystem
     private bool Sphere((int X, int Y, int Z) center, int radius, ushort blockId, string name)
     {
         radius = Math.Clamp(radius, 1, 12);
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         int radiusSquared = radius * radius;
         for (int z = center.Z - radius; z <= center.Z + radius; z++)
         for (int y = center.Y - radius; y <= center.Y + radius; y++)
@@ -376,7 +381,7 @@ public sealed class BuildToolSystem
 
     private bool FlattenAt(int centerX, int targetY, int centerZ)
     {
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         int radiusSquared = BrushRadius * BrushRadius;
         for (int z = centerZ - BrushRadius; z <= centerZ + BrushRadius; z++)
         for (int x = centerX - BrushRadius; x <= centerX + BrushRadius; x++)
@@ -385,7 +390,7 @@ public sealed class BuildToolSystem
             int dz = z - centerZ;
             if (dx * dx + dz * dz > radiusSquared) continue;
 
-            for (int y = targetY + 1; y < VoxelWorld.Height; y++)
+            for (int y = targetY + 1; y < VoxelWorld.MaximumY; y++)
             {
                 ushort existing = _world.GetBlockId(x, y, z);
                 if (existing != 0 && !_blocks.Get(existing).IsFluid)
@@ -404,7 +409,7 @@ public sealed class BuildToolSystem
         Func<int, int, int, ushort, ushort> transform,
         string name)
     {
-        var requested = new Dictionary<int, PendingEdit>();
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
         for (int z = minimum.Z; z <= maximum.Z; z++)
         for (int y = minimum.Y; y <= maximum.Y; y++)
         for (int x = minimum.X; x <= maximum.X; x++)
@@ -424,10 +429,10 @@ public sealed class BuildToolSystem
             return false;
         }
 
-        var changes = new Dictionary<int, VoxelEdit>();
+        var changes = new Dictionary<VoxelPoint, VoxelEdit>();
         void Record(VoxelChangedEvent change)
         {
-            int key = WorldIndex(change.X, change.Y, change.Z);
+            var key = new VoxelPoint(change.X, change.Y, change.Z);
             if (changes.TryGetValue(key, out VoxelEdit previous))
             {
                 changes[key] = previous with { NewBlockId = change.NewBlockId };
@@ -470,14 +475,14 @@ public sealed class BuildToolSystem
         return true;
     }
 
-    private void AddPending(Dictionary<int, PendingEdit> requested, int x, int y, int z, ushort blockId)
+    private void AddPending(Dictionary<VoxelPoint, PendingEdit> requested, int x, int y, int z, ushort blockId)
     {
         if (!_world.IsInside(x, y, z)) return;
-        int key = WorldIndex(x, y, z);
+        var key = new VoxelPoint(x, y, z);
         requested[key] = new PendingEdit(x, y, z, blockId);
     }
 
-    private bool Commit(Dictionary<int, PendingEdit> requested, string name)
+    private bool Commit(Dictionary<VoxelPoint, PendingEdit> requested, string name)
     {
         var edits = new List<VoxelEdit>(requested.Count);
         foreach (PendingEdit pending in requested.Values)
@@ -525,9 +530,6 @@ public sealed class BuildToolSystem
 
     private int ClipboardIndex(int x, int y, int z) =>
         x + _clipboardWidth * (y + _clipboardHeight * z);
-
-    private static int WorldIndex(int x, int y, int z) =>
-        x + VoxelWorld.Width * (y + VoxelWorld.Height * z);
 
     private void ClampOptions()
     {

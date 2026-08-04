@@ -4,14 +4,19 @@ namespace RTXSandbox.ModAPI;
 
 public interface IVoxelWorld
 {
+    /// <summary>Legacy horizontal GPU window width; X coordinates themselves are unbounded.</summary>
     int Width { get; }
     int Height { get; }
+    /// <summary>Legacy horizontal GPU window depth; Z coordinates themselves are unbounded.</summary>
     int Depth { get; }
+    int MinimumY { get; }
+    int MaximumYExclusive { get; }
     int Seed { get; }
     string GenerationPreset { get; }
     string GenerationBiome { get; }
     ushort GetBlock(int x, int y, int z);
     bool SetBlock(int x, int y, int z, ushort blockId);
+    bool IsInside(int x, int y, int z);
 }
 
 public readonly struct MicroVoxelData

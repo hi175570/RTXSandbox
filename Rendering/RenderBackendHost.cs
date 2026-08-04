@@ -19,6 +19,7 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
     private float _renderScale;
     private bool _disposed;
     private IRenderBackend _active;
+    private IRenderBackend? _cachedHardwareRayTracing;
 
     public IRenderBackend ActiveBackend => _active;
     public RenderBackendKind Kind => _active.Kind;
@@ -61,8 +62,17 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
             initialKind = RenderBackendKind.SoftwareRayTracing;
         }
 
-        _active = Create(initialKind);
-        Status = $"Active renderer: {_active.Name}";
+        try
+        {
+            _active = Create(initialKind);
+            Status = $"Active renderer: {_active.Name}";
+        }
+        catch (Exception exception) when (initialKind == RenderBackendKind.HardwareRayTracing)
+        {
+            _active = Create(RenderBackendKind.SoftwareRayTracing);
+            Status = $"Hardware Ray Tracing initialization failed; using {_active.Name}: {exception.Message}";
+            Console.Error.WriteLine(Status);
+        }
     }
 
     public bool Switch(RenderBackendKind kind)
@@ -86,7 +96,16 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
         IRenderBackend replacement;
         try
         {
-            replacement = Create(kind);
+            if (kind == RenderBackendKind.HardwareRayTracing && _cachedHardwareRayTracing is not null)
+            {
+                replacement = _cachedHardwareRayTracing;
+                _cachedHardwareRayTracing = null;
+                replacement.Resize(_width, _height, _renderScale);
+            }
+            else
+            {
+                replacement = Create(kind);
+            }
         }
         catch (Exception exception)
         {
@@ -96,7 +115,10 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
 
         IRenderBackend previous = _active;
         _active = replacement;
-        previous.Dispose();
+        if (previous.Kind == RenderBackendKind.HardwareRayTracing)
+            _cachedHardwareRayTracing = previous;
+        else
+            previous.Dispose();
         Status = $"Active renderer: {_active.Name}";
         return true;
     }
@@ -121,9 +143,9 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
         Camera camera,
         VoxelHit? selection,
         float timeOfDay,
-        int pathBounces,
+        RenderQualitySettings quality,
         float exposure) =>
-        _active.Render(cameraPosition, camera, selection, timeOfDay, pathBounces, exposure);
+        _active.Render(cameraPosition, camera, selection, timeOfDay, quality, exposure);
 
     public MaterialTileUv GetMaterialTileUv(ushort materialId, MaterialFace face) =>
         PreviewSource.GetMaterialTileUv(materialId, face);
@@ -133,12 +155,20 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
         if (_disposed) return;
         _disposed = true;
         _active.Dispose();
+        _cachedHardwareRayTracing?.Dispose();
+        _cachedHardwareRayTracing = null;
     }
 
     private IRenderBackend Create(RenderBackendKind kind) => kind switch
     {
+        RenderBackendKind.HardwareRayTracing =>
+            new DxrHardwareRenderer(_world, _blocks, _width, _height, _renderScale),
         RenderBackendKind.SoftwareRayTracing =>
             new RayTracingRenderer(_world, _blocks, _width, _height, _renderScale),
+        RenderBackendKind.DeferredLighting =>
+            new RasterVoxelRenderer(_world, _blocks, _width, _height, classic: false, deferred: true),
+        RenderBackendKind.HybridPbrRaster =>
+            new RasterVoxelRenderer(_world, _blocks, _width, _height, classic: false, hybrid: true),
         RenderBackendKind.PbrForward =>
             new RasterVoxelRenderer(_world, _blocks, _width, _height, classic: false),
         RenderBackendKind.Classic =>

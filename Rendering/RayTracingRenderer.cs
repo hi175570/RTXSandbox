@@ -1,5 +1,6 @@
 using System.Numerics;
 using OpenTK.Graphics.OpenGL4;
+using RTXSandbox.Infrastructure;
 using RTXSandbox.Gameplay;
 using RTXSandbox.ModAPI;
 using RTXSandbox.World;
@@ -32,6 +33,11 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
     private int _frameIndex;
     private bool _disposed;
     private int _dynamicBoxCount;
+    private bool _dynamicGridsDirty;
+    private int _voxelOriginX;
+    private int _voxelOriginZ;
+    private bool _windowDirty;
+    private readonly HashSet<ChunkCoordinate> _dirtyVoxelChunks = new();
 
     public int AccumulatedSamples => _frameIndex;
     public RenderBackendKind Kind => RenderBackendKind.SoftwareRayTracing;
@@ -50,7 +56,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         _world = world;
         _blocks = blocks;
 
-        string shaderRoot = Path.Combine(AppContext.BaseDirectory, "Shaders");
+        string shaderRoot = Path.Combine(RuntimePaths.OutputRoot, "Shaders");
         _compute = new ShaderProgram(
             (ShaderType.ComputeShader, File.ReadAllText(Path.Combine(shaderRoot, "pathtrace.comp.glsl"))));
         _display = new ShaderProgram(
@@ -58,7 +64,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             (ShaderType.FragmentShader, File.ReadAllText(Path.Combine(shaderRoot, "tonemap.frag.glsl"))));
 
         _vertexArray = GL.GenVertexArray();
-        _voxelTexture = CreateVoxelTexture(world.RawData);
+        _voxelTexture = CreateVoxelTexture(world.CreateRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ));
         _microCellTexture = CreateMicroCellTexture();
         _microBoxBuffer = GL.GenBuffer();
         _dynamicBoxBuffer = GL.GenBuffer();
@@ -73,7 +79,8 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         _world.VoxelChanged += OnVoxelChanged;
         _world.WorldReloaded += UploadAllVoxels;
         _world.MicroVoxelsChanged += UploadMicroVoxels;
-        _world.PhysicsGrids.Changed += UploadDynamicGrids;
+        _world.ChunkGenerated += OnChunkGenerated;
+        _world.PhysicsGrids.Changed += OnPhysicsGridsChanged;
         _blocks.DefinitionsChanged += UploadMaterialTextures;
         Resize(width, height, renderScale);
     }
@@ -124,9 +131,38 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         Camera camera,
         VoxelHit? selection,
         float timeOfDay,
-        int pathBounces,
+        RenderQualitySettings quality,
         float exposure)
     {
+        ChunkCoordinate wantedOrigin = ChunkCoordinate.FromVoxel(
+            (int)MathF.Floor(cameraPosition.X) - VoxelWorld.Width / 2,
+            (int)MathF.Floor(cameraPosition.Z) - VoxelWorld.Depth / 2);
+        if (wantedOrigin.MinimumX != _voxelOriginX || wantedOrigin.MinimumZ != _voxelOriginZ)
+        {
+            _voxelOriginX = wantedOrigin.MinimumX;
+            _voxelOriginZ = wantedOrigin.MinimumZ;
+            _windowDirty = true;
+        }
+        if (_windowDirty)
+        {
+            UploadAllVoxels();
+            UploadMicroVoxels();
+            _dirtyVoxelChunks.Clear();
+            _windowDirty = false;
+        }
+        else if (_dirtyVoxelChunks.Count > 0)
+        {
+            UploadDirtyVoxelChunks();
+        }
+
+        // Physics can publish several substep changes between displayed frames.
+        // Coalesce them into one SSBO upload instead of uploading the complete grid
+        // set for every substep.
+        if (_dynamicGridsDirty)
+        {
+            UploadDynamicGrids();
+            _dynamicGridsDirty = false;
+        }
         Vector3 forward = camera.Forward;
         Vector3 right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
         Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
@@ -138,9 +174,13 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform3(_compute.Uniform("uCameraRight"), right.X, right.Y, right.Z);
         GL.Uniform3(_compute.Uniform("uCameraUp"), up.X, up.Y, up.Z);
         GL.Uniform1(_compute.Uniform("uTanHalfFov"), MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f));
-        GL.Uniform1(_compute.Uniform("uFrameIndex"), _frameIndex);
         GL.Uniform1(_compute.Uniform("uTimeOfDay"), timeOfDay);
-        GL.Uniform1(_compute.Uniform("uMaxBounces"), Math.Clamp(pathBounces, 1, 12));
+        GL.Uniform1(_compute.Uniform("uMaxBounces"), Math.Clamp(quality.PathBounces, 1, 12));
+        GL.Uniform3(
+            _compute.Uniform("uWorldOrigin"),
+            _voxelOriginX,
+            VoxelWorld.MinimumY,
+            _voxelOriginZ);
 
         if (selection.HasValue)
         {
@@ -181,8 +221,15 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, 2, _dynamicBoxBuffer);
         GL.Uniform1(_compute.Uniform("uDynamicBoxCount"), _dynamicBoxCount);
         GL.BindImageTexture(0, _accumulationTexture, 0, false, 0, TextureAccess.ReadWrite, SizedInternalFormat.Rgba32f);
-        GL.DispatchCompute((_width + 7) / 8, (_height + 7) / 8, 1);
-        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+        int samplesThisFrame = Math.Clamp(quality.PathSamplesPerFrame, 1, 8);
+        int maximumSamples = Math.Clamp(quality.PathMaxAccumulatedSamples, 64, 16_384);
+        for (int sample = 0; sample < samplesThisFrame && _frameIndex < maximumSamples; sample++)
+        {
+            GL.Uniform1(_compute.Uniform("uFrameIndex"), _frameIndex);
+            GL.DispatchCompute((_width + 7) / 8, (_height + 7) / 8, 1);
+            GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+            _frameIndex++;
+        }
 
         GL.Disable(EnableCap.DepthTest);
         GL.Viewport(0, 0, _viewportWidth, _viewportHeight);
@@ -195,10 +242,6 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindVertexArray(_vertexArray);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
 
-        if (_frameIndex < 16_384)
-        {
-            _frameIndex++;
-        }
     }
 
     private static int CreateVoxelTexture(ushort[] data)
@@ -257,7 +300,12 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         var boxes = new List<float>();
         foreach ((int x, int y, int z, MicroVoxelSnapshot snapshot) in _world.SnapshotMicroVoxels())
         {
-            int cellIndex = x + VoxelWorld.Width * (y + VoxelWorld.Height * z);
+            int localX = x - _voxelOriginX;
+            int localY = y - VoxelWorld.MinimumY;
+            int localZ = z - _voxelOriginZ;
+            if (localX < 0 || localX >= VoxelWorld.Width || localY < 0 || localY >= VoxelWorld.Height ||
+                localZ < 0 || localZ >= VoxelWorld.Depth) continue;
+            int cellIndex = localX + VoxelWorld.Width * (localY + VoxelWorld.Height * localZ);
             cells[cellIndex * 2] = (uint)(boxes.Count / 8);
             cells[cellIndex * 2 + 1] = (uint)snapshot.Boxes.Count;
             float inverse = 1f / snapshot.Resolution;
@@ -327,17 +375,24 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         ResetAccumulation();
     }
 
+    private void OnPhysicsGridsChanged() => _dynamicGridsDirty = true;
+
     private void OnVoxelChanged(int x, int y, int z, VoxelMaterial material)
     {
+        int localX = x - _voxelOriginX;
+        int localY = y - VoxelWorld.MinimumY;
+        int localZ = z - _voxelOriginZ;
+        if (localX < 0 || localX >= VoxelWorld.Width || localY < 0 || localY >= VoxelWorld.Height ||
+            localZ < 0 || localZ >= VoxelWorld.Depth) return;
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture3D, _voxelTexture);
         GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
         GL.TexSubImage3D(
             TextureTarget.Texture3D,
             0,
-            x,
-            y,
-            z,
+            localX,
+            localY,
+            localZ,
             1,
             1,
             1,
@@ -363,8 +418,42 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             VoxelWorld.Depth,
             PixelFormat.RedInteger,
             PixelType.UnsignedShort,
-            _world.RawData);
+            _world.CreateRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ));
         ResetAccumulation();
+    }
+
+    private void UploadDirtyVoxelChunks()
+    {
+        bool uploaded = false;
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.Texture3D, _voxelTexture);
+        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+        foreach (ChunkCoordinate chunk in _dirtyVoxelChunks.ToArray())
+        {
+            _dirtyVoxelChunks.Remove(chunk);
+            int localX = chunk.MinimumX - _voxelOriginX;
+            int localZ = chunk.MinimumZ - _voxelOriginZ;
+            if (localX < 0 || localX + ChunkCoordinate.Size > VoxelWorld.Width ||
+                localZ < 0 || localZ + ChunkCoordinate.Size > VoxelWorld.Depth)
+                continue;
+            GL.TexSubImage3D(
+                TextureTarget.Texture3D, 0,
+                localX, 0, localZ,
+                ChunkCoordinate.Size, VoxelWorld.Height, ChunkCoordinate.Size,
+                PixelFormat.RedInteger, PixelType.UnsignedShort,
+                _world.CreateRenderChunkSnapshot(chunk));
+            uploaded = true;
+        }
+        if (uploaded) ResetAccumulation();
+    }
+
+    private void OnChunkGenerated(ChunkCoordinate chunk)
+    {
+        int maximumX = _voxelOriginX + VoxelWorld.Width;
+        int maximumZ = _voxelOriginZ + VoxelWorld.Depth;
+        if (chunk.MinimumX < maximumX && chunk.MinimumX + ChunkCoordinate.Size > _voxelOriginX &&
+            chunk.MinimumZ < maximumZ && chunk.MinimumZ + ChunkCoordinate.Size > _voxelOriginZ)
+            _dirtyVoxelChunks.Add(chunk);
     }
 
     private void UploadMaterialTextures()
@@ -467,7 +556,8 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         _world.VoxelChanged -= OnVoxelChanged;
         _world.WorldReloaded -= UploadAllVoxels;
         _world.MicroVoxelsChanged -= UploadMicroVoxels;
-        _world.PhysicsGrids.Changed -= UploadDynamicGrids;
+        _world.ChunkGenerated -= OnChunkGenerated;
+        _world.PhysicsGrids.Changed -= OnPhysicsGridsChanged;
         _blocks.DefinitionsChanged -= UploadMaterialTextures;
         GL.DeleteTexture(_voxelTexture);
         GL.DeleteTexture(_microCellTexture);

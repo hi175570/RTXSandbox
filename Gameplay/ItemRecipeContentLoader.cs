@@ -1,20 +1,21 @@
 using System.Numerics;
 using System.Text.Json;
 using RTXSandbox.ModAPI;
+using RTXSandbox.Infrastructure;
 
 namespace RTXSandbox.Gameplay;
 
 public static class ItemRecipeContentLoader
 {
-    public static string BaseItemsPath => Path.Combine(AppContext.BaseDirectory, "Content", "Base", "base.items.json");
-    public static string BaseRecipesPath => Path.Combine(AppContext.BaseDirectory, "Content", "Base", "base.recipes.json");
+    public static string BaseItemsPath => Path.Combine(RuntimePaths.OutputRoot, "Content", "Base", "base.items.json");
+    public static string BaseRecipesPath => Path.Combine(RuntimePaths.OutputRoot, "Content", "Base", "base.recipes.json");
 
     public static void LoadInto(ItemRegistry items, RecipeRegistry recipes, string? contentPacksPath = null)
     {
         RegisterItems(items, Read<ItemDocument>(BaseItemsPath), force: false);
         RegisterRecipes(recipes, Read<RecipeDocument>(BaseRecipesPath), force: false);
 
-        contentPacksPath ??= Path.Combine(AppContext.BaseDirectory, "ContentPacks");
+        contentPacksPath ??= Path.Combine(RuntimePaths.OutputRoot, "ContentPacks");
         if (!Directory.Exists(contentPacksPath))
         {
             return;

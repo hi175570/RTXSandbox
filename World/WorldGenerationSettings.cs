@@ -46,7 +46,7 @@ public sealed class WorldGenerationSettings
 
     public void Validate()
     {
-        FlatSurfaceHeight = Math.Clamp(FlatSurfaceHeight, 1, VoxelWorld.Height - 6);
+        FlatSurfaceHeight = Math.Clamp(FlatSurfaceHeight, VoxelWorld.MinimumY + 1, 256);
         if (string.IsNullOrWhiteSpace(SurfaceBlockKey)) SurfaceBlockKey = "rtxsandbox:grass";
         if (string.IsNullOrWhiteSpace(UndergroundBlockKey)) UndergroundBlockKey = "rtxsandbox:stone";
     }

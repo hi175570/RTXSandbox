@@ -1,10 +1,13 @@
 namespace RTXSandbox.Rendering;
 
+using RTXSandbox.Rendering.Backends;
+
 public enum RenderBackendKind
 {
     HardwareRayTracing,
     SoftwareRayTracing,
     DeferredLighting,
+    HybridPbrRaster,
     PbrForward,
     Classic,
 }
@@ -32,15 +35,42 @@ public sealed record RenderBackendDescriptor(
 
 public static class RenderBackendCatalog
 {
+    private static readonly (bool Supported, string Status) HardwareRayTracing = ProbeHardwareRayTracing();
+    public static string HardwareRayTracingStatus => HardwareRayTracing.Status;
+
     public static IReadOnlyList<RenderBackendDescriptor> All { get; } = new[]
     {
         new RenderBackendDescriptor(
-            RenderBackendKind.HardwareRayTracing,
-            "Hardware Ray Tracing",
-            "硬體光線追蹤",
-            "Reserved for a future DXR or Vulkan RT backend; OpenGL cannot expose the required acceleration structures.",
-            false,
-            RenderBackendCapabilities.GlobalIllumination | RenderBackendCapabilities.Reflections |
+            RenderBackendKind.Classic,
+            "Classic",
+            "經典低負載",
+            "Low-cost textured raster mode for compatibility and editor work.",
+            true,
+            RenderBackendCapabilities.RealTime | RenderBackendCapabilities.LowEnd |
+            RenderBackendCapabilities.MicroVoxels),
+        new RenderBackendDescriptor(
+            RenderBackendKind.PbrForward,
+            "PBR Forward",
+            "PBR 前向光柵",
+            "Real-time raster backend with procedural textures, sunlight, Fresnel sky reflections and transparency.",
+            true,
+            RenderBackendCapabilities.RealTime | RenderBackendCapabilities.Reflections |
+            RenderBackendCapabilities.Transmission | RenderBackendCapabilities.MicroVoxels),
+        new RenderBackendDescriptor(
+            RenderBackendKind.DeferredLighting,
+            "Deferred Lighting",
+            "延遲光照",
+            "Five-target GBuffer lighting with a forward transparency pass for water and glass.",
+            true,
+            RenderBackendCapabilities.RealTime | RenderBackendCapabilities.Reflections |
+            RenderBackendCapabilities.Transmission | RenderBackendCapabilities.MicroVoxels),
+        new RenderBackendDescriptor(
+            RenderBackendKind.HybridPbrRaster,
+            "Hybrid PBR Raster",
+            "混合式 PBR 光柵",
+            "High-quality raster pipeline: deferred PBR opaque lighting, shadows, SSR, bloom, plus forward water and transparency.",
+            true,
+            RenderBackendCapabilities.RealTime | RenderBackendCapabilities.Reflections |
             RenderBackendCapabilities.Transmission | RenderBackendCapabilities.MicroVoxels),
         new RenderBackendDescriptor(
             RenderBackendKind.SoftwareRayTracing,
@@ -52,28 +82,13 @@ public static class RenderBackendCatalog
             RenderBackendCapabilities.Reflections | RenderBackendCapabilities.Transmission |
             RenderBackendCapabilities.MicroVoxels),
         new RenderBackendDescriptor(
-            RenderBackendKind.DeferredLighting,
-            "Deferred Lighting",
-            "延遲光照",
-            "Planned GBuffer backend; unavailable until chunk meshes and the lighting pass are complete.",
-            false,
-            RenderBackendCapabilities.RealTime | RenderBackendCapabilities.MicroVoxels),
-        new RenderBackendDescriptor(
-            RenderBackendKind.PbrForward,
-            "PBR Forward",
-            "PBR 即時渲染",
-            "Real-time raster backend with procedural textures, sunlight, Fresnel sky reflections and transparency.",
-            true,
+            RenderBackendKind.HardwareRayTracing,
+            "Hardware Ray Tracing",
+            "硬體光線追蹤",
+            $"Direct3D 12 DXR V1. {HardwareRayTracingStatus}",
+            HardwareRayTracing.Supported,
             RenderBackendCapabilities.RealTime | RenderBackendCapabilities.Reflections |
-            RenderBackendCapabilities.Transmission | RenderBackendCapabilities.MicroVoxels),
-        new RenderBackendDescriptor(
-            RenderBackendKind.Classic,
-            "Classic",
-            "經典低負載",
-            "Low-cost textured raster mode for compatibility and editor work.",
-            true,
-            RenderBackendCapabilities.RealTime | RenderBackendCapabilities.LowEnd |
-            RenderBackendCapabilities.MicroVoxels),
+            RenderBackendCapabilities.Transmission),
     };
 
     public static IReadOnlyList<RenderBackendDescriptor> Implemented { get; } =
@@ -84,4 +99,10 @@ public static class RenderBackendCatalog
 
     public static RenderBackendDescriptor Get(RenderBackendKind kind) =>
         All.First(descriptor => descriptor.Kind == kind);
+
+    private static (bool Supported, string Status) ProbeHardwareRayTracing()
+    {
+        bool supported = DxrHardwareRenderer.IsSupported(out string status);
+        return (supported, status);
+    }
 }

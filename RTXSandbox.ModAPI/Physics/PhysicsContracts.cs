@@ -1,14 +1,16 @@
 namespace RTXSandbox.ModAPI;
 
 /// <summary>
-/// Structural-grid physics service. String modes are retained for source compatibility and keep the public API independent from the game's
-/// configuration assembly and allow future mods to introduce custom simulation modes.
+/// Structural-grid physics service. Structural fracture is a world rule rather than a
+/// user-selectable simulation mode; mods can request reevaluation and inspect the active backend.
 /// </summary>
 public interface IVoxelPhysicsService
 {
     string ModeName { get; }
+    string BackendName { get; }
+    int ActiveGridCount { get; }
     int ChangesLastStep { get; }
+    int SimulationSubstepsLastStep { get; }
     string Status { get; }
-    bool TrySetMode(string modeName);
     void RequestEvaluation();
 }

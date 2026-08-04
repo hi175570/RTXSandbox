@@ -181,12 +181,14 @@
       "displayName": "Water",
       "category": "Special / Fluids",
       "albedo": [0.055, 0.25, 0.48],
-      "roughness": 0.06,
-      "metallic": 0.12,
+      "roughness": 0.025,
+      "metallic": 0.0,
       "hardnessSeconds": 0.1,
-      "isUnbreakable": true,
       "isCollidable": false,
       "isFluid": true,
+      "isTransparent": true,
+      "transmission": 0.96,
+      "indexOfRefraction": 1.333,
       "isReplaceable": true
     },
     {

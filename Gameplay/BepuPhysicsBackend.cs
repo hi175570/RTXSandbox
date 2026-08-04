@@ -14,20 +14,23 @@ namespace RTXSandbox.Gameplay;
 /// <summary>BEPUphysics 2 compound-body backend for detached voxel grids.</summary>
 public sealed class BepuPhysicsBackend : IDisposable
 {
-    private const int ChunkSize = 16;
     private readonly VoxelWorld _world;
     private readonly BufferPool _pool = new();
     private readonly ThreadDispatcher _dispatcher;
     private readonly Simulation _simulation;
     private readonly Dictionary<ulong, DynamicBody> _dynamicBodies = new();
-    private readonly Dictionary<(int X, int Z), List<StaticBody>> _staticChunks = new();
-    private readonly HashSet<(int X, int Z)> _dirtyChunks = new();
+    private readonly Dictionary<ChunkCoordinate, List<StaticBody>> _staticChunks = new();
+    private readonly HashSet<ChunkCoordinate> _dirtyChunks = new();
+    private readonly HashSet<ChunkCoordinate> _urgentDirtyChunks = new();
+    private const float FixedStepSeconds = 1f / 120f;
+    private const int MaximumCatchUpSteps = 6;
+    private float _timeAccumulator;
     private bool _disposed;
 
     public string Name => "BEPUphysics 2";
     public int DynamicBodyCount => _dynamicBodies.Count;
     public int StaticChunkBodyCount => _staticChunks.Values.Sum(list => list.Count);
-    public int CollisionStepsLastFrame { get; private set; } = 1;
+    public int CollisionStepsLastFrame { get; private set; }
 
     public BepuPhysicsBackend(VoxelWorld world)
     {
@@ -36,24 +39,38 @@ public sealed class BepuPhysicsBackend : IDisposable
         _dispatcher = new ThreadDispatcher(threads);
         _simulation = Simulation.Create(
             _pool,
-            new NarrowPhaseCallbacks(new SpringSettings(30f, 1f), 1.5f, 0.72f),
+            // Contacts recover overlap without restitution. Keeping the recovery speed
+            // below visible launch velocity prevents a landed Grid from repeatedly
+            // throwing itself back into the air, while moderate friction still lets an
+            // off-balance structure continue rotating on the floor.
+            new NarrowPhaseCallbacks(new SpringSettings(20f, 1f), 0.35f, 0.55f),
             new PoseIntegratorCallbacks(new Vector3(0f, -18f, 0f), 0.035f, 0.08f),
             new SolveDescription(8, 2));
         _world.DetailedVoxelChanged += OnVoxelChanged;
-        _world.MicroVoxelsChanged += MarkAllStaticDirty;
-        _world.WorldReloaded += MarkAllStaticDirty;
+        _world.MicroVoxelCellChanged += OnMicroVoxelCellChanged;
+        _world.MicroVoxelsReloaded += MarkAllStaticDirty;
+        _world.WorldReloaded += OnWorldReloaded;
+        _world.ChunkGenerated += OnChunkGenerated;
         MarkAllStaticDirty();
     }
 
     public void Step(float deltaSeconds)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(BepuPhysicsBackend));
-        RebuildDirtyChunks();
+        RebuildDirtyChunks(maximumChunks: 1);
         ReconcileDynamicBodies();
-        deltaSeconds = Math.Clamp(deltaSeconds, 0f, 0.05f);
-        CollisionStepsLastFrame = Math.Clamp((int)MathF.Ceiling(deltaSeconds / (1f / 120f)), 1, 6);
-        float step = deltaSeconds / CollisionStepsLastFrame;
-        for (int i = 0; i < CollisionStepsLastFrame; i++) _simulation.Timestep(step, _dispatcher);
+        deltaSeconds = Math.Clamp(deltaSeconds, 0f, 0.25f);
+        _timeAccumulator = MathF.Min(
+            _timeAccumulator + deltaSeconds,
+            FixedStepSeconds * MaximumCatchUpSteps);
+        CollisionStepsLastFrame = 0;
+        while (_timeAccumulator + 0.0000001f >= FixedStepSeconds &&
+               CollisionStepsLastFrame < MaximumCatchUpSteps)
+        {
+            _simulation.Timestep(FixedStepSeconds, _dispatcher);
+            _timeAccumulator -= FixedStepSeconds;
+            CollisionStepsLastFrame++;
+        }
         SynchronizeGrids();
     }
 
@@ -63,7 +80,7 @@ public sealed class BepuPhysicsBackend : IDisposable
         foreach (ulong id in _dynamicBodies.Keys.Where(id => !live.Contains(id)).ToArray()) RemoveDynamic(id);
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
         {
-            int signature = Signature(grid);
+            int signature = grid.TopologyVersion;
             if (_dynamicBodies.TryGetValue(grid.Id, out DynamicBody existing) && existing.Signature == signature) continue;
             if (_dynamicBodies.ContainsKey(grid.Id)) RemoveDynamic(grid.Id);
             CreateDynamic(grid, signature);
@@ -76,7 +93,11 @@ public sealed class BepuPhysicsBackend : IDisposable
         foreach (PhysicsGridElement element in grid.Elements)
         {
             Vector3 size = Vector3.Max(element.Maximum - element.Minimum, new Vector3(0.01f));
-            float mass = MathF.Max(0.001f, element.Volume);
+            // Use the same mass model as PhysicsGrid so BEPU's compound center and
+            // the rendered/local Grid origin cannot disagree.
+            float mass = MathF.Max(
+                0.001f,
+                element.Volume * MathF.Max(0.05f, grid.DensityOf(element.MaterialId)));
             builder.Add(new Box(size.X, size.Y, size.Z),
                 new RigidPose(element.Center - grid.CenterOfMassLocal, Quaternion.Identity), mass);
         }
@@ -106,44 +127,86 @@ public sealed class BepuPhysicsBackend : IDisposable
             BodyReference body = _simulation.Bodies[entry.Handle];
             Quaternion orientation = body.Pose.Orientation;
             Vector3 gridPosition = body.Pose.Position - Vector3.Transform(entry.CenterOffset, orientation);
-            grid.SetPhysicsState(gridPosition, orientation, body.Velocity.Linear, body.Velocity.Angular, !body.Awake);
-            changed = true;
+            changed |= grid.SetPhysicsState(
+                gridPosition, orientation, body.Velocity.Linear, body.Velocity.Angular, !body.Awake);
         }
         if (changed) _world.PhysicsGrids.NotifyChanged();
     }
 
-    private void RebuildDirtyChunks()
+    private void RebuildDirtyChunks(int maximumChunks)
     {
-        foreach ((int x, int z) chunk in _dirtyChunks.ToArray())
+        int remaining = Math.Max(0, maximumChunks);
+        ChunkCoordinate[] selected = _urgentDirtyChunks.Take(remaining)
+            .Concat(_dirtyChunks.Where(chunk => !_urgentDirtyChunks.Contains(chunk)).Take(remaining))
+            .Take(remaining)
+            .ToArray();
+        foreach (ChunkCoordinate chunk in selected)
         {
+            _urgentDirtyChunks.Remove(chunk);
             _dirtyChunks.Remove(chunk);
             RemoveStaticChunk(chunk);
-            CreateStaticChunk(chunk.x, chunk.z);
+            CreateStaticChunk(chunk);
         }
     }
 
-    private void CreateStaticChunk(int chunkX, int chunkZ)
+    private void CreateStaticChunk(ChunkCoordinate chunk)
     {
-        int startX = chunkX * ChunkSize;
-        int startZ = chunkZ * ChunkSize;
         var bodies = new List<StaticBody>();
-        var boxes = new List<VoxelAabb>(8);
-        for (int z = startZ; z < Math.Min(startZ + ChunkSize, VoxelWorld.Depth); z++)
-        for (int y = 0; y < VoxelWorld.Height; y++)
-        for (int x = startX; x < Math.Min(startX + ChunkSize, VoxelWorld.Width); x++)
+        VoxelChunkSnapshot snapshot = _world.SnapshotChunk(chunk);
+        foreach (IGrouping<(int X, int Z), StoredVoxel> column in snapshot.Voxels
+                     .Where(voxel => _world.IsCollidableMaterial(voxel.MaterialId))
+                     .GroupBy(voxel => (voxel.LocalX, voxel.LocalZ)))
         {
-            boxes.Clear();
-            _world.GetStaticCollisionBoxes(x, y, z, boxes);
-            foreach (VoxelAabb voxel in boxes)
+            int x = chunk.MinimumX + column.Key.X;
+            int z = chunk.MinimumZ + column.Key.Z;
+            int runStart = int.MinValue;
+            int previousY = int.MinValue;
+            foreach (StoredVoxel voxel in column.OrderBy(voxel => voxel.Y))
             {
-                Vector3 size = voxel.Maximum - voxel.Minimum;
-                Vector3 center = (voxel.Minimum + voxel.Maximum) * 0.5f;
-                TypedIndex shape = _simulation.Shapes.Add(new Box(size.X, size.Y, size.Z));
-                StaticHandle handle = _simulation.Statics.Add(new StaticDescription(center, shape));
-                bodies.Add(new StaticBody(handle, shape));
+                if (runStart == int.MinValue) runStart = voxel.Y;
+                else if (voxel.Y != previousY + 1)
+                {
+                    AddStaticBox(new VoxelAabb(
+                        new Vector3(x, runStart, z),
+                        new Vector3(x + 1f, previousY + 1f, z + 1f), 0), bodies);
+                    runStart = voxel.Y;
+                }
+                previousY = voxel.Y;
+            }
+            if (runStart != int.MinValue)
+                AddStaticBox(new VoxelAabb(
+                    new Vector3(x, runStart, z),
+                    new Vector3(x + 1f, previousY + 1f, z + 1f), 0), bodies);
+        }
+
+        foreach (StoredMicroVoxel micro in snapshot.MicroVoxels)
+        {
+            float inverse = 1f / micro.Snapshot.Resolution;
+            foreach (MicroVoxelBox box in micro.Snapshot.Boxes)
+            {
+                if (!_world.IsCollidableMaterial(box.MaterialId)) continue;
+                AddStaticBox(new VoxelAabb(
+                    new Vector3(
+                        chunk.MinimumX + micro.LocalX + box.MinX * inverse,
+                        micro.Y + box.MinY * inverse,
+                        chunk.MinimumZ + micro.LocalZ + box.MinZ * inverse),
+                    new Vector3(
+                        chunk.MinimumX + micro.LocalX + box.MaxX * inverse,
+                        micro.Y + box.MaxY * inverse,
+                        chunk.MinimumZ + micro.LocalZ + box.MaxZ * inverse),
+                    box.MaterialId), bodies);
             }
         }
-        if (bodies.Count > 0) _staticChunks[(chunkX, chunkZ)] = bodies;
+        if (bodies.Count > 0) _staticChunks[chunk] = bodies;
+    }
+
+    private void AddStaticBox(VoxelAabb voxel, List<StaticBody> bodies)
+    {
+        Vector3 size = voxel.Maximum - voxel.Minimum;
+        Vector3 center = (voxel.Minimum + voxel.Maximum) * 0.5f;
+        TypedIndex shape = _simulation.Shapes.Add(new Box(size.X, size.Y, size.Z));
+        StaticHandle handle = _simulation.Statics.Add(new StaticDescription(center, shape));
+        bodies.Add(new StaticBody(handle, shape));
     }
 
     private void RemoveDynamic(ulong id)
@@ -153,7 +216,7 @@ public sealed class BepuPhysicsBackend : IDisposable
         _simulation.Shapes.Remove(entry.Shape);
     }
 
-    private void RemoveStaticChunk((int X, int Z) chunk)
+    private void RemoveStaticChunk(ChunkCoordinate chunk)
     {
         if (!_staticChunks.Remove(chunk, out List<StaticBody>? bodies)) return;
         foreach (StaticBody body in bodies)
@@ -163,36 +226,45 @@ public sealed class BepuPhysicsBackend : IDisposable
         }
     }
 
-    private void OnVoxelChanged(VoxelChangedEvent change) => MarkChunkDirty(change.X, change.Z);
-    private void MarkChunkDirty(int x, int z)
+    private void OnVoxelChanged(VoxelChangedEvent change) => MarkChunkDirty(change.X, change.Z, urgent: true);
+    private void OnMicroVoxelCellChanged(int x, int y, int z) => MarkChunkDirty(x, z, urgent: true);
+    private void OnWorldReloaded()
     {
-        if (x < 0 || z < 0 || x >= VoxelWorld.Width || z >= VoxelWorld.Depth) return;
-        _dirtyChunks.Add((x / ChunkSize, z / ChunkSize));
+        // A fractional step belongs to the old world. Never carry it across a load or
+        // regeneration boundary, where it could advance newly restored bodies early.
+        _timeAccumulator = 0f;
+        foreach (ulong id in _dynamicBodies.Keys.ToArray()) RemoveDynamic(id);
+        foreach (ChunkCoordinate chunk in _staticChunks.Keys.ToArray()) RemoveStaticChunk(chunk);
+        _dirtyChunks.Clear();
+        _urgentDirtyChunks.Clear();
+        MarkAllStaticDirty();
     }
+
+    private void MarkChunkDirty(int x, int z, bool urgent = false)
+    {
+        ChunkCoordinate chunk = ChunkCoordinate.FromVoxel(x, z);
+        _dirtyChunks.Add(chunk);
+        if (urgent) _urgentDirtyChunks.Add(chunk);
+    }
+    private void OnChunkGenerated(ChunkCoordinate chunk) => _dirtyChunks.Add(chunk);
     private void MarkAllStaticDirty()
     {
-        for (int z = 0; z < VoxelWorld.Depth; z += ChunkSize)
-        for (int x = 0; x < VoxelWorld.Width; x += ChunkSize)
-            _dirtyChunks.Add((x / ChunkSize, z / ChunkSize));
+        foreach (ChunkCoordinate chunk in _staticChunks.Keys)
+            _dirtyChunks.Add(chunk);
+        foreach (ChunkCoordinate chunk in _world.SnapshotLoadedChunks())
+            _dirtyChunks.Add(chunk);
     }
-    private static int Signature(PhysicsGrid grid)
-    {
-        var hash = new HashCode();
-        foreach (PhysicsGridElement element in grid.Elements)
-        {
-            hash.Add(element.CellX); hash.Add(element.CellY); hash.Add(element.CellZ);
-            hash.Add(element.Minimum); hash.Add(element.Maximum); hash.Add(element.MaterialId);
-        }
-        return hash.ToHashCode();
-    }
+    internal bool IsStaticChunkRegistered(ChunkCoordinate chunk) => _staticChunks.ContainsKey(chunk);
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _world.DetailedVoxelChanged -= OnVoxelChanged;
-        _world.MicroVoxelsChanged -= MarkAllStaticDirty;
-        _world.WorldReloaded -= MarkAllStaticDirty;
+        _world.MicroVoxelCellChanged -= OnMicroVoxelCellChanged;
+        _world.MicroVoxelsReloaded -= MarkAllStaticDirty;
+        _world.WorldReloaded -= OnWorldReloaded;
+        _world.ChunkGenerated -= OnChunkGenerated;
         _simulation.Dispose();
         _dispatcher.Dispose();
         _pool.Clear();

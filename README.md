@@ -3,10 +3,13 @@
 ## 0.13 Engine Architecture
 
 - 新增可在遊戲內即時切換的渲染後端：`Compute Path Tracing`、`PBR Forward`、`Classic`。選擇會寫入 `settings.json`。
+- `settings.json` 使用版本化驗證、落盤後原子替換與 `.bak` 恢復；主檔損壞時會載入上一份有效設定。
 - `Hardware Ray Tracing` 與 `Deferred Lighting` 會顯示在設定頁但鎖定為「規劃中」；目前沒有用名稱或假選項冒充 DXR／GBuffer 實作。
 - `RenderBackendHost` 讓遊戲迴圈與模組依賴渲染介面；切換失敗會保留上一個可用後端。
 - PBR／Classic 都使用真正的 voxel mesh、16×16 程序材質 atlas、micro-voxel 幾何與選取框，不是空白模式。
 - Mod API 已拆出 `Blocks`、`World`、`Rendering`、`Physics` contracts，並新增 `IRenderBackendService` 與 `IVoxelPhysicsService`。
+- 主選單會在即時光追場景上列出所有有效世界，可安全保存目前世界後直接切換；建立世界預設只顯示名稱與隨機／自訂種子，需要時才展開模板與生態選項。
+- 結構物理是固定世界規則，已移除失效的 Off／Simple／Full 設定與 Mod 假切換；Mod API 改為回報 BEPU backend、Grid 和 substep 狀態。
 - 詳細的現況邊界、依賴方向與下一階段拆分原則見 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 驗證三個圖形模式：
@@ -15,6 +18,8 @@
 dotnet run -c Release -- --gpu-smoke
 dotnet run -c Release -- --gpu-smoke-pbr
 dotnet run -c Release -- --gpu-smoke-classic
+dotnet run -c Release -- --gpu-smoke-menu
+dotnet run -c Release -- --gpu-smoke-world-creator
 ```
 
 ## 0.12.1 互動、反射與中文介面
@@ -32,7 +37,7 @@ dotnet run -c Release -- --gpu-smoke-classic
 - `V` 切換精密模式；精密模式左鍵移除一個微格，普通模式左鍵會清除整個細分容器，右鍵放置，`Alt + 滾輪` 切換精度。
 - 微方塊共用 CPU 射線命中、玩家 AABB 碰撞、六面物理支撐、GPU path tracing 與第 7 版存檔資料。
 - Tools 介面可切換模式與選擇網格；一般畫面不顯示編輯狀態，按 F3 才顯示精度與除錯資訊。
-- GPU 採二層追蹤：先走 64×32×64 粗網格，只在命中的 cell 測試 sparse micro AABB。
+- Compute PT 採跟隨玩家的 64×576×64 GPU 粗網格視窗，只在命中的 cell 測試 sparse micro AABB；CPU 世界座標的 X／Z 不受這個視窗限制。
 
 快速驗證：
 
@@ -60,7 +65,7 @@ Creative voxel building
 - 世界與方塊預覽共用真正的程序化 16×16 材質圖集；自然材質有穩定的逐像素色差、粗糙度與高度法線，純色方塊不會被強制加雜訊。
 - Creative Library 提供等角方塊縮圖、分類、搜尋、收藏、最近使用，以及可自行配置並持久化的九格快捷欄。
 - `E`、`I` 或 `Tab` 開啟材質庫；數字鍵選快捷格、滾輪切換、中鍵吸取到目前快捷格。
-- 準星有明暗場景可見的外框與情境顏色，並能在設定調整大小、透明度和開關。
+- 準星有明暗場景可見的外框與真正接線的情境顏色：破壞、放置成功／阻擋、選區、吸取和 Grid 工具各自可辨識，並能在設定調整大小、透明度與開關。
 - Natural v2 使用 domain warp、大陸度、侵蝕、山脊、溫濕度、河道與地質分層生成；包含 3D 洞穴與群落式植被，不生成任何生物或人工建築。
 
 ## 目前已完成
@@ -78,13 +83,17 @@ Creative voxel building
 - 球形增加／擦除筆刷、地形平整、可調半徑爆破。
 - 六面結構物理：失去支撐的連通結構會整體脫離成可連續平移、旋轉、碰撞與休眠的局部 Grid；斜角接觸不傳遞支撐。
 - 網格歸屬工具：左鍵選目標 Grid，右鍵把目前方塊轉入目標；只接受座標對齊且六面相鄰的完整方塊。
-- 摔落衝擊斷裂是獨立實驗選項，預設關閉；基本的失去支撐斷裂永遠屬於世界規則，不再是舊式落沙開關。
-- 世界 Chunk 會註冊為 BEPU 靜態碰撞體，斷裂 Grid 會轉成動態 compound body；BEPU 負責接觸流形、摩擦、零回彈、CCD、旋轉、堆疊和休眠。F3 可查看實際碰撞步數。
-- 第 5 版 16-bit 世界存檔、備份恢復、自動存檔與方塊 key 重映射；第 1–4 版 byte 世界可自動遷移。
+- 基本的失去支撐斷裂永遠屬於世界規則，不再是舊式落沙開關；撞擊二次斷裂要等 BEPU 接觸事件正式接入後才會重新提供設定。
+- 世界 Chunk 會註冊為 BEPU 靜態碰撞體，斷裂 Grid 會轉成動態 compound body；BEPU 負責接觸流形、摩擦、零回彈、CCD、旋轉、堆疊和休眠，並以固定 120 Hz、最多六步追幀。F3 可查看實際步數。
+- PBR Forward 與 Classic 使用 16×16 Chunk GPU mesh；一般方塊修改只重建所屬與必要的面鄰接 Chunk，移動 Grid 使用獨立動態 mesh。
+- 常規與精密體素資料由稀疏 Chunk 實際持有；空 Chunk 會自動釋放，舊版線性資料只在存檔與 compute GPU 上傳邊界產生。
+- 目錄世界以每個 16×16 Chunk 的獨立稀疏檔保存；Chunk、Physics、Player 全部寫完後才原子切換 `level.json`，損壞時以 `.bak` 恢復上一個完整世代，空世界不寫空 Chunk。
+- 方塊 ID 依 namespaced key 重映射；舊版第 1–7 版單區域存檔可讀取，下一次保存會遷移成新的分 Chunk 世代格式。
+- 主選單具備多世界瀏覽與載入；同名建立會拒絕而非靜默覆寫，切換前若目前世界保存失敗也會取消切換。
 - BepInEx 6 CoreCLR、HarmonyX、設定介面與依賴檢查已內置。
 - Mod API 可註冊／強制覆蓋方塊、物品、配方與建造工具。
 
-舊版生存資料結構仍保留在組件與存檔格式中，僅用於二進位相容與既有 Mod 過渡；本體不載入生存配方、不更新生存數值，也不顯示生存 HUD。
+舊版生存資料結構仍保留在組件與存檔格式中，僅用於二進位相容與既有 Mod 過渡；本體設定不再序列化遊戲模式、難度或掉落開關，也不載入生存配方、不更新生存數值、不消耗創意物品且不顯示生存 HUD。
 
 ## 操作
 
@@ -135,12 +144,13 @@ dotnet run -c Release --no-build -- --mod-diagnostics
 ```text
 SandboxGame                    -> 輸入、編輯器 UI、時間與各系統協調
 Gameplay/BuildToolSystem       -> 區域、筆刷、剪貼簿與爆破
-Gameplay/VoxelPhysicsSimulator -> 六面支撐分析、局部 Grid 剛體與可選衝擊斷裂
+Gameplay/VoxelPhysicsSimulator -> 六面支撐分析與局部 Grid 生命週期
+Gameplay/BepuPhysicsBackend    -> compound 剛體、固定步進、CCD、接觸與休眠
 Gameplay/PlayerController      -> 第一人稱、碰撞飛行、noclip、水中移動
 World/VoxelWorld               -> 體素資料、生成、碰撞查詢與修改事件
 World/BlockRegistry            -> 4,096 槽 16-bit 材質表與 last-writer-wins 覆蓋
 Rendering/RayTracingRenderer   -> compute path tracer 與 GPU 資源
-Persistence/WorldSaveService   -> 版本化 level/chunk/player 存檔
+Persistence/WorldSaveService   -> 分 Chunk 世代提交、完整備份恢復與舊存檔遷移
 RTXSandbox.ModAPI              -> 穩定的公開 Mod 合約
 Modding/ModHost                -> BepInEx 與服務／事件橋接
 ```
@@ -157,4 +167,4 @@ Modding/ModHost                -> BepInEx 與服務／事件橋接
 
 ## 有意保留到後續階段
 
-目前世界仍是固定 64×32×64 的可驗證原型，因此 Flat 高度會誠實限制在目前容量；真正的無限 Chunk、半格／四分之一格 micro-voxel、剛體碎片、天氣體積效果、鏡頭路徑與 DXR/Vulkan 後端需要更深的資料或渲染架構，不會用假 UI 冒充完成。這些項目已按依賴順序列入 Roadmap。
+世界目前支援無邊界 X／Z、Y -64..511 與玩家周圍同步惰性 Chunk 生成；每個 Region 檔合併 32×32 個 16×16 Chunk。遠距 Chunk 卸載、背景生成／mesh job、LOD、撞擊碎片、天氣體積效果與鏡頭路徑仍需後續完成，不會用假 UI 冒充。精密建造目前已支援 1/2 到 1/64 混合網格。

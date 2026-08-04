@@ -8,6 +8,12 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <OutputPath>bin\$(Configuration)\$(TargetFramework)\Managed\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <RunCommand>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(AssemblyName).exe'))</RunCommand>
+    <RunWorkingDirectory>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)'))</RunWorkingDirectory>
+    <StartProgram>$(RunCommand)</StartProgram>
+    <StartWorkingDirectory>$(RunWorkingDirectory)</StartWorkingDirectory>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,6 +22,7 @@
 
   <ItemGroup>
     <Compile Remove="RTXSandbox.ModAPI\**\*.cs" />
+    <Compile Remove="Examples\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,20 +30,57 @@
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
     <PackageReference Include="BepuPhysics" Version="2.4.0" />
     <PackageReference Include="OpenTK" Version="4.9.4" />
+    <PackageReference Include="Vortice.Direct3D12" Version="3.1.1-beta" />
+    <PackageReference Include="Vortice.Dxc" Version="3.1.1-beta" />
   </ItemGroup>
 
   <ItemGroup>
     <None Update="Shaders\*.glsl">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>..\Shaders\%(Filename)%(Extension)</TargetPath>
+    </None>
+    <None Update="Shaders\*.hlsl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>..\Shaders\%(Filename)%(Extension)</TargetPath>
     </None>
     <None Update="settings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>..\settings.json</TargetPath>
     </None>
     <None Update="Content\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>..\Content\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
     </None>
     <None Update="ContentPacks\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>..\ContentPacks\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
     </None>
   </ItemGroup>
+
+  <Target Name="RemoveLegacyRootRuntimeFiles" BeforeTargets="Build">
+    <ItemGroup>
+      <LegacyRootRuntimeFile Include="$(OutputPath)..\*.dll" />
+      <LegacyRootRuntimeFile Include="$(OutputPath)..\*.pdb" />
+      <LegacyRootRuntimeFile Include="$(OutputPath)..\RTXSandbox.exe" />
+      <LegacyRootRuntimeFile Include="$(OutputPath)..\RTXSandbox.deps.json" />
+      <LegacyRootRuntimeFile Include="$(OutputPath)..\RTXSandbox.runtimeconfig.json" />
+    </ItemGroup>
+    <Delete Files="@(LegacyRootRuntimeFile)" />
+    <RemoveDir Directories="$(OutputPath)..\runtimes" Condition="Exists('$(OutputPath)..\runtimes')" />
+  </Target>
+
+  <Target Name="CreateRootAppHost"
+          AfterTargets="Build"
+          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration">
+    <CreateAppHost AppHostSourcePath="$(AppHostSourcePath)"
+                   AppHostDestinationPath="$(OutputPath)..\$(TargetName)$(_NativeExecutableExtension)"
+                   AppBinaryName="Managed\$(AssemblyName)$(TargetExt)"
+                   IntermediateAssembly="@(IntermediateAssembly->'%(FullPath)')"
+                   WindowsGraphicalUserInterface="$(_UseWindowsGraphicalUserInterface)"
+                   Retries="$(CopyRetryCount)"
+                   RetryDelayMilliseconds="$(CopyRetryDelayMilliseconds)"
+                   EnableMacOSCodeSign="$(_EnableMacOSCodeSign)"
+                   DisableCetCompat="$(_DisableCetCompat)" />
+    <Delete Files="$(TargetDir)$(TargetName)$(_NativeExecutableExtension)" />
+  </Target>
 </Project>

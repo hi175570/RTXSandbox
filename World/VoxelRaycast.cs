@@ -31,8 +31,6 @@ public static class VoxelRaycast
         int x = (int)MathF.Floor(origin.X);
         int y = (int)MathF.Floor(origin.Y);
         int z = (int)MathF.Floor(origin.Z);
-        bool skipStartingFluid = world.IsFluid(x, y, z);
-
         int stepX = Math.Sign(direction.X);
         int stepY = Math.Sign(direction.Y);
         int stepZ = Math.Sign(direction.Z);
@@ -48,7 +46,8 @@ public static class VoxelRaycast
         for (int iteration = 0; iteration < 512 && distance <= maxDistance; iteration++)
         {
             VoxelMaterial material = world.Get(x, y, z);
-            if (material != VoxelMaterial.Air && !(skipStartingFluid && world.IsFluid(x, y, z)))
+            // Water is a visual medium, never an editable selection target.
+            if (material != VoxelMaterial.Air && !world.IsFluid(x, y, z))
             {
                 return new VoxelHit(x, y, z, normal, distance, material);
             }

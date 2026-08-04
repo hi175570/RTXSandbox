@@ -1,9 +1,13 @@
 using System.Numerics;
+using System.Reflection;
+using System.Text.Json;
 using RTXSandbox.Configuration;
 using RTXSandbox.Gameplay;
 using RTXSandbox.ModAPI;
+using RTXSandbox.Modding;
 using RTXSandbox.Persistence;
 using RTXSandbox.Rendering;
+using RTXSandbox.Rendering.Backends;
 using RTXSandbox.World;
 
 namespace RTXSandbox;
@@ -14,14 +18,28 @@ public static class SelfTests
     {
         var failures = new List<string>();
         Run("voxel set/get", TestVoxelSetGet, failures);
+        Run("infinite world generates deterministic distant negative chunks", TestInfiniteWorldGeneration, failures);
+        Run("queued chunk generation commits asynchronously", TestQueuedChunkGeneration, failures);
+        Run("chunk streaming cancels obsolete generation work", TestChunkGenerationCancellation, failures);
         Run("raycast hit and normal", TestRaycast, failures);
         Run("player floor collision", TestFloorCollision, failures);
         Run("player cannot place inside body", TestPlacementOverlap, failures);
+        Run("placement requires 1.1 blocks of eye distance", TestMinimumPlacementDistance, failures);
         Run("world clock cycle and pause", TestWorldClock, failures);
+        Run("settings save atomically and recover from backup", TestSettingsRecovery, failures);
         Run("water raycast and collision", TestWaterBehavior, failures);
         Run("player can swim upward", TestSwimming, failures);
+        Run("player continuously climbs out at a shoreline", TestSwimmingShoreExit, failures);
+        Run("player does not auto-climb walls from water", TestSwimmingDoesNotAutoClimb, failures);
+        Run("physics grids push players continuously without teleporting", TestContinuousGridPush, failures);
         Run("modded world save remaps block keys", TestWorldSaveRemapping, failures);
+        Run("directory worlds save and recover independent chunks", TestDirectoryChunkPersistence, failures);
+        Run("world management renames rebuilds and deletes safely", TestWorldManagement, failures);
+        Run("empty directory worlds do not emit empty chunk files", TestEmptyDirectoryChunkPersistence, failures);
+        Run("legacy directory region migrates into chunk generations", TestLegacyDirectoryMigration, failures);
         Run("forced block override is last-writer-wins", TestForcedBlockOverride, failures);
+        Run("example content pack loads a playable block", TestExampleContentPack, failures);
+        Run("manual mod workspace compiles and preserves loose text sources", TestModWorkspaceCompilation, failures);
         Run("inventory stacks and removes items", TestInventoryStacking, failures);
         Run("dropped items are picked up", TestDroppedItemPickup, failures);
         Run("survival applies fall and drowning damage", TestSurvivalDamage, failures);
@@ -52,24 +70,36 @@ public static class SelfTests
         Run("creative hotbar stores namespaced block keys", TestCreativeHotbar, failures);
         Run("mixed precision grids stay sparse and exact", TestMicroVoxelGridPromotion, failures);
         Run("micro voxels raycast at exact surfaces", TestMicroVoxelRaycast, failures);
+        Run("micro voxel edits publish precise and bulk invalidation", TestMicroVoxelChangeEvents, failures);
         Run("player collision follows micro voxel geometry", TestMicroVoxelCollision, failures);
         Run("precision edits undo and persist with key remapping", TestMicroVoxelEditingAndPersistence, failures);
         Run("primary destroys while secondary placement stays explicit", TestPrimaryDestroySemantics, failures);
         Run("renderer catalog exposes only working backends", TestRenderBackendCatalog, failures);
+        Run("chunk coordinates and mesh invalidation cross boundaries", TestChunkCoordinates, failures);
+        Run("voxel data is owned and released by chunks", TestChunkOwnedVoxelStorage, failures);
+        Run("chunk storage preserves the legacy linear snapshot", TestChunkLinearSnapshot, failures);
+        Run("chunk occupied bounds shrink without losing precision cells", TestChunkOccupiedBounds, failures);
         Run("normal destruction clears an entire precision cell", TestWholeCellMicroDestruction, failures);
         Run("physics grids persist with transforms and velocities", TestPhysicsGridPersistence, failures);
         Run("grid ownership transfers only aligned face-neighbor cells", TestGridOwnershipTransfer, failures);
         Run("physics grids prune enclosed collision cells", TestPhysicsGridCollisionShell, failures);
         Run("physics engine uses bounded collision substeps", TestPhysicsGridSubsteps, failures);
-        Run("physics grid center of mass uses element volume", TestPhysicsGridCenterOfMass, failures);
+        Run("physics engine accumulates an exact fixed timestep", TestPhysicsFixedTimestep, failures);
+        Run("physics backend survives world reload", TestPhysicsWorldReload, failures);
+        Run("player edits outrank streamed collision rebuilds", TestUrgentPhysicsChunkRebuild, failures);
+        Run("physics disposal is idempotent", TestPhysicsDisposal, failures);
+        Run("sleeping physics grids do not invalidate rendering", TestSleepingGridInvalidation, failures);
+        Run("physics grid center of mass uses volume and density", TestPhysicsGridCenterOfMass, failures);
+        Run("physics grid culling radius covers its complete geometry", TestPhysicsGridBoundingRadius, failures);
         Run("removing an offset support gives structure angular velocity", TestOffsetSupportTorque, failures);
         Run("dynamic grid selection follows translation and rotation", TestDynamicGridSelectionTransform, failures);
+        Run("dynamic grid placement preview matches the committed cell", TestDynamicGridPlacementPreview, failures);
         Run("floor contact preserves rigid-body rotation", TestFloorContactRotation, failures);
         Run("resting grid does not enter a perpetual bounce cycle", TestGridSettlesWithoutBounce, failures);
 
         if (failures.Count == 0)
         {
-            Console.WriteLine("All 53 RTX Sandbox self-tests passed.");
+            Console.WriteLine("All 79 RTX Sandbox self-tests passed.");
             return 0;
         }
 
@@ -86,7 +116,148 @@ public static class SelfTests
         var world = new VoxelWorld(generate: false);
         Assert(world.Set(2, 3, 4, VoxelMaterial.Metal), "first write should change the world");
         Assert(world.Get(2, 3, 4) == VoxelMaterial.Metal, "material mismatch");
-        Assert(!world.Set(-1, 3, 4, VoxelMaterial.Stone), "out-of-bounds write succeeded");
+        Assert(world.Set(-1, 3, -4, VoxelMaterial.Stone) &&
+               world.Get(-1, 3, -4) == VoxelMaterial.Stone,
+            "negative horizontal coordinates were rejected");
+        Assert(!world.Set(0, VoxelWorld.MinimumY - 1, 0, VoxelMaterial.Stone) &&
+               !world.Set(0, VoxelWorld.MaximumY, 0, VoxelMaterial.Stone),
+            "vertical out-of-bounds write succeeded");
+    }
+
+    private static void TestInfiniteWorldGeneration()
+    {
+        var settings = WorldGenerationSettings.Natural(8675309);
+        var first = new VoxelWorld(generationSettings: settings);
+        var second = new VoxelWorld(generationSettings: settings);
+        var distant = new ChunkCoordinate(-41, 73);
+        Assert(first.EnsureChunkGenerated(distant) && second.EnsureChunkGenerated(distant),
+            "distant negative/positive chunk coordinates were not generated");
+        VoxelChunkSnapshot firstChunk = first.SnapshotChunk(distant);
+        VoxelChunkSnapshot secondChunk = second.SnapshotChunk(distant);
+        Assert(firstChunk.Voxels.SequenceEqual(secondChunk.Voxels),
+            "same seed generated different distant chunk contents");
+        Assert(firstChunk.Voxels.Any(voxel => voxel.Y == VoxelWorld.MinimumY &&
+                                              voxel.MaterialId == (ushort)VoxelMaterial.Bedrock),
+            "distant chunk did not include the -64 bedrock boundary");
+        Assert(first.IsInside(int.MinValue, 0, int.MaxValue) &&
+               !first.IsInside(0, VoxelWorld.MaximumY, 0),
+            "world bounds are not unbounded X/Z with the configured vertical range");
+    }
+
+    private static void TestQueuedChunkGeneration()
+    {
+        var world = new VoxelWorld(generationSettings: WorldGenerationSettings.Natural(424242));
+        int loadedBefore = world.LoadedChunkCount;
+        var target = new ChunkCoordinate(-17, 21);
+        Vector3 targetPosition = new(target.MinimumX + 0.5f, 8f, target.MinimumZ + 0.5f);
+        Assert(world.QueueChunksAround(targetPosition, radius: 0) == 1,
+            "missing target chunk was not queued");
+        Assert(world.LoadedChunkCount == loadedBefore && world.PendingChunkGenerationCount == 1,
+            "queue call synchronously generated or committed the chunk");
+
+        bool committed = false;
+        var timeout = System.Diagnostics.Stopwatch.StartNew();
+        while (timeout.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            if (world.ProcessPendingChunkGeneration() == 1)
+            {
+                committed = true;
+                break;
+            }
+            Thread.Yield();
+        }
+        Assert(committed && world.PendingChunkGenerationCount == 0,
+            "worker result was not committed within the test timeout");
+        Assert(world.SnapshotGeneratedChunks().Contains(target) && world.SnapshotChunk(target).Voxels.Count > 0,
+            "committed worker result did not populate the requested chunk");
+    }
+
+    private static void TestChunkGenerationCancellation()
+    {
+        var settings = new WorldGenerationSettings
+        {
+            Preset = WorldPreset.Flat,
+            Seed = 4141,
+            FlatSurfaceHeight = 4,
+            GenerateLakes = false,
+            GenerateVegetation = false,
+        };
+        var world = new VoxelWorld(generate: false, generationSettings: settings);
+        world.QueueChunksAround(Vector3.Zero, radius: 1);
+        Assert(world.PendingChunkGenerationCount == 9,
+            $"first generation window queued {world.PendingChunkGenerationCount} chunks instead of nine");
+
+        var distantPosition = new Vector3(1600.5f, 8f, -1600.5f);
+        world.QueueChunksAround(distantPosition, radius: 1);
+        Assert(world.PendingChunkGenerationCount == 9,
+            "moving the generation window retained obsolete chunks around the old position");
+
+        ChunkCoordinate direct = ChunkCoordinate.FromVoxel(1600, -1601);
+        Assert(world.EnsureChunkGenerated(direct), "direct chunk generation did not run");
+        Assert(world.PendingChunkGenerationCount == 8,
+            "a synchronously generated queued chunk remained falsely pending");
+    }
+
+    private static void TestModWorkspaceCompilation()
+    {
+        string testRoot = Path.Combine(Path.GetTempPath(), $"RTXSandbox-ModWorkspace-{Guid.NewGuid():N}");
+        string pluginRoot = Path.Combine(testRoot, "plugins");
+        string backupRoot = Path.Combine(testRoot, "backups");
+        string trashRoot = Path.Combine(testRoot, "trash");
+        Directory.CreateDirectory(pluginRoot);
+        string prerequisiteSource = Path.Combine(pluginRoot, "Prerequisite.txt");
+        string looseSource = Path.Combine(pluginRoot, "MysteryText.txt");
+        const string prerequisite = "public static class PrerequisiteMarker { public const int Value = 7; }";
+        const string source = """
+            using BepInEx;
+            using BepInEx.NET.Common;
+
+            [BepInPlugin("rtxsandbox.tests.mystery", "Mystery Text Mod", "1.0.0")]
+            public sealed class MysteryTextPlugin : BasePlugin
+            {
+                public int PrerequisiteValue => PrerequisiteMarker.Value;
+                public override void Load() { }
+            }
+            """;
+        try
+        {
+            File.WriteAllText(prerequisiteSource, prerequisite);
+            var workspace = new ModWorkspace(pluginRoot, AppContext.BaseDirectory, backupRoot, trashRoot);
+            ModCompilationResult prerequisiteResult = workspace.Compile(prerequisiteSource, TimeSpan.FromMinutes(2));
+            Assert(prerequisiteResult.Success, $"prerequisite compile failed: {prerequisiteResult.Log}");
+
+            File.WriteAllText(looseSource, source);
+            File.WriteAllBytes(Path.Combine(pluginRoot, "MysteryText.dll"), new byte[] { 1, 2, 3, 4 });
+
+            ModCompilationResult result = workspace.Compile(looseSource, TimeSpan.FromMinutes(2));
+            Assert(result.Success, $"manual mod compile failed: {result.Log}");
+            Assert(result.ReferenceCount > prerequisiteResult.ReferenceCount,
+                "recursive plugin prerequisite DLL was not included in all-in references");
+            Assert(result.OrganizedLooseFiles, "loose source was not organized on explicit compile");
+            string organizedSource = Path.Combine(pluginRoot, "MysteryText", "MysteryText.txt");
+            string compiledAssembly = Path.Combine(pluginRoot, "MysteryText", "MysteryText.dll");
+            Assert(File.Exists(organizedSource), "organized source was lost");
+            Assert(File.ReadAllText(organizedSource) == source, "compile changed the source text");
+            Assert(!File.Exists(looseSource), "loose source was copied instead of moved into its folder");
+            Assert(File.Exists(compiledAssembly), "compiled DLL was not placed beside the source");
+            Assert(AssemblyName.GetAssemblyName(compiledAssembly).Name == "MysteryText",
+                "compiled output is not a readable MysteryText assembly");
+
+            string edited = source.Replace("1.0.0", "1.0.1", StringComparison.Ordinal);
+            string backupPath = workspace.SaveText(organizedSource, edited);
+            Assert(File.Exists(backupPath), "editor save did not retain a rollback copy");
+            Assert(workspace.RollbackText(organizedSource) == source, "editor rollback did not restore the prior save");
+
+            string movedSource = workspace.MoveToFolder(organizedSource, "Moved");
+            Assert(File.Exists(movedSource), "explicit move did not move the source");
+            string trashedSource = workspace.MoveToTrash(movedSource);
+            Assert(File.Exists(trashedSource) && !File.Exists(movedSource),
+                "confirmed delete did not move the source into recoverable trash");
+        }
+        finally
+        {
+            if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
+        }
     }
 
     private static void TestRaycast()
@@ -125,6 +296,48 @@ public static class SelfTests
         Assert(!player.WouldIntersectBlock(4, 1, 3), "adjacent voxel incorrectly overlaps body");
     }
 
+    private static void TestMinimumPlacementDistance()
+    {
+        var blocks = new BlockRegistry();
+
+        var regularWorld = new VoxelWorld(generate: false, registry: blocks);
+        regularWorld.Set(3, 2, 2, VoxelMaterial.Stone);
+        var buildTools = new BuildToolSystem(regularWorld, blocks, new BuildToolRegistry())
+        {
+            SelectedBlockId = (ushort)VoxelMaterial.Glass,
+        };
+        var nearRegular = new VoxelHit(3, 2, 2, -Vector3.UnitX, 1.099f, VoxelMaterial.Stone);
+        Assert(!buildTools.QuickPlace(nearRegular) && regularWorld.Get(2, 2, 2) == VoxelMaterial.Air,
+            "regular placement accepted a target closer than 1.1 blocks");
+        Assert(buildTools.QuickPlace(nearRegular with { Distance = 1.1f }) &&
+               regularWorld.Get(2, 2, 2) == VoxelMaterial.Glass,
+            "regular placement rejected the exact 1.1-block boundary");
+
+        var microWorld = new VoxelWorld(generate: false, registry: blocks);
+        microWorld.Set(3, 2, 2, VoxelMaterial.Stone);
+        var micro = new MicroBuildSystem(microWorld, blocks);
+        var nearPrecision = new PrecisionHit(
+            3, 2, 2, new Vector3(3f, 2.5f, 2.5f), -Vector3.UnitX, 1.099f,
+            (ushort)VoxelMaterial.Stone, false);
+        Assert(!micro.Place(nearPrecision, (ushort)VoxelMaterial.Glass),
+            "precision placement accepted a target closer than 1.1 blocks");
+        Assert(micro.Place(nearPrecision with { Distance = 1.1f }, (ushort)VoxelMaterial.Glass),
+            "precision placement rejected the exact 1.1-block boundary");
+
+        var gridWorld = new VoxelWorld(generate: false, registry: blocks);
+        PhysicsGrid grid = gridWorld.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            new Vector3(8f));
+        using var physics = new VoxelPhysicsSimulator(gridWorld, blocks);
+        var nearGrid = new PhysicsGridRayHit(
+            grid.Id, 0, 0, 0, (ushort)VoxelMaterial.Stone,
+            grid.LocalToWorld(new Vector3(1f, 0.5f, 0.5f)), Vector3.UnitX, 1.099f);
+        Assert(!physics.CanPlaceOnGrid(nearGrid, (ushort)VoxelMaterial.Glass),
+            "Physics Grid placement accepted a target closer than 1.1 blocks");
+        Assert(physics.CanPlaceOnGrid(nearGrid with { Distance = 1.1f }, (ushort)VoxelMaterial.Glass),
+            "Physics Grid placement rejected the exact 1.1-block boundary");
+    }
+
     private static void TestWorldClock()
     {
         var clock = new WorldClock(23.5f, 1f);
@@ -137,9 +350,80 @@ public static class SelfTests
         Assert(MathF.Abs(clock.TimeOfDayHours - 23.5f) < 0.001f, "manual rewind did not wrap");
     }
 
+    private static void TestSettingsRecovery()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"rtxsandbox-settings-{Guid.NewGuid():N}");
+        string path = Path.Combine(directory, "settings.json");
+        try
+        {
+            var settings = new GameSettings
+            {
+                Exposure = 1.4f,
+                PathBounces = 5,
+                PathSamplesPerFrame = 2,
+                PathMaxAccumulatedSamples = 2048,
+                DeferredSpecularQuality = 1,
+                DeferredShadowQuality = 3,
+                DeferredAmbientOcclusionQuality = 1,
+                DeferredDebugView = DeferredDebugView.Normal,
+                PbrReflectionQuality = 3,
+                ClassicLightingQuality = 2,
+                HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.Reference,
+                FpsLimit = 144,
+            };
+            settings.Save(path);
+            Assert(File.Exists(path) && !File.Exists(path + ".tmp"),
+                "first settings save was not finalized atomically");
+            string settingsJson = File.ReadAllText(path);
+            Assert(!settingsJson.Contains("physicsMode", StringComparison.OrdinalIgnoreCase) &&
+                   !settingsJson.Contains("impactFracture", StringComparison.OrdinalIgnoreCase) &&
+                   !settingsJson.Contains("gameMode", StringComparison.OrdinalIgnoreCase) &&
+                   !settingsJson.Contains("difficulty", StringComparison.OrdinalIgnoreCase) &&
+                   !settingsJson.Contains("enableItemDrops", StringComparison.OrdinalIgnoreCase),
+                "removed physics or survival switches still leaked into the settings schema");
+
+            settings.Exposure = 2.2f;
+            settings.PathBounces = 9;
+            settings.FpsLimit = 165;
+            settings.Save();
+            Assert(File.Exists(path + ".bak"), "replacing settings did not retain a backup");
+            GameSettings latest = GameSettings.Load(path);
+            Assert(!latest.RecoveredFromBackup && MathF.Abs(latest.Exposure - 2.2f) < 0.001f &&
+                   latest.PathBounces == 9 && latest.FpsLimit == 165 &&
+                   latest.PathSamplesPerFrame == 2 && latest.PathMaxAccumulatedSamples == 2048 &&
+                   latest.DeferredSpecularQuality == 1 && latest.PbrReflectionQuality == 3 &&
+                   latest.DeferredShadowQuality == 3 && latest.DeferredAmbientOcclusionQuality == 1 &&
+                   latest.DeferredDebugView == DeferredDebugView.Normal &&
+                   latest.ClassicLightingQuality == 2 &&
+                   latest.HardwareRayTracingRenderStyle == HardwareRayTracingRenderStyle.Reference &&
+                   latest.Version == GameSettings.CurrentVersion,
+                "settings did not round-trip through the current schema");
+
+            File.WriteAllText(path, "{ definitely-not-json");
+            GameSettings recovered = GameSettings.Load(path);
+            Assert(recovered.RecoveredFromBackup && MathF.Abs(recovered.Exposure - 1.4f) < 0.001f &&
+                   recovered.PathBounces == 5 && recovered.FpsLimit == 144,
+                "corrupt settings did not recover the last valid backup");
+            recovered.Save();
+            GameSettings repaired = GameSettings.Load(path);
+            Assert(!repaired.RecoveredFromBackup && MathF.Abs(repaired.Exposure - 1.4f) < 0.001f,
+                "saving recovered settings did not repair the primary file");
+
+            File.Delete(path);
+            GameSettings missingPrimary = GameSettings.Load(path);
+            Assert(missingPrimary.RecoveredFromBackup && MathF.Abs(missingPrimary.Exposure - 1.4f) < 0.001f,
+                "a missing primary settings file did not recover the valid backup");
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static void TestWaterBehavior()
     {
-        var world = new VoxelWorld(generate: false);
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
         world.Set(2, 2, 2, VoxelMaterial.Water);
         world.Set(3, 2, 2, VoxelMaterial.Water);
         world.Set(4, 2, 2, VoxelMaterial.Stone);
@@ -147,6 +431,29 @@ public static class SelfTests
         Assert(world.FindTopVoxelY(2, 2) == 2, "water surface was not included in top-voxel query");
         VoxelHit? hit = VoxelRaycast.Cast(world, new Vector3(2.5f, 2.5f, 2.5f), Vector3.UnitX, 8f);
         Assert(hit.HasValue && hit.Value.Material == VoxelMaterial.Stone, "ray starting in water did not reach solid terrain");
+        VoxelHit? outsideHit = VoxelRaycast.Cast(world, new Vector3(1.5f, 2.5f, 2.5f), Vector3.UnitX, 8f);
+        Assert(outsideHit.HasValue && outsideHit.Value.Material == VoxelMaterial.Stone && outsideHit.Value.X == 4,
+            "selection ray targeted water instead of passing through it");
+
+        BlockDefinition water = blocks.Get((ushort)VoxelMaterial.Water);
+        Assert(!water.IsUnbreakable && water.IsReplaceable && water.IsTransparent &&
+               water.Transmission > 0.9f && MathF.Abs(water.IndexOfRefraction - 1.333f) < 0.01f,
+            "water optical or editing properties were not loaded");
+        var tools = new BuildToolSystem(world, blocks, new BuildToolRegistry())
+        {
+            SelectedBlockId = (ushort)VoxelMaterial.Glass,
+        };
+        var waterHit = new VoxelHit(2, 2, 2, Vector3.UnitX, 1.5f, VoxelMaterial.Water);
+        Assert(tools.QuickPlace(waterHit) && world.Get(2, 2, 2) == VoxelMaterial.Glass,
+            "placing a block did not replace the targeted water cell");
+        world.Set(2, 2, 2, VoxelMaterial.Water);
+        Assert(tools.UsePrimary(waterHit) && world.Get(2, 2, 2) == VoxelMaterial.Air,
+            "primary destroy could not remove water");
+
+        world.Set(2, 2, 2, VoxelMaterial.Water);
+        var precision = new MicroBuildSystem(world, blocks);
+        Assert(precision.PaintCell(2, 2, 2, 16, 0, 0, 0, 0),
+            "precision editing still treated water as unbreakable");
     }
 
     private static void TestSwimming()
@@ -164,6 +471,94 @@ public static class SelfTests
         }
         Assert(player.IsInWater, "player did not detect water");
         Assert(player.Position.Y > initialY + 0.2f, "swim-up input did not raise the player");
+    }
+
+    private static void TestSwimmingShoreExit()
+    {
+        var world = new VoxelWorld(generate: false);
+        for (int x = 2; x <= 4; x++)
+        for (int z = 3; z <= 5; z++)
+        {
+            world.Set(x, 0, z, VoxelMaterial.Bedrock);
+            world.Set(x, 1, z, VoxelMaterial.Water);
+        }
+        for (int x = 2; x <= 4; x++)
+        {
+            world.Set(x, 0, 2, VoxelMaterial.Bedrock);
+            world.Set(x, 1, 2, VoxelMaterial.Stone);
+        }
+        var player = new PlayerController(world, new Vector3(3.5f, 1.05f, 3.5f));
+        bool reachedShore = false;
+        for (int frame = 0; frame < 180; frame++)
+        {
+            player.Update(1f / 60f, new Vector2(0f, 1f), -Vector3.UnitZ, false, true);
+            if (player.Position.Z < 3.0f && player.Position.Y >= 1.95f)
+            {
+                reachedShore = true;
+                break;
+            }
+        }
+        Assert(reachedShore,
+            $"player remained trapped at shoreline ({player.Position.X:0.00}, {player.Position.Y:0.00}, {player.Position.Z:0.00})");
+    }
+
+    private static void TestSwimmingDoesNotAutoClimb()
+    {
+        var world = new VoxelWorld(generate: false);
+        for (int x = 2; x <= 4; x++)
+        for (int z = 3; z <= 5; z++)
+        {
+            world.Set(x, 0, z, VoxelMaterial.Bedrock);
+            world.Set(x, 1, z, VoxelMaterial.Water);
+        }
+        for (int x = 2; x <= 4; x++)
+        for (int y = 0; y <= 3; y++)
+            world.Set(x, y, 2, y == 0 ? VoxelMaterial.Bedrock : VoxelMaterial.Stone);
+
+        var player = new PlayerController(world, new Vector3(3.5f, 1.05f, 3.5f));
+        float initialY = player.Position.Y;
+        for (int frame = 0; frame < 180; frame++)
+            player.Update(1f / 60f, new Vector2(0f, 1f), -Vector3.UnitZ, false, false);
+
+        Assert(player.Position.Z >= 3.25f,
+            $"player crossed a high wall without jump input (Z={player.Position.Z:0.00})");
+        Assert(player.Position.Y < initialY + 0.2f,
+            $"player auto-climbed while pressing forward in water (Y={player.Position.Y:0.00})");
+    }
+
+    private static void TestContinuousGridPush()
+    {
+        var world = new VoxelWorld(generate: false);
+        world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            Vector3.Zero);
+        var player = new PlayerController(world, new Vector3(1.2f, 0f, 0.5f));
+        Vector3 initial = player.Position;
+        Assert(player.ResolveExternalPenetration(1f / 60f), "overlapping Grid did not push the player");
+        float firstStep = Vector3.Distance(initial, player.Position);
+        Assert(firstStep > 0f && firstStep <= 0.041f,
+            $"Grid squeeze teleported the player by {firstStep:0.000} m in one frame");
+        Assert(MathF.Abs(player.Position.Y - initial.Y) < 0.001f,
+            $"Grid squeeze pushed the player upward instead of sideways (Y={player.Position.Y:0.000})");
+        for (int frame = 0; frame < 30; frame++) player.ResolveExternalPenetration(1f / 60f);
+        Assert(!world.PhysicsGrids.TryCalculatePlayerPenetration(
+                new Vector3(player.Position.X - PlayerController.Radius, player.Position.Y, player.Position.Z - PlayerController.Radius),
+                new Vector3(player.Position.X + PlayerController.Radius, player.Position.Y + PlayerController.Height, player.Position.Z + PlayerController.Radius),
+                out _, out _),
+            "bounded continuous pushes never released the player from the Grid");
+
+        var fastWorld = new VoxelWorld(generate: false);
+        PhysicsGrid fastGrid = fastWorld.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            Vector3.Zero);
+        fastGrid.LinearVelocity = Vector3.UnitX * 120f;
+        var fastPlayer = new PlayerController(fastWorld, new Vector3(1.2f, 0f, 0.5f));
+        Vector3 fastInitial = fastPlayer.Position;
+        Assert(fastPlayer.ResolveExternalPenetration(1f / 60f),
+            "fast overlapping Grid did not trigger anti-stuck recovery");
+        float fastStep = Vector3.Distance(fastInitial, fastPlayer.Position);
+        Assert(MathF.Abs(fastStep - firstStep) < 0.0001f,
+            $"anti-stuck speed inherited Grid velocity: stationary={firstStep:0.000}, fast={fastStep:0.000}");
     }
 
     private static void TestWorldSaveRemapping()
@@ -209,6 +604,261 @@ public static class SelfTests
             File.Delete(savePath);
             File.Delete(savePath + ".tmp");
         }
+    }
+
+    private static void TestDirectoryChunkPersistence()
+    {
+        string saveRoot = Path.Combine(Path.GetTempPath(), $"rtxsandbox-chunks-{Guid.NewGuid():N}");
+        try
+        {
+            var originalBlocks = new BlockRegistry();
+            ushort originalMaterial = originalBlocks.Register(new BlockDefinition(
+                "test:chunk_material", "Chunk Material", new Vector3(0.2f, 0.7f, 1f)));
+            var originalWorld = new VoxelWorld(generate: false, registry: originalBlocks);
+            originalWorld.SetGenerationMetadata(new WorldGenerationSettings
+            {
+                Preset = WorldPreset.Flat,
+                Biome = BiomePreset.Plains,
+                Seed = 314159,
+                FlatSurfaceHeight = 4,
+                GenerateLakes = false,
+                GenerateVegetation = false,
+            });
+            originalWorld.SetBlockId(15, 3, 15, originalMaterial);
+            originalWorld.SetBlockId(16, 4, 15, originalMaterial);
+            var micro = new MicroVoxelContainer(4);
+            micro.PaintCell(4, 0, 0, 0, originalMaterial);
+            originalWorld.SetMicroVoxels(32, 5, 15, micro);
+            PhysicsGrid originalGrid = originalWorld.PhysicsGrids.Create(
+                new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, originalMaterial) },
+                new Vector3(8f, 10f, 8f));
+            originalGrid.AngularVelocity = new Vector3(0.2f, 0.4f, 0.1f);
+
+            var originalSaves = new WorldSaveService(
+                originalBlocks, preferredSeed: 314159, worldName: "chunk-test", saveRoot: saveRoot);
+            originalSaves.Save(originalWorld, new Vector3(2f, 3f, 4f), 17.5f);
+            Assert(File.Exists(originalSaves.SavePath), "directory world manifest was not created");
+            WorldSaveSummary[] discovered = originalSaves.DiscoverWorlds().ToArray();
+            Assert(discovered.Length == 1 && discovered[0].StorageName == "chunk-test" &&
+                   discovered[0].Seed == 314159 && discovered[0].Preset == WorldPreset.Flat,
+                "world browser metadata did not discover the saved world");
+            string[] firstRegionFiles = Directory.GetFiles(
+                Path.Combine(originalSaves.SaveDirectory, "regions"), "*.region", SearchOption.AllDirectories);
+            Assert(firstRegionFiles.Length == 1,
+                $"three chunks in one 32x32 area produced {firstRegionFiles.Length} region files");
+
+            var reorderedBlocks = new BlockRegistry();
+            reorderedBlocks.Register(new BlockDefinition("test:before_chunk", "Before Chunk", Vector3.One));
+            ushort remappedMaterial = reorderedBlocks.Register(new BlockDefinition(
+                "test:chunk_material", "Chunk Material", new Vector3(0.2f, 0.7f, 1f)));
+            var loadedWorld = new VoxelWorld(generate: false, registry: reorderedBlocks);
+            var loadedSaves = new WorldSaveService(
+                reorderedBlocks, preferredSeed: 1, worldName: "chunk-test", saveRoot: saveRoot);
+            Assert(loadedSaves.TryLoad(loadedWorld, out SavedWorldState loadedState, out string? loadError),
+                loadError ?? "directory world did not load");
+            Assert(remappedMaterial != originalMaterial &&
+                   loadedWorld.GetBlockId(15, 3, 15) == remappedMaterial &&
+                   loadedWorld.GetBlockId(16, 4, 15) == remappedMaterial,
+                "independent chunk material keys were not remapped");
+            Assert(loadedWorld.TryGetMicroVoxels(32, 5, 15, out MicroVoxelContainer? loadedMicro) &&
+                   loadedMicro!.Boxes.All(box => box.MaterialId == remappedMaterial),
+                "precision geometry was not restored from its chunk");
+            Assert(loadedWorld.PhysicsGrids.Count == 1 &&
+                   loadedWorld.PhysicsGrids.Grids[0].Elements[0].MaterialId == remappedMaterial,
+                "world-level physics state was not remapped and restored");
+            Assert(Vector3.DistanceSquared(loadedState.PlayerPosition, new Vector3(2f, 3f, 4f)) < 0.0001f &&
+                   MathF.Abs(loadedState.TimeOfDay - 17.5f) < 0.001f,
+                "directory player or time state was not restored");
+
+            loadedWorld.SetBlockId(15, 3, 15, (ushort)VoxelMaterial.Glass);
+            loadedSaves.Save(loadedWorld, new Vector3(9f, 9f, 9f), 3f);
+            string corruptRegionRelativePath;
+            using (JsonDocument manifest = JsonDocument.Parse(File.ReadAllText(loadedSaves.SavePath)))
+            {
+                corruptRegionRelativePath = manifest.RootElement.GetProperty("regions")
+                    .EnumerateArray()
+                    .Select(element => element.GetString() ?? string.Empty)
+                    .First(path => path.EndsWith("/0_0.region", StringComparison.Ordinal));
+            }
+            string corruptRegionPath = Path.GetFullPath(Path.Combine(
+                loadedSaves.SaveDirectory,
+                corruptRegionRelativePath.Replace('/', Path.DirectorySeparatorChar)));
+            File.WriteAllBytes(corruptRegionPath, new byte[] { 1, 2, 3, 4 });
+
+            var recoveredWorld = new VoxelWorld(generate: false, registry: reorderedBlocks);
+            var recoverySaves = new WorldSaveService(
+                reorderedBlocks, preferredSeed: 1, worldName: "chunk-test", saveRoot: saveRoot);
+            Assert(recoverySaves.TryLoad(recoveredWorld, out SavedWorldState recoveredState, out string? recoveryError),
+                recoveryError ?? "backup generation did not load");
+            Assert(recoverySaves.RecoveredLastLoad &&
+                   recoveredWorld.GetBlockId(15, 3, 15) == remappedMaterial &&
+                   Vector3.DistanceSquared(recoveredState.PlayerPosition, new Vector3(2f, 3f, 4f)) < 0.0001f,
+                "a corrupt active chunk did not recover the complete previous generation");
+
+            recoverySaves.Save(recoveredWorld, recoveredState.PlayerPosition, recoveredState.TimeOfDay);
+            var repairedWorld = new VoxelWorld(generate: false, registry: reorderedBlocks);
+            var repairedSaves = new WorldSaveService(
+                reorderedBlocks, preferredSeed: 1, worldName: "chunk-test", saveRoot: saveRoot);
+            Assert(repairedSaves.TryLoad(repairedWorld, out _, out string? repairedError),
+                repairedError ?? "repaired chunk generation did not load");
+            Assert(!repairedSaves.RecoveredLastLoad && repairedWorld.GetBlockId(15, 3, 15) == remappedMaterial,
+                "saving after recovery did not repair the primary manifest");
+        }
+        finally
+        {
+            if (Directory.Exists(saveRoot)) Directory.Delete(saveRoot, recursive: true);
+        }
+    }
+
+    private static void TestLegacyDirectoryMigration()
+    {
+        string saveRoot = Path.Combine(Path.GetTempPath(), $"rtxsandbox-legacy-directory-{Guid.NewGuid():N}");
+        try
+        {
+            var blocks = new BlockRegistry();
+            string worldDirectory = Path.Combine(saveRoot, "legacy-world");
+            string legacyChunkPath = Path.Combine(worldDirectory, "chunks", "0_0.chunk");
+            var legacyWorld = new VoxelWorld(generate: false, registry: blocks);
+            legacyWorld.Set(4, 5, 6, VoxelMaterial.Marble);
+            new WorldSaveService(blocks, legacyChunkPath)
+                .Save(legacyWorld, new Vector3(7f, 8f, 9f), 13.25f);
+            string levelPath = Path.Combine(worldDirectory, "level.json");
+            File.WriteAllText(levelPath, JsonSerializer.Serialize(new
+            {
+                formatVersion = 2,
+                seed = 1337,
+                chunks = new[] { "chunks/0_0.chunk" },
+            }));
+
+            var loadedWorld = new VoxelWorld(generate: false, registry: blocks);
+            var directorySaves = new WorldSaveService(
+                blocks, preferredSeed: 1, worldName: "legacy-world", saveRoot: saveRoot);
+            Assert(directorySaves.TryLoad(loadedWorld, out SavedWorldState state, out string? error),
+                error ?? "legacy directory region did not load");
+            Assert(loadedWorld.Get(4, 5, 6) == VoxelMaterial.Marble &&
+                   Vector3.DistanceSquared(state.PlayerPosition, new Vector3(7f, 8f, 9f)) < 0.0001f,
+                "legacy directory region lost world or player state");
+
+            directorySaves.Save(loadedWorld, state.PlayerPosition, state.TimeOfDay);
+            using JsonDocument migratedManifest = JsonDocument.Parse(File.ReadAllText(levelPath));
+            Assert(migratedManifest.RootElement.GetProperty("formatVersion").GetInt32() == 4 &&
+                   migratedManifest.RootElement.GetProperty("regions").GetArrayLength() == 1 &&
+                   File.Exists(levelPath + ".bak"),
+                "saving a legacy directory did not create a generation manifest and preserve its old manifest");
+        }
+        finally
+        {
+            if (Directory.Exists(saveRoot)) Directory.Delete(saveRoot, recursive: true);
+        }
+    }
+
+    private static void TestWorldManagement()
+    {
+        string saveRoot = Path.Combine(Path.GetTempPath(), $"rtxsandbox-world-management-{Guid.NewGuid():N}");
+        try
+        {
+            var blocks = new BlockRegistry();
+            var generation = new WorldGenerationSettings
+            {
+                Preset = WorldPreset.Void,
+                Biome = BiomePreset.Auto,
+                Seed = 24681357,
+                GenerateLakes = false,
+                GenerateVegetation = false,
+            };
+            generation.Validate();
+            var world = new VoxelWorld(generate: false, registry: blocks);
+            world.Regenerate(generation);
+            world.SetBlockId(1, 10, 1, (ushort)VoxelMaterial.Glow);
+
+            var saves = new WorldSaveService(
+                blocks, preferredSeed: generation.Seed, worldName: "managed-world", saveRoot: saveRoot);
+            saves.Save(world, new Vector3(4f, 5f, 6f), 9f);
+            Assert(saves.TryRenameWorld("managed-world", "重新命名的世界", out string? renameError),
+                renameError ?? "world rename failed");
+            WorldSaveSummary renamed = saves.DiscoverWorlds().Single();
+            Assert(renamed.StorageName == "managed-world" && renamed.DisplayName == "重新命名的世界" &&
+                   renamed.Seed == generation.Seed,
+                "rename changed storage identity or seed instead of display name only");
+            saves.Save(world, new Vector3(4f, 5f, 6f), 9f);
+            Assert(saves.DisplayName == "重新命名的世界" &&
+                   saves.DiscoverWorlds().Single().DisplayName == "重新命名的世界",
+                "a normal autosave reverted the renamed display name");
+            Assert(saves.TryGetWorldGeneration("managed-world", out WorldGenerationSettings loadedGeneration,
+                    out string? generationError), generationError ?? "could not read rebuild settings");
+            Assert(loadedGeneration.Seed == generation.Seed && loadedGeneration.Preset == WorldPreset.Void,
+                "rebuild settings did not preserve seed or preset");
+
+            // Rebuild follows the same production flow: regenerate from stored settings,
+            // overwrite the active generation, then restore the display name metadata.
+            world.Regenerate(loadedGeneration);
+            saves.Save(world, new Vector3(4f, 5f, 6f), 9f);
+            Assert(saves.TryRenameWorld("managed-world", renamed.DisplayName, out renameError),
+                renameError ?? "rebuild did not preserve display name");
+            var rebuilt = new VoxelWorld(generate: false, registry: blocks);
+            var loader = new WorldSaveService(
+                blocks, preferredSeed: 1, worldName: "managed-world", saveRoot: saveRoot);
+            Assert(loader.TryLoad(rebuilt, out SavedWorldState rebuiltState, out string? loadError),
+                loadError ?? "rebuilt world did not load");
+            Assert(rebuilt.GetBlockId(1, 10, 1) == 0 && rebuiltState.Seed == generation.Seed &&
+                   rebuiltState.GenerationSettings.Preset == WorldPreset.Void,
+                "rebuild retained player edits or changed seed/settings");
+            Assert(!saves.TryDeleteWorld("..", out _),
+                "world delete accepted a path outside the managed Saves root");
+            Assert(saves.TryDeleteWorld("managed-world", out string? deleteError),
+                deleteError ?? "world delete failed");
+            Assert(!Directory.Exists(Path.Combine(saveRoot, "managed-world")) && saves.DiscoverWorlds().Count == 0,
+                "deleted world remained on disk or in discovery");
+        }
+        finally
+        {
+            if (Directory.Exists(saveRoot)) Directory.Delete(saveRoot, recursive: true);
+        }
+    }
+
+    private static void TestEmptyDirectoryChunkPersistence()
+    {
+        string saveRoot = Path.Combine(Path.GetTempPath(), $"rtxsandbox-empty-directory-{Guid.NewGuid():N}");
+        try
+        {
+            var blocks = new BlockRegistry();
+            var emptyWorld = new VoxelWorld(generate: false, registry: blocks);
+            var saves = new WorldSaveService(
+                blocks, preferredSeed: 2026, worldName: "empty-world", saveRoot: saveRoot);
+            saves.Save(emptyWorld, new Vector3(1f, 2f, 3f), 6.5f);
+
+            string regionsDirectory = Path.Combine(saves.SaveDirectory, "regions");
+            Assert(Directory.Exists(regionsDirectory), "empty world generation directory was not created");
+            Assert(Directory.GetFiles(regionsDirectory, "*.region", SearchOption.AllDirectories).Length == 0,
+                "empty world emitted an unnecessary region payload");
+
+            var loadedWorld = new VoxelWorld(generate: false, registry: blocks);
+            var loader = new WorldSaveService(
+                blocks, preferredSeed: 1, worldName: "empty-world", saveRoot: saveRoot);
+            Assert(loader.TryLoad(loadedWorld, out SavedWorldState state, out string? error),
+                error ?? "empty directory world did not load");
+            Assert(loadedWorld.LoadedChunkCount == 0 && loadedWorld.PhysicsGrids.Count == 0,
+                "loading an empty world allocated voxel chunks or physics grids");
+            Assert(Vector3.DistanceSquared(state.PlayerPosition, new Vector3(1f, 2f, 3f)) < 0.0001f &&
+                   MathF.Abs(state.TimeOfDay - 6.5f) < 0.001f,
+                "empty world player state was not restored");
+        }
+        finally
+        {
+            if (Directory.Exists(saveRoot)) Directory.Delete(saveRoot, recursive: true);
+        }
+    }
+
+    private static void TestExampleContentPack()
+    {
+        var blocks = new BlockRegistry();
+        LoadedContentPack pack = blocks.LoadedContentPacks.Single(candidate =>
+            candidate.Id == "rtxsandbox.example-content");
+        Assert(pack.Enabled && pack.Error is null && pack.BlockCount == 1,
+            $"example content pack did not load cleanly: {pack.Error ?? "no block was registered"}");
+        Assert(blocks.TryGet("examplepack:cyan_lamp", out BlockDefinition? definition) &&
+               definition!.Id == 500 && definition.IsPlaceable && definition.Emission.LengthSquared() > 0f,
+            "example content pack block is missing or not playable");
     }
 
     private static void TestForcedBlockOverride()
@@ -365,7 +1015,7 @@ public static class SelfTests
     {
         var blocks = new BlockRegistry();
         var world = new VoxelWorld(registry: blocks);
-        ushort bedrockId = world.GetBlockId(12, 0, 12);
+        ushort bedrockId = world.GetBlockId(12, VoxelWorld.MinimumY, 12);
         Assert(bedrockId == (ushort)VoxelMaterial.Bedrock, "bottom layer is not bedrock");
         Assert(blocks.Get(bedrockId).IsUnbreakable, "bedrock definition is breakable");
     }
@@ -498,15 +1148,16 @@ public static class SelfTests
     {
         var blocks = new BlockRegistry();
         var world = new VoxelWorld(generate: false, registry: blocks);
-        world.Set(3, 0, 3, VoxelMaterial.Bedrock);
-        world.Set(3, 1, 3, VoxelMaterial.Stone);
-        world.Set(3, 2, 3, VoxelMaterial.Stone);
+        world.Set(3, VoxelWorld.MinimumY, 3, VoxelMaterial.Bedrock);
+        world.Set(3, VoxelWorld.MinimumY + 1, 3, VoxelMaterial.Stone);
+        world.Set(3, VoxelWorld.MinimumY + 2, 3, VoxelMaterial.Stone);
         world.Set(6, 4, 6, VoxelMaterial.Brick);
         world.Set(7, 4, 6, VoxelMaterial.Glass);
         var physics = new VoxelPhysicsSimulator(world, blocks);
         physics.RequestEvaluation();
         physics.AnalyzeNow();
-        Assert(world.Get(3, 2, 3) == VoxelMaterial.Stone, "grounded six-face structure detached");
+        Assert(world.Get(3, VoxelWorld.MinimumY + 2, 3) == VoxelMaterial.Stone,
+            "grounded six-face structure detached");
         Assert(world.Get(6, 4, 6) == VoxelMaterial.Air && world.Get(7, 4, 6) == VoxelMaterial.Air,
             "unsupported structure remained in the static world");
         Assert(world.PhysicsGrids.Count == 1 && world.PhysicsGrids.Grids[0].Elements.Count == 2,
@@ -594,7 +1245,7 @@ public static class SelfTests
             GenerateVegetation = false,
         };
         var world = new VoxelWorld(registry: blocks, generationSettings: settings);
-        Assert(world.Get(10, 0, 10) == VoxelMaterial.Bedrock, "flat world has no bedrock layer");
+        Assert(world.Get(10, VoxelWorld.MinimumY, 10) == VoxelMaterial.Bedrock, "flat world has no bedrock layer");
         Assert(world.Get(10, 8, 10) == VoxelMaterial.BlackConcrete, "flat underground material was ignored");
         Assert(world.Get(10, 9, 10) == VoxelMaterial.WhiteConcrete, "flat surface material was ignored");
         Assert(world.Get(10, 10, 10) == VoxelMaterial.Air, "flat world generated material above its surface");
@@ -660,12 +1311,20 @@ public static class SelfTests
             GenerateLakes = true,
             GenerateVegetation = true,
         });
-        Assert(CountBlock(world, VoxelMaterial.Sand) > 0, "pure nature has no desert band");
-        Assert(CountBlock(world, VoxelMaterial.Grass) > 0, "pure nature has no plains/forest band");
-        Assert(CountBlock(world, VoxelMaterial.Snow) > 0, "pure nature has no snow/mountain band");
-        Assert(CountBlock(world, VoxelMaterial.Water) > 0, "pure nature has no connected water band");
-        Assert(CountBlock(world, VoxelMaterial.Bamboo) > 0 || CountBlock(world, VoxelMaterial.Mud) > 0,
-            "pure nature has no wet biome transition");
+        foreach (int chunkX in new[] { -128, -96, -64, -32, 32, 64, 96, 128 })
+            world.EnsureChunkGenerated(new ChunkCoordinate(chunkX, 0));
+        HashSet<ushort> materials = world.SnapshotGeneratedChunks()
+            .SelectMany(chunk => world.SnapshotChunk(chunk).Voxels)
+            .Select(voxel => voxel.MaterialId)
+            .ToHashSet();
+        int climateSurfaceTypes = new[]
+        {
+            VoxelMaterial.Sand, VoxelMaterial.Grass, VoxelMaterial.Snow,
+            VoxelMaterial.Mud, VoxelMaterial.Bamboo,
+        }.Count(material => materials.Contains((ushort)material));
+        Assert(climateSurfaceTypes >= 3,
+            $"infinite pure-nature sampling exposed only {climateSurfaceTypes} climate surface types");
+        Assert(materials.Contains((ushort)VoxelMaterial.Water), "pure nature has no connected water band");
     }
 
     private static void TestVoidWorldPreset()
@@ -801,7 +1460,8 @@ public static class SelfTests
                 writer.Write(0x57585452);
                 writer.Write(4);
                 writer.Write(VoxelWorld.Width);
-                writer.Write(VoxelWorld.Height);
+                const int legacyHeight = 32;
+                writer.Write(legacyHeight);
                 writer.Write(VoxelWorld.Depth);
                 writer.Write(15f);
                 writer.Write(3.5f);
@@ -827,10 +1487,10 @@ public static class SelfTests
                 writer.Write("rtxsandbox:air");
                 writer.Write((byte)VoxelMaterial.Stone);
                 writer.Write("rtxsandbox:stone");
-                int voxelCount = VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth;
+                int voxelCount = VoxelWorld.Width * legacyHeight * VoxelWorld.Depth;
                 writer.Write(voxelCount);
                 var legacy = new byte[voxelCount];
-                int index = 4 + VoxelWorld.Width * (5 + VoxelWorld.Height * 6);
+                int index = 4 + VoxelWorld.Width * (5 + legacyHeight * 6);
                 legacy[index] = (byte)VoxelMaterial.Stone;
                 writer.Write(legacy);
             }
@@ -888,6 +1548,32 @@ public static class SelfTests
             8f);
         Assert(reverseHit.HasValue && reverseHit.Value.Normal == Vector3.UnitX,
             "reverse micro ray returned the wrong outward normal");
+    }
+
+    private static void TestMicroVoxelChangeEvents()
+    {
+        var world = new VoxelWorld(generate: false);
+        var changedCells = new List<(int X, int Y, int Z)>();
+        int reloads = 0;
+        int aggregateChanges = 0;
+        world.MicroVoxelCellChanged += (x, y, z) => changedCells.Add((x, y, z));
+        world.MicroVoxelsReloaded += () => reloads++;
+        world.MicroVoxelsChanged += () => aggregateChanges++;
+
+        var micro = new MicroVoxelContainer(2);
+        micro.PaintCell(2, 0, 0, 0, (ushort)VoxelMaterial.Stone);
+        Assert(world.SetMicroVoxels(15, 2, 15, micro), "micro cell setup failed");
+        Assert(changedCells.SequenceEqual(new[] { (15, 2, 15) }) && reloads == 0 && aggregateChanges == 1,
+            "a local precision edit did not publish its exact cell");
+
+        Assert(world.SetBlockId(15, 2, 15, (ushort)VoxelMaterial.Glass),
+            "regular block replacement did not remove precision geometry");
+        Assert(changedCells.Count == 2 && changedCells[1] == (15, 2, 15) && aggregateChanges == 2,
+            "removing precision geometry through a full block missed its exact invalidation");
+
+        world.LoadMicroVoxels(Array.Empty<(int X, int Y, int Z, MicroVoxelSnapshot Snapshot)>());
+        Assert(reloads == 1 && changedCells.Count == 2 && aggregateChanges == 3,
+            "bulk precision loading was confused with a local edit");
     }
 
     private static void TestMicroVoxelCollision()
@@ -961,7 +1647,7 @@ public static class SelfTests
         Assert(tools.UsePrimary(hit), "primary click made no change");
         Assert(world.Get(3, 2, 2) == VoxelMaterial.Air && world.Get(2, 2, 2) == VoxelMaterial.Air,
             "primary click placed a voxel instead of destroying the target");
-        Assert(tools.QuickPlace(new VoxelHit(4, 2, 2, -Vector3.UnitX, 1f, VoxelMaterial.Stone)),
+        Assert(tools.QuickPlace(new VoxelHit(4, 2, 2, -Vector3.UnitX, 1.5f, VoxelMaterial.Stone)),
             "explicit secondary placement failed");
         Assert(world.Get(3, 2, 2) == VoxelMaterial.Glass,
             "secondary placement did not use the selected material");
@@ -972,19 +1658,140 @@ public static class SelfTests
         RenderBackendKind[] implemented = RenderBackendCatalog.Implemented
             .Select(descriptor => descriptor.Kind)
             .ToArray();
-        Assert(implemented.SequenceEqual(new[]
+        RenderBackendKind[] requiredRasterAndCompute =
         {
             RenderBackendKind.SoftwareRayTracing,
+            RenderBackendKind.DeferredLighting,
+            RenderBackendKind.HybridPbrRaster,
             RenderBackendKind.PbrForward,
             RenderBackendKind.Classic,
-        }), "implemented renderer list is incomplete or exposes a placeholder");
-        Assert(!RenderBackendCatalog.IsImplemented(RenderBackendKind.HardwareRayTracing),
-            "hardware RT must remain unavailable until a DXR/Vulkan RT backend exists");
-        Assert(!RenderBackendCatalog.IsImplemented(RenderBackendKind.DeferredLighting),
-            "deferred mode must remain unavailable until its GBuffer path exists");
-        Assert(RenderBackendCatalog.Implemented.All(descriptor =>
+        };
+        Assert(requiredRasterAndCompute.All(implemented.Contains),
+            "implemented renderer list lost an existing raster or compute backend");
+        Assert(RenderBackendCatalog.IsImplemented(RenderBackendKind.HardwareRayTracing) ==
+               DxrHardwareRenderer.IsSupported(out _),
+            "hardware ray tracing catalog availability disagrees with the DXR capability probe");
+        Assert(RenderBackendCatalog.IsImplemented(RenderBackendKind.DeferredLighting),
+            "completed GBuffer deferred mode is not selectable");
+        RenderBackendKind[] catalogOrder = RenderBackendCatalog.All.Select(descriptor => descriptor.Kind).ToArray();
+        int deferredIndex = Array.IndexOf(catalogOrder, RenderBackendKind.DeferredLighting);
+        Assert(deferredIndex >= 0 && deferredIndex + 2 < catalogOrder.Length &&
+               catalogOrder[deferredIndex + 1] == RenderBackendKind.HybridPbrRaster &&
+               catalogOrder[deferredIndex + 2] == RenderBackendKind.SoftwareRayTracing,
+            "Hybrid PBR Raster is not positioned between Deferred and Compute PT");
+        Assert(RenderBackendCatalog.Implemented.Where(descriptor =>
+                    descriptor.Kind != RenderBackendKind.HardwareRayTracing).All(descriptor =>
                 descriptor.Capabilities.HasFlag(RenderBackendCapabilities.MicroVoxels)),
             "a selectable renderer cannot display precision-built geometry");
+    }
+
+    private static void TestChunkCoordinates()
+    {
+        Assert(ChunkCoordinate.FromVoxel(0, 0) == new ChunkCoordinate(0, 0) &&
+               ChunkCoordinate.FromVoxel(15, 15) == new ChunkCoordinate(0, 0) &&
+               ChunkCoordinate.FromVoxel(16, 16) == new ChunkCoordinate(1, 1),
+            "positive chunk boundary conversion was incorrect");
+        Assert(ChunkCoordinate.FromVoxel(-1, -1) == new ChunkCoordinate(-1, -1) &&
+               ChunkCoordinate.FromVoxel(-16, -16) == new ChunkCoordinate(-1, -1) &&
+               ChunkCoordinate.FromVoxel(-17, -17) == new ChunkCoordinate(-2, -2),
+            "negative coordinates did not use floor division");
+        Assert(RegionCoordinate.FromChunk(new ChunkCoordinate(31, 31)) == new RegionCoordinate(0, 0) &&
+               RegionCoordinate.FromChunk(new ChunkCoordinate(32, 32)) == new RegionCoordinate(1, 1) &&
+               RegionCoordinate.FromChunk(new ChunkCoordinate(-1, -1)) == new RegionCoordinate(-1, -1) &&
+               RegionCoordinate.FromChunk(new ChunkCoordinate(-32, -32)) == new RegionCoordinate(-1, -1) &&
+               RegionCoordinate.FromChunk(new ChunkCoordinate(-33, -33)) == new RegionCoordinate(-2, -2),
+            "32x32 region grouping failed at a positive or negative boundary");
+
+        ChunkCoordinate[] affected = ChunkCoordinate.MeshDependenciesForVoxel(
+                15, 15, VoxelWorld.Width, VoxelWorld.Depth)
+            .OrderBy(chunk => chunk.X)
+            .ThenBy(chunk => chunk.Z)
+            .ToArray();
+        Assert(affected.SequenceEqual(new[]
+        {
+            new ChunkCoordinate(0, 0),
+            new ChunkCoordinate(0, 1),
+            new ChunkCoordinate(1, 0),
+        }), "a boundary edit did not invalidate the owner and two face-neighbor chunks");
+
+        ChunkCoordinate[] interior = ChunkCoordinate.MeshDependenciesForVoxel(
+                8, 8, VoxelWorld.Width, VoxelWorld.Depth)
+            .ToArray();
+        Assert(interior.SequenceEqual(new[] { new ChunkCoordinate(0, 0) }),
+            "an interior edit invalidated unrelated chunks");
+    }
+
+    private static void TestChunkOwnedVoxelStorage()
+    {
+        var world = new VoxelWorld(generate: false);
+        Assert(world.LoadedChunkCount == 0, "an empty world eagerly allocated voxel chunks");
+
+        world.Set(15, 2, 15, VoxelMaterial.Stone);
+        world.Set(16, 2, 15, VoxelMaterial.Glass);
+        Assert(world.LoadedChunkCount == 2,
+            "voxels across a chunk boundary were not owned by separate chunks");
+
+        world.Set(15, 2, 15, VoxelMaterial.Air);
+        Assert(world.LoadedChunkCount == 1,
+            "removing the final voxel did not release its empty chunk");
+
+        var micro = new MicroVoxelContainer(4);
+        micro.PaintCell(4, 0, 0, 0, (ushort)VoxelMaterial.Marble);
+        world.SetMicroVoxels(32, 3, 15, micro);
+        Assert(world.LoadedChunkCount == 2 && world.MicroVoxelContainerCount == 1,
+            "precision geometry did not participate in chunk ownership");
+        world.SetBlockId(32, 3, 15, 0);
+        Assert(world.LoadedChunkCount == 1 && world.MicroVoxelContainerCount == 0,
+            "removing the final precision volume did not release its empty chunk");
+
+        world.Set(16, 2, 15, VoxelMaterial.Air);
+        Assert(world.LoadedChunkCount == 0, "the world retained an empty final chunk");
+    }
+
+    private static void TestChunkLinearSnapshot()
+    {
+        var source = new ushort[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth];
+        static int Index(int x, int y, int z) =>
+            x + VoxelWorld.Width * (y + VoxelWorld.Height * z);
+        source[Index(0, 0, 0)] = (ushort)VoxelMaterial.Bedrock;
+        source[Index(15, 7, 15)] = (ushort)VoxelMaterial.Stone;
+        source[Index(16, 7, 15)] = (ushort)VoxelMaterial.Glass;
+        source[Index(63, 31, 63)] = (ushort)VoxelMaterial.Glow;
+
+        var world = new VoxelWorld(generate: false);
+        world.LoadRawData(source);
+        Assert(world.LoadedChunkCount == 3,
+            $"linear load created {world.LoadedChunkCount} chunks instead of three occupied chunks");
+        Assert(world.RawData.SequenceEqual(source),
+            "chunk storage changed the established x/y/z linear save layout");
+
+        world.LoadRawData(new ushort[source.Length]);
+        Assert(world.LoadedChunkCount == 0 && world.RawData.All(block => block == 0),
+            "loading an empty snapshot retained stale chunk data");
+    }
+
+    private static void TestChunkOccupiedBounds()
+    {
+        var world = new VoxelWorld(generate: false);
+        var chunk = new ChunkCoordinate(0, 0);
+        world.Set(2, -40, 2, VoxelMaterial.Stone);
+        world.Set(2, 420, 2, VoxelMaterial.Glass);
+        Assert(world.TryGetChunkVerticalBounds(chunk, out int minimum, out int maximum) &&
+               minimum == -40 && maximum == 421,
+            $"initial occupied bounds were {minimum}..{maximum}");
+
+        world.Set(2, 420, 2, VoxelMaterial.Air);
+        Assert(world.TryGetChunkVerticalBounds(chunk, out minimum, out maximum) &&
+               minimum == -40 && maximum == -39,
+            $"removing the top boundary left bounds at {minimum}..{maximum}");
+
+        var micro = new MicroVoxelContainer(4);
+        micro.PaintCell(4, 0, 0, 0, (ushort)VoxelMaterial.Marble);
+        world.SetMicroVoxels(3, 300, 3, micro);
+        world.Set(2, -40, 2, VoxelMaterial.Air);
+        Assert(world.TryGetChunkVerticalBounds(chunk, out minimum, out maximum) &&
+               minimum == 300 && maximum == 301,
+            "regular-boundary removal discarded or hid the remaining precision cell");
     }
 
     private static void TestWholeCellMicroDestruction()
@@ -1104,6 +1911,102 @@ public static class SelfTests
             "physics engine did not use the bounded collision-step budget");
     }
 
+    private static void TestPhysicsFixedTimestep()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        PhysicsGrid grid = world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            new Vector3(20f, 20f, 20f));
+        using var backend = new BepuPhysicsBackend(world);
+        Vector3 initialPosition = grid.Position;
+
+        backend.Step(1f / 240f);
+        Assert(backend.CollisionStepsLastFrame == 0 && Vector3.Distance(grid.Position, initialPosition) < 0.000001f,
+            "a partial frame advanced the physics simulation");
+
+        backend.Step(1f / 240f);
+        Assert(backend.CollisionStepsLastFrame == 1 && grid.Position.Y < initialPosition.Y,
+            "two partial frames did not accumulate into one exact physics step");
+
+        backend.Step(1f);
+        Assert(backend.CollisionStepsLastFrame == 6,
+            "a stalled frame exceeded or failed to fill the catch-up budget");
+    }
+
+    private static void TestPhysicsWorldReload()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        world.Set(4, 0, 4, VoxelMaterial.Bedrock);
+        world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Brick) },
+            new Vector3(4f, 4f, 4f));
+        using var backend = new BepuPhysicsBackend(world);
+        backend.Step(1f / 120f);
+        Assert(backend.DynamicBodyCount == 1 && backend.StaticChunkBodyCount == 1,
+            "initial physics bodies were not registered");
+
+        world.LoadRawData(new ushort[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth]);
+        Assert(backend.DynamicBodyCount == 0 && backend.StaticChunkBodyCount == 0,
+            "world reload retained old-world colliders until a later physics frame");
+        backend.Step(0f);
+        Assert(backend.DynamicBodyCount == 0 && backend.StaticChunkBodyCount == 0,
+            "world reload left stale physics bodies behind");
+
+        world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Glass) },
+            new Vector3(8f, 8f, 8f));
+        backend.Step(1f / 120f);
+        Assert(backend.DynamicBodyCount == 1,
+            "physics backend did not accept bodies after a world reload");
+    }
+
+    private static void TestUrgentPhysicsChunkRebuild()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        world.Set(0, 0, 0, VoxelMaterial.Stone);
+        world.Set(16, 0, 0, VoxelMaterial.Stone);
+        world.Set(32, 0, 0, VoxelMaterial.Stone);
+        using var backend = new BepuPhysicsBackend(world);
+
+        world.Set(32, 0, 0, VoxelMaterial.Glass);
+        backend.Step(0f);
+        Assert(backend.IsStaticChunkRegistered(new ChunkCoordinate(2, 0)),
+            "the player-edited collision chunk waited behind the streaming rebuild backlog");
+    }
+
+    private static void TestPhysicsDisposal()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            new Vector3(8f, 8f, 8f));
+        var physics = new VoxelPhysicsSimulator(world, blocks);
+        physics.Update(1f / 120f);
+        physics.Dispose();
+        physics.Dispose();
+    }
+
+    private static void TestSleepingGridInvalidation()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        PhysicsGrid grid = world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            new Vector3(8f, 8f, 8f));
+        grid.IsSleeping = true;
+        int visualChanges = 0;
+        world.PhysicsGrids.Changed += () => visualChanges++;
+        using var backend = new BepuPhysicsBackend(world);
+        backend.Step(1f / 120f);
+        backend.Step(1f / 120f);
+        Assert(visualChanges == 0,
+            "an unchanged sleeping body repeatedly invalidated the dynamic render mesh");
+    }
+
     private static void TestPhysicsGridCenterOfMass()
     {
         var grid = new PhysicsGrid(1,
@@ -1113,10 +2016,27 @@ public static class SelfTests
                 new PhysicsGridElement(2, 0, 0, new Vector3(2f, 0f, 0f), new Vector3(2.5f, 1f, 1f),
                     (ushort)VoxelMaterial.Metal),
             },
+            Vector3.Zero,
+            material => material == (ushort)VoxelMaterial.Metal ? 4f : 1f);
+        // Centres 0.5 and 2.25; masses are 1.0 and (0.5 volume * 4 density) = 2.0.
+        Assert(MathF.Abs(grid.CenterOfMassLocal.X - 1.6666667f) < 0.0001f,
+            "center of mass was not volume-and-density weighted");
+    }
+
+    private static void TestPhysicsGridBoundingRadius()
+    {
+        var grid = new PhysicsGrid(1,
+            new[]
+            {
+                new PhysicsGridElement(
+                    0, 0, 0,
+                    new Vector3(-24f, -2f, -1f),
+                    new Vector3(24f, 2f, 1f),
+                    (ushort)VoxelMaterial.Stone),
+            },
             Vector3.Zero);
-        // Centres 0.5 and 2.25, volumes 1 and 0.5 respectively.
-        Assert(MathF.Abs(grid.CenterOfMassLocal.X - 1.0833334f) < 0.0001f,
-            "center of mass was not volume weighted");
+        Assert(grid.BoundingRadius >= 24f,
+            $"large Grid reported a {grid.BoundingRadius:0.00}-block culling radius");
     }
 
     private static void TestOffsetSupportTorque()
@@ -1162,6 +2082,50 @@ public static class SelfTests
         PhysicsGridRayHit? moved = world.PhysicsGrids.Raycast(faceCenter + faceNormal * 2f, -faceNormal, 4f);
         Assert(moved.HasValue && moved.Value.GridId == grid.Id && moved.Value.CellX == selectedCellX,
             "selection ray did not follow the moving Grid transform");
+
+        grid.SetTransformAndVelocity(
+            grid.Position,
+            grid.Orientation,
+            new Vector3(0.8f, -1.2f, 0.35f),
+            new Vector3(0.3f, 0.6f, 0.2f));
+        Vector3 beforePhysicsPosition = grid.Position;
+        Quaternion beforePhysicsOrientation = grid.Orientation;
+        using var backend = new BepuPhysicsBackend(world);
+        backend.Step(1f / 120f);
+        Assert(Vector3.DistanceSquared(beforePhysicsPosition, grid.Position) > 0.000001f &&
+               MathF.Abs(Quaternion.Dot(beforePhysicsOrientation, grid.Orientation)) < 0.9999999f,
+            "BEPU movement was not synchronized back to the selectable Grid transform");
+        faceNormal = Vector3.Normalize(grid.LocalDirectionToWorld(-Vector3.UnitZ));
+        faceCenter = grid.LocalToWorld(new Vector3(0.5f, 0.5f, 0f));
+        PhysicsGridRayHit? falling = world.PhysicsGrids.Raycast(faceCenter + faceNormal * 2f, -faceNormal, 4f);
+        Assert(falling.HasValue && falling.Value.GridId == grid.Id && falling.Value.CellX == selectedCellX,
+            "selection stopped following while BEPU was translating and rotating the Grid");
+    }
+
+    private static void TestDynamicGridPlacementPreview()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        PhysicsGrid grid = world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            new Vector3(8f, 8f, 8f));
+        using var physics = new VoxelPhysicsSimulator(world, blocks);
+        var hit = new PhysicsGridRayHit(
+            grid.Id,
+            0,
+            0,
+            0,
+            (ushort)VoxelMaterial.Stone,
+            grid.LocalToWorld(new Vector3(1f, 0.5f, 0.5f)),
+            Vector3.UnitX,
+            2f);
+
+        Assert(physics.CanPlaceOnGrid(hit, (ushort)VoxelMaterial.Glass),
+            "grid placement preview rejected a free face-neighbor cell");
+        Assert(physics.TryPlaceOnGrid(hit, (ushort)VoxelMaterial.Glass) && grid.ContainsCell(1, 0, 0),
+            "grid placement did not commit the cell accepted by its preview");
+        Assert(!physics.CanPlaceOnGrid(hit, (ushort)VoxelMaterial.Glass),
+            "grid placement preview accepted an occupied destination");
     }
 
     private static void TestFloorContactRotation()
@@ -1211,7 +2175,7 @@ public static class SelfTests
             physics.Update(1f / 120f);
             maximumLateUpwardSpeed = MathF.Max(maximumLateUpwardSpeed, grid.LinearVelocity.Y);
         }
-        Assert(maximumLateUpwardSpeed < 0.35f,
+        Assert(maximumLateUpwardSpeed < 0.12f,
             $"resting Grid kept bouncing at {maximumLateUpwardSpeed:0.00} m/s");
     }
 

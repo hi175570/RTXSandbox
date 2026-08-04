@@ -23,8 +23,9 @@ uniform int uHasSelection;
 uniform ivec3 uSelectedCell;
 uniform int uSelectedGrid;
 uniform int uDynamicBoxCount;
+uniform ivec3 uWorldOrigin;
 
-const ivec3 WORLD_SIZE = ivec3(64, 32, 64);
+const ivec3 WORLD_SIZE = ivec3(64, 576, 64);
 const float PI = 3.14159265359;
 const int MATERIAL_TILE_SIZE = 16;
 const int MATERIAL_TILES_PER_ROW = 128;
@@ -39,6 +40,10 @@ struct Hit
     ivec3 cell;
     uint material;
     int grid;
+    // Coordinates and normal in the hit box's own unrotated [0, 1] surface space.
+    // These keep textures and the selection frame attached to moving Physics Grids.
+    vec3 surfaceCoordinates;
+    vec3 surfaceNormal;
 };
 
 struct MicroBox
@@ -111,6 +116,10 @@ Hit traceDynamicBoxes(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool
         hit.distance = distance;
         hit.position = rayOrigin + rayDirection * distance;
         hit.normal = normalize(rotateQuaternion(box.rotation, localNormal));
+        vec3 halfExtents = max(box.halfExtentsAndGrid.xyz, vec3(0.00001));
+        vec3 localHitPosition = localOrigin + localDirection * distance;
+        hit.surfaceCoordinates = clamp((localHitPosition + halfExtents) / (2.0 * halfExtents), 0.0, 1.0);
+        hit.surfaceNormal = localNormal;
         hit.cell = ivec3(box.cellAndPadding.xyz + vec3(0.5));
         hit.material = material;
         hit.grid = int(box.halfExtentsAndGrid.w + 0.5);
@@ -136,7 +145,13 @@ float random(inout uint state)
 
 bool insideWorld(ivec3 cell)
 {
-    return all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, WORLD_SIZE));
+    return all(greaterThanEqual(cell, uWorldOrigin)) &&
+           all(lessThan(cell, uWorldOrigin + WORLD_SIZE));
+}
+
+ivec3 textureCell(ivec3 worldCell)
+{
+    return worldCell - uWorldOrigin;
 }
 
 float firstBoundary(float origin, float direction, int cell)
@@ -245,23 +260,44 @@ Hit traceVoxelWorld(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool i
             return hit;
         }
 
-        uint material = texelFetch(uVoxels, cell, 0).r;
+        float cellExitDistance = min(nextBoundary.x, min(nextBoundary.y, nextBoundary.z));
+        uint material = texelFetch(uVoxels, textureCell(cell), 0).r;
         if (material != 0u && !(ignoreTransmissive && materialIsTransmissive(material)))
         {
-            hit.found = true;
-            hit.distance = distance;
-            hit.position = rayOrigin + rayDirection * distance;
-            hit.normal = normal;
-            hit.cell = cell;
-            hit.material = material;
-            hit.grid = 0;
-            return hit;
+            float materialDistance = distance;
+            vec3 materialNormal = normal;
+            ivec3 cellAbove = cell + ivec3(0, 1, 0);
+            bool fluidAbove = materialIsFluid(material) && insideWorld(cellAbove) &&
+                materialIsFluid(texelFetch(uVoxels, textureCell(cellAbove), 0).r);
+            bool intersectsMaterial = !materialIsFluid(material) ||
+                intersectMicroBox(
+                    rayOrigin,
+                    rayDirection,
+                    vec3(cell),
+                    vec3(cell) + vec3(1.0, fluidAbove ? 1.0 : 0.875, 1.0),
+                    max(0.0, distance - 0.0001),
+                    min(cellExitDistance + 0.0001, maxDistance),
+                    materialDistance,
+                    materialNormal);
+            if (intersectsMaterial)
+            {
+                hit.found = true;
+                hit.distance = materialDistance;
+                hit.position = rayOrigin + rayDirection * materialDistance;
+                hit.normal = materialNormal;
+                hit.cell = cell;
+                hit.material = material;
+                hit.grid = 0;
+                hit.surfaceCoordinates = fract(hit.position + materialNormal * 0.001);
+                hit.surfaceNormal = materialNormal;
+                return hit;
+            }
         }
 
-        uvec2 microCell = texelFetch(uMicroCells, cell, 0).rg;
-        float cellExitDistance = min(nextBoundary.x, min(nextBoundary.y, nextBoundary.z));
+        uvec2 microCell = texelFetch(uMicroCells, textureCell(cell), 0).rg;
         float nearestMicroDistance = min(cellExitDistance + 0.0001, maxDistance);
         vec3 nearestMicroNormal = vec3(0.0);
+        vec3 nearestMicroCoordinates = vec3(0.0);
         uint nearestMicroMaterial = 0u;
         for (uint localIndex = 0u; localIndex < microCell.y; ++localIndex)
         {
@@ -283,6 +319,9 @@ Hit traceVoxelWorld(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool i
                 nearestMicroDistance = boxDistance;
                 nearestMicroNormal = boxNormal;
                 nearestMicroMaterial = boxMaterial;
+                vec3 boxSize = max(box.maximumAndPadding.xyz - box.minimumAndMaterial.xyz, vec3(0.00001));
+                vec3 boxPosition = rayOrigin + rayDirection * boxDistance;
+                nearestMicroCoordinates = clamp((boxPosition - box.minimumAndMaterial.xyz) / boxSize, 0.0, 1.0);
             }
         }
         if (nearestMicroMaterial != 0u)
@@ -294,6 +333,8 @@ Hit traceVoxelWorld(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool i
             hit.cell = cell;
             hit.material = nearestMicroMaterial;
             hit.grid = 0;
+            hit.surfaceCoordinates = nearestMicroCoordinates;
+            hit.surfaceNormal = nearestMicroNormal;
             return hit;
         }
 
@@ -374,10 +415,10 @@ int materialFaceIndex(vec3 normal)
 
 vec2 materialFaceUv(Hit hit)
 {
-    vec3 local = fract(hit.position + hit.normal * 0.001);
-    vec2 uv = abs(hit.normal.y) > 0.5
+    vec3 local = hit.surfaceCoordinates;
+    vec2 uv = abs(hit.surfaceNormal.y) > 0.5
         ? local.xz
-        : (abs(hit.normal.x) > 0.5 ? local.zy : local.xy);
+        : (abs(hit.surfaceNormal.x) > 0.5 ? local.zy : local.xy);
 
     uint orientation = hash(uint(hit.cell.x) * 73856093u ^
                             uint(hit.cell.y) * 19349663u ^
@@ -416,7 +457,7 @@ vec2 sampleMaterialDetail(uint id, int face, vec2 uv)
 
 void applySurfaceDetail(uint id, Hit hit, inout vec3 albedo, inout float roughness, inout vec3 shadingNormal)
 {
-    int face = materialFaceIndex(hit.normal);
+    int face = materialFaceIndex(hit.surfaceNormal);
     vec2 uv = materialFaceUv(hit);
     vec4 atlas = sampleMaterialAtlas(id, face, uv);
     vec2 detail = sampleMaterialDetail(id, face, uv);
@@ -482,7 +523,9 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     ivec3 originCell = ivec3(floor(rayOrigin));
-    uint originMaterial = insideWorld(originCell) ? texelFetch(uVoxels, originCell, 0).r : 0u;
+    uint originMaterial = insideWorld(originCell)
+        ? texelFetch(uVoxels, textureCell(originCell), 0).r
+        : 0u;
     bool travellingThroughTransmissive = materialIsTransmissive(originMaterial);
     if (travellingThroughTransmissive)
     {
@@ -500,6 +543,7 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     for (int bounce = 0; bounce < 12; ++bounce)
     {
         if (bounce >= uMaxBounces) break;
+        bool wasTravellingThroughMedium = travellingThroughTransmissive;
         Hit hit = traceVoxelWorld(rayOrigin, rayDirection, 140.0, travellingThroughTransmissive);
         if (!hit.found)
         {
@@ -508,13 +552,20 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
         }
 
         travellingThroughTransmissive = false;
+        if (wasTravellingThroughMedium)
+        {
+            // Beer-Lambert-style distance attenuation keeps underwater scenes visible
+            // nearby while naturally losing red light with depth.
+            vec3 absorption = vec3(0.075, 0.028, 0.012);
+            throughput *= exp(-absorption * max(hit.distance, 0.0));
+        }
 
         // Selection is part of the light transport instead of a screen-space overlay.
         // Emitting it at every bounce makes the frame visible in mirrors, water and glass.
         if (uHasSelection != 0 && hit.grid == uSelectedGrid && all(equal(hit.cell, uSelectedCell)))
         {
-            vec3 local = abs(fract(hit.position + hit.normal * 0.001) - 0.5);
-            vec3 tangentMask = vec3(1.0) - abs(hit.normal);
+            vec3 local = abs(hit.surfaceCoordinates - 0.5);
+            vec3 tangentMask = vec3(1.0) - abs(hit.surfaceNormal);
             float edge = max(local.x * tangentMask.x, max(local.y * tangentMask.y, local.z * tangentMask.z));
             if (edge > 0.455)
             {
@@ -533,25 +584,38 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
             materialProperties(hit.material, mediumAlbedo, mediumRoughness, mediumMetallic, mediumEmission);
             radiance += throughput * mediumEmission;
             float ior = materialIsFluid(hit.material) ? 1.333 : materialIndexOfRefraction(hit.material);
-            float facing = clamp(dot(-rayDirection, hit.normal), 0.0, 1.0);
+            vec3 opticalNormal = hit.normal;
+            if (materialIsFluid(hit.material))
+            {
+                float phase = uTimeOfDay * 3.2;
+                vec2 gradient = vec2(
+                    cos(hit.position.x * 5.7 + hit.position.z * 2.1 + phase) * 0.055,
+                    sin(hit.position.z * 6.3 - hit.position.x * 1.7 - phase * 0.83) * 0.055);
+                vec3 tangent = normalize(abs(opticalNormal.y) < 0.95
+                    ? cross(vec3(0.0, 1.0, 0.0), opticalNormal)
+                    : vec3(1.0, 0.0, 0.0));
+                vec3 bitangent = normalize(cross(opticalNormal, tangent));
+                opticalNormal = normalize(opticalNormal + tangent * gradient.x + bitangent * gradient.y);
+            }
+            float facing = clamp(dot(-rayDirection, opticalNormal), 0.0, 1.0);
             float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
             float fresnel = f0 + (1.0 - f0) * pow(1.0 - facing, 5.0);
             if (random(state) < fresnel)
             {
-                rayDirection = reflect(rayDirection, hit.normal);
-                rayOrigin = hit.position + hit.normal * 0.004;
+                rayDirection = reflect(rayDirection, opticalNormal);
+                rayOrigin = hit.position + opticalNormal * 0.004;
                 throughput *= mix(vec3(0.82), mediumAlbedo, 0.18);
             }
             else
             {
-                vec3 transmitted = refract(rayDirection, hit.normal, 1.0 / ior);
+                vec3 transmitted = refract(rayDirection, opticalNormal, 1.0 / ior);
                 rayDirection = length(transmitted) > 0.001 ? normalize(transmitted) : rayDirection;
                 if (mediumRoughness > 0.08)
                 {
-                    vec3 scattered = cosineHemisphere(-hit.normal, state);
+                    vec3 scattered = cosineHemisphere(-opticalNormal, state);
                     rayDirection = normalize(mix(rayDirection, scattered, min(mediumRoughness * 0.32, 0.28)));
                 }
-                rayOrigin = hit.position - hit.normal * 0.006;
+                rayOrigin = hit.position - opticalNormal * 0.006;
                 throughput *= mix(vec3(0.72), clamp(mediumAlbedo * 1.25 + 0.08, 0.12, 1.0), 0.58);
                 travellingThroughTransmissive = true;
             }

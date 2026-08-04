@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Text.Json;
+using RTXSandbox.Infrastructure;
 using System.Text.Json.Serialization;
 using System.Text.Json.Nodes;
 using RTXSandbox.ModAPI;
@@ -20,10 +21,10 @@ public sealed record LoadedContentPack(
 public static class BlockContentLoader
 {
     public static string DefaultBaseContentPath =>
-        Path.Combine(AppContext.BaseDirectory, "Content", "Base", "base.blocks.json");
+        Path.Combine(RuntimePaths.OutputRoot, "Content", "Base", "base.blocks.json");
 
     public static string DefaultContentPacksPath =>
-        Path.Combine(AppContext.BaseDirectory, "ContentPacks");
+        Path.Combine(RuntimePaths.OutputRoot, "ContentPacks");
 
     public static IReadOnlyList<LoadedContentPack> LoadInto(
         BlockRegistry registry,
