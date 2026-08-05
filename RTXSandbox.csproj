@@ -49,11 +49,11 @@
     </None>
     <None Update="Content\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <TargetPath>..\Content\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <TargetPath>..\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
     </None>
     <None Update="ContentPacks\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <TargetPath>..\ContentPacks\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <TargetPath>..\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
     </None>
   </ItemGroup>
 

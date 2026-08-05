@@ -94,7 +94,7 @@ public sealed partial class SandboxGame
         {
             case RenderBackendKind.SoftwareRayTracing:
                 int bounces = _settings.PathBounces;
-                if (ImGui.SliderInt("最大光線反彈次數", ref bounces, 1, 12))
+                if (ImGui.SliderInt("最大光線反彈次數", ref bounces, 1, 50))
                 {
                     _settings.PathBounces = bounces;
                     _renderer.ResetAccumulation();
@@ -192,12 +192,16 @@ public sealed partial class SandboxGame
                     2 => "RTX 陰影 + 選擇性反射射線",
                     _ => "RTX 陰影 + 廣泛反射射線（最高負載）",
                 });
+                int reflectionBounces = _settings.HardwareRayTracingReflectionBounces;
+                if (ImGui.SliderInt("RTX 反射次數", ref reflectionBounces, 1, 29))
+                    _settings.HardwareRayTracingReflectionBounces = reflectionBounces;
+                ImGui.TextDisabled("鏡面命中後會繼續追蹤完整 DXR 世界；預設 3 次。DXR API 上限為 29 個完整反射層。");
                 string[] renderStyles = { "Default", "Wax Mode（打蠟模式）", "Reference（物理正確）", "Debug" };
                 int renderStyle = (int)_settings.HardwareRayTracingRenderStyle;
                 if (ImGui.Combo("Render Style", ref renderStyle, renderStyles, renderStyles.Length))
                     _settings.HardwareRayTracingRenderStyle = (HardwareRayTracingRenderStyle)renderStyle;
                 ImGui.TextDisabled(_settings.HardwareRayTracingRenderStyle == HardwareRayTracingRenderStyle.WaxMode
-                    ? "提高所有實心材質反射率；非金屬仍保留底色，不會全部變成鏡子。"
+                    ? "所有實心材質的有效反射強度提高至原效果 1.7 倍；仍保留非金屬底色。"
                     : "Default、物理參考與材質 Debug 均不啟用打蠟增益。");
                 ImGui.BeginDisabled();
                 bool denoiser = _settings.HardwareRayTracingDenoiser;

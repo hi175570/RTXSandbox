@@ -125,6 +125,18 @@ public sealed class BlockRegistry : IBlockRegistry
         }
     }
 
+    internal BlockDefinition[] CreateLookupSnapshot()
+    {
+        lock (_sync)
+        {
+            var snapshot = new BlockDefinition[MaterialCapacity];
+            Array.Fill(snapshot, _unknown);
+            for (int id = 0; id < _byId.Length; id++)
+                if (_byId[id] is BlockDefinition definition) snapshot[id] = definition;
+            return snapshot;
+        }
+    }
+
     public bool TryGet(string key, out BlockDefinition? definition)
     {
         lock (_sync)

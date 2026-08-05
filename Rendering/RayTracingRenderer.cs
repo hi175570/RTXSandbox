@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Numerics;
 using OpenTK.Graphics.OpenGL4;
 using RTXSandbox.Infrastructure;
@@ -36,8 +37,12 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
     private bool _dynamicGridsDirty;
     private int _voxelOriginX;
     private int _voxelOriginZ;
+    private int _voxelTextureOffsetX;
+    private int _voxelTextureOffsetZ;
     private bool _windowDirty;
     private readonly HashSet<ChunkCoordinate> _dirtyVoxelChunks = new();
+    private bool _microVoxelTextureInitialized;
+    private bool _microVoxelTextureEmpty;
 
     public int AccumulatedSamples => _frameIndex;
     public RenderBackendKind Kind => RenderBackendKind.SoftwareRayTracing;
@@ -50,6 +55,12 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
     public string Name => "Compute Path Tracing";
     public int MaterialAtlasTexture => _materialAtlasTexture;
     public int MaterialTextureResolution => ProceduralMaterialAtlas.TileSize;
+    public int PendingVoxelUploadCount => (_windowDirty ? 1 : 0) + _dirtyVoxelChunks.Count +
+                                          (_dynamicGridsDirty ? 1 : 0);
+    public int VoxelUploadCount { get; private set; }
+    public long VoxelUploadBytes { get; private set; }
+    public double VoxelUploadTotalMilliseconds { get; private set; }
+    public double MaximumVoxelUploadMilliseconds { get; private set; }
 
     public RayTracingRenderer(VoxelWorld world, BlockRegistry blocks, int width, int height, float renderScale = 1f)
     {
@@ -139,9 +150,24 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             (int)MathF.Floor(cameraPosition.Z) - VoxelWorld.Depth / 2);
         if (wantedOrigin.MinimumX != _voxelOriginX || wantedOrigin.MinimumZ != _voxelOriginZ)
         {
+            int oldOriginX = _voxelOriginX;
+            int oldOriginZ = _voxelOriginZ;
+            int deltaX = wantedOrigin.MinimumX - oldOriginX;
+            int deltaZ = wantedOrigin.MinimumZ - oldOriginZ;
             _voxelOriginX = wantedOrigin.MinimumX;
             _voxelOriginZ = wantedOrigin.MinimumZ;
-            _windowDirty = true;
+            if (Math.Abs(deltaX) < VoxelWorld.Width && Math.Abs(deltaZ) < VoxelWorld.Depth &&
+                deltaX % ChunkCoordinate.Size == 0 && deltaZ % ChunkCoordinate.Size == 0)
+            {
+                _voxelTextureOffsetX = PositiveModulo(_voxelTextureOffsetX + deltaX, VoxelWorld.Width);
+                _voxelTextureOffsetZ = PositiveModulo(_voxelTextureOffsetZ + deltaZ, VoxelWorld.Depth);
+                QueueNewWindowEdgeChunks(oldOriginX, oldOriginZ);
+                UploadMicroVoxels();
+            }
+            else
+            {
+                _windowDirty = true;
+            }
         }
         if (_windowDirty)
         {
@@ -181,6 +207,10 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             _voxelOriginX,
             VoxelWorld.MinimumY,
             _voxelOriginZ);
+        GL.Uniform2(
+            _compute.Uniform("uVoxelTextureOffset"),
+            _voxelTextureOffsetX,
+            _voxelTextureOffsetZ);
 
         if (selection.HasValue)
         {
@@ -296,8 +326,8 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
 
     private void UploadMicroVoxels()
     {
-        var cells = new uint[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth * 2];
-        var boxes = new List<float>();
+        long uploadStarted = Stopwatch.GetTimestamp();
+        var visibleMicroVoxels = new List<(int X, int Y, int Z, MicroVoxelSnapshot Snapshot)>();
         foreach ((int x, int y, int z, MicroVoxelSnapshot snapshot) in _world.SnapshotMicroVoxels())
         {
             int localX = x - _voxelOriginX;
@@ -305,6 +335,22 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             int localZ = z - _voxelOriginZ;
             if (localX < 0 || localX >= VoxelWorld.Width || localY < 0 || localY >= VoxelWorld.Height ||
                 localZ < 0 || localZ >= VoxelWorld.Depth) continue;
+            visibleMicroVoxels.Add((x, y, z, snapshot));
+        }
+
+        // Once an empty index texture has been uploaded, moving between other empty
+        // windows cannot change its contents. Avoid allocating and transferring an
+        // 18 MiB zero array on every Chunk-boundary camera move.
+        if (visibleMicroVoxels.Count == 0 && _microVoxelTextureInitialized && _microVoxelTextureEmpty)
+            return;
+
+        var cells = new uint[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth * 2];
+        var boxes = new List<float>();
+        foreach ((int x, int y, int z, MicroVoxelSnapshot snapshot) in visibleMicroVoxels)
+        {
+            int localX = x - _voxelOriginX;
+            int localY = y - VoxelWorld.MinimumY;
+            int localZ = z - _voxelOriginZ;
             int cellIndex = localX + VoxelWorld.Width * (localY + VoxelWorld.Height * localZ);
             cells[cellIndex * 2] = (uint)(boxes.Count / 8);
             cells[cellIndex * 2 + 1] = (uint)snapshot.Boxes.Count;
@@ -346,11 +392,17 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             boxData,
             BufferUsageHint.DynamicDraw);
         GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
+        RecordVoxelUpload(
+            ElapsedMilliseconds(uploadStarted),
+            (long)cells.Length * sizeof(uint) + (long)boxData.Length * sizeof(float));
+        _microVoxelTextureInitialized = true;
+        _microVoxelTextureEmpty = visibleMicroVoxels.Count == 0;
         ResetAccumulation();
     }
 
     private void UploadDynamicGrids()
     {
+        long uploadStarted = Stopwatch.GetTimestamp();
         var data = new List<float>();
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
         foreach (PhysicsGridElement element in grid.Elements)
@@ -372,6 +424,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             upload,
             BufferUsageHint.DynamicDraw);
         GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
+        RecordVoxelUpload(ElapsedMilliseconds(uploadStarted), (long)upload.Length * sizeof(float));
         ResetAccumulation();
     }
 
@@ -384,26 +437,19 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         int localZ = z - _voxelOriginZ;
         if (localX < 0 || localX >= VoxelWorld.Width || localY < 0 || localY >= VoxelWorld.Height ||
             localZ < 0 || localZ >= VoxelWorld.Depth) return;
-        GL.ActiveTexture(TextureUnit.Texture0);
-        GL.BindTexture(TextureTarget.Texture3D, _voxelTexture);
-        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
-        GL.TexSubImage3D(
-            TextureTarget.Texture3D,
-            0,
-            localX,
-            localY,
-            localZ,
-            1,
-            1,
-            1,
-            PixelFormat.RedInteger,
-            PixelType.UnsignedShort,
-            new[] { (ushort)material });
+        // Event callbacks may arrive thousands of times in one update. Coalesce them
+        // by Chunk and let the render-thread upload budget publish one immutable slab
+        // per frame instead of issuing one GL call (and one array allocation) per voxel.
+        _dirtyVoxelChunks.Add(ChunkCoordinate.FromVoxel(x, z));
         ResetAccumulation();
     }
 
     private void UploadAllVoxels()
     {
+        long uploadStarted = Stopwatch.GetTimestamp();
+        ushort[] snapshot = _world.CreateRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ);
+        _voxelTextureOffsetX = 0;
+        _voxelTextureOffsetZ = 0;
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture3D, _voxelTexture);
         GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
@@ -418,7 +464,8 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             VoxelWorld.Depth,
             PixelFormat.RedInteger,
             PixelType.UnsignedShort,
-            _world.CreateRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ));
+            snapshot);
+        RecordVoxelUpload(ElapsedMilliseconds(uploadStarted), (long)snapshot.Length * sizeof(ushort));
         ResetAccumulation();
     }
 
@@ -428,24 +475,80 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture3D, _voxelTexture);
         GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+        int remainingUploads = FrameWorkBudget.Default.MaximumUploadsPerFrame;
         foreach (ChunkCoordinate chunk in _dirtyVoxelChunks.ToArray())
         {
             _dirtyVoxelChunks.Remove(chunk);
-            int localX = chunk.MinimumX - _voxelOriginX;
-            int localZ = chunk.MinimumZ - _voxelOriginZ;
-            if (localX < 0 || localX + ChunkCoordinate.Size > VoxelWorld.Width ||
-                localZ < 0 || localZ + ChunkCoordinate.Size > VoxelWorld.Depth)
+            int logicalX = chunk.MinimumX - _voxelOriginX;
+            int logicalZ = chunk.MinimumZ - _voxelOriginZ;
+            if (logicalX < 0 || logicalX + ChunkCoordinate.Size > VoxelWorld.Width ||
+                logicalZ < 0 || logicalZ + ChunkCoordinate.Size > VoxelWorld.Depth)
                 continue;
+            int textureX = PositiveModulo(logicalX + _voxelTextureOffsetX, VoxelWorld.Width);
+            int textureZ = PositiveModulo(logicalZ + _voxelTextureOffsetZ, VoxelWorld.Depth);
+            ushort[] snapshot = _world.CreateRenderChunkSnapshot(chunk);
+            long uploadStarted = Stopwatch.GetTimestamp();
             GL.TexSubImage3D(
                 TextureTarget.Texture3D, 0,
-                localX, 0, localZ,
+                textureX, 0, textureZ,
                 ChunkCoordinate.Size, VoxelWorld.Height, ChunkCoordinate.Size,
                 PixelFormat.RedInteger, PixelType.UnsignedShort,
-                _world.CreateRenderChunkSnapshot(chunk));
+                snapshot);
+            RecordVoxelUpload(ElapsedMilliseconds(uploadStarted), (long)snapshot.Length * sizeof(ushort));
             uploaded = true;
+            // A large generation burst must not drain every dirty texture slab in one
+            // render call. Remaining uploads stay queued for later frames.
+            if (--remainingUploads <= 0) break;
         }
         if (uploaded) ResetAccumulation();
     }
+
+    private void QueueNewWindowEdgeChunks(int oldOriginX, int oldOriginZ)
+    {
+        int oldMaximumX = oldOriginX + VoxelWorld.Width;
+        int oldMaximumZ = oldOriginZ + VoxelWorld.Depth;
+        int firstChunkX = Math.DivRem(_voxelOriginX, ChunkCoordinate.Size, out int remainderX);
+        if (remainderX < 0) firstChunkX--;
+        int firstChunkZ = Math.DivRem(_voxelOriginZ, ChunkCoordinate.Size, out int remainderZ);
+        if (remainderZ < 0) firstChunkZ--;
+        int chunkWidth = VoxelWorld.Width / ChunkCoordinate.Size;
+        int chunkDepth = VoxelWorld.Depth / ChunkCoordinate.Size;
+        for (int z = 0; z < chunkDepth; z++)
+        for (int x = 0; x < chunkWidth; x++)
+        {
+            var chunk = new ChunkCoordinate(firstChunkX + x, firstChunkZ + z);
+            bool insideOld = chunk.MinimumX >= oldOriginX &&
+                             chunk.MinimumX + ChunkCoordinate.Size <= oldMaximumX &&
+                             chunk.MinimumZ >= oldOriginZ &&
+                             chunk.MinimumZ + ChunkCoordinate.Size <= oldMaximumZ;
+            if (!insideOld) _dirtyVoxelChunks.Add(chunk);
+        }
+    }
+
+    private static int PositiveModulo(int value, int modulus)
+    {
+        int result = value % modulus;
+        return result < 0 ? result + modulus : result;
+    }
+
+    public void ResetPerformanceCounters()
+    {
+        VoxelUploadCount = 0;
+        VoxelUploadBytes = 0;
+        VoxelUploadTotalMilliseconds = 0;
+        MaximumVoxelUploadMilliseconds = 0;
+    }
+
+    private void RecordVoxelUpload(double milliseconds, long bytes)
+    {
+        VoxelUploadCount++;
+        VoxelUploadBytes += Math.Max(0, bytes);
+        VoxelUploadTotalMilliseconds += milliseconds;
+        MaximumVoxelUploadMilliseconds = Math.Max(MaximumVoxelUploadMilliseconds, milliseconds);
+    }
+
+    private static double ElapsedMilliseconds(long started) =>
+        (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
 
     private void OnChunkGenerated(ChunkCoordinate chunk)
     {

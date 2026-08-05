@@ -30,8 +30,11 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 {
     private const float CullingFrustumScale = 1.6f;
     private const int DescriptorCount = 4;
-    private const int CameraConstantCount = 24;
-    private static readonly bool[] AllFaces = { true, true, true, true, true, true };
+    private const int CameraConstantCount = 28;
+    // D3D12 permits a maximum TraceRay recursion depth of 31. One level is the
+    // primary ray and one is reserved for the deepest shadow ray.
+    private const int MaximumReflectionBounces = 29;
+    private const byte AllFaces = 0b0011_1111;
     private static readonly Lazy<(bool Supported, string Reason)> Support = new(ProbeSupport);
 
     private readonly VoxelWorld _world;
@@ -59,6 +62,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
     private ID3D12Resource? _staticVertexBuffer;
     private ID3D12Resource? _dynamicVertexBuffer;
+    private ID3D12Resource? _dynamicUpdateScratch;
+    private ulong _dynamicUpdateScratchBytes;
     private ID3D12Resource? _instanceBuffer;
     private ID3D12Resource? _staticBlas;
     private ID3D12Resource? _dynamicBlas;
@@ -93,10 +98,18 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private bool _disposed;
     private int _staticVertexCount;
     private int _dynamicVertexCount;
+    private ulong _staticBlasBytes;
+    private ulong _dynamicBlasBytes;
+    private ulong _tlasBytes;
     private int _emissiveLightCount;
     private int _lastLoadedChunkCount;
     private readonly Dictionary<ulong, CachedGridGeometry> _gridGeometryCache = new();
+    private readonly Dictionary<ChunkCoordinate, CachedStaticChunkGeometry> _staticChunkGeometryCache = new();
+    private readonly HashSet<ChunkCoordinate> _dirtyStaticGeometryChunks = new();
     private readonly List<EmissiveLight> _staticEmissiveCandidates = new();
+    private Task<StaticWorldGeometryBuild?>? _staticGeometryBuildTask;
+    private CancellationTokenSource? _staticGeometryBuildCancellation;
+    private int _staticGeometryVersion;
 
     public RenderBackendKind Kind => RenderBackendKind.HardwareRayTracing;
     public RenderBackendCapabilities Capabilities => RenderBackendCapabilities.RealTime |
@@ -108,6 +121,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public string AdapterName { get; }
     public RaytracingTier RaytracingTier => _device.Options5.RaytracingTier;
     public int TracedTriangleCount => (_staticVertexCount + _dynamicVertexCount) / 3;
+    public ulong AccelerationStructureMemoryBytes => _staticBlasBytes + _dynamicBlasBytes + _tlasBytes;
     public int LastHitPixelCount { get; private set; }
     public int LastShadowRayPixelCount { get; private set; }
     public int LastShadowOccludedPixelCount { get; private set; }
@@ -133,6 +147,11 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public double LastAccelerationStructureBuildMilliseconds { get; private set; }
     public double LastStaticAccelerationStructureBuildMilliseconds { get; private set; }
     public double LastDynamicAccelerationStructureBuildMilliseconds { get; private set; }
+    public double MaximumAccelerationStructureBuildMilliseconds { get; private set; }
+    public double AccelerationStructureBuildTotalMilliseconds { get; private set; }
+    public double LastStaticGeometryBuildMilliseconds { get; private set; }
+    public double MaximumStaticGeometryBuildMilliseconds { get; private set; }
+    public int PendingStaticGeometryBuildCount => _staticGeometryBuildTask is null ? 0 : 1;
 
     public static bool IsSupported(out string reason)
     {
@@ -200,6 +219,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _world.WorldReloaded += OnWorldReloaded;
         _world.MicroVoxelCellChanged += OnMicroVoxelCellChanged;
         _world.MicroVoxelsReloaded += OnMicroVoxelsReloaded;
+        _world.ChunkGenerated += OnChunkGenerated;
         _world.PhysicsGrids.Changed += OnPhysicsGridsChanged;
         Console.WriteLine($"DXR initialized: {AdapterName}, tier {RaytracingTier}, BLAS triangles {TracedTriangleCount:N0}.");
     }
@@ -230,7 +250,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             (now - _lastStaticGeometryChangeMs >= 160 &&
              (_world.PendingChunkGenerationCount == 0 || now - _staticGeometryDirtySinceMs >= 1500));
         if (_geometryDirty && staticGeometryReady)
-            RebuildWorldAccelerationStructures();
+            ProcessStaticGeometryBuild();
         else if (_physicsGeometryDirty && now - _lastAccelerationStructureBuildMs >= 120)
             RebuildDynamicAccelerationStructures();
         Trace(cameraPosition, camera, timeOfDay, quality);
@@ -433,7 +453,10 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         var shaderConfig = new StateSubObject(new RaytracingShaderConfig(6 * sizeof(float), 2 * sizeof(float)));
         var shaderAssociation = new StateSubObject(new SubObjectToExportsAssociation(
             shaderConfig, "RayGen", "Miss", "ShadowMiss", "AnyHit", "ClosestHit"));
-        var pipelineConfig = new StateSubObject(new RaytracingPipelineConfig(2));
+        // Primary ray + 29 reflected rays + the deepest shadow ray. D3D12's hard
+        // maximum declaration is 31, so this must never be raised without changing
+        // to a non-recursive/wavefront DXR architecture.
+        var pipelineConfig = new StateSubObject(new RaytracingPipelineConfig(MaximumReflectionBounces + 2));
         var globalRoot = new StateSubObject(new GlobalRootSignature(_rootSignature));
         ID3D12StateObject pipeline;
         try
@@ -469,11 +492,93 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private void CopyShaderIdentifier(byte* destination, string exportName) =>
         Unsafe.CopyBlockUnaligned(destination, (void*)_pipelineProperties.GetShaderIdentifier(exportName), ShaderIdentifierSizeInBytes);
 
-    private void RebuildWorldAccelerationStructures()
+    private void ProcessStaticGeometryBuild()
     {
-        WorldVertex[] staticVertices = BuildStaticWorldVertices();
+        if (_staticGeometryBuildTask is null)
+        {
+            ScheduleStaticGeometryBuild();
+            return;
+        }
+        if (!_staticGeometryBuildTask.IsCompleted) return;
+
+        StaticWorldGeometryBuild? result;
+        try
+        {
+            result = _staticGeometryBuildTask.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        finally
+        {
+            _staticGeometryBuildTask = null;
+            _staticGeometryBuildCancellation?.Dispose();
+            _staticGeometryBuildCancellation = null;
+        }
+        // Cancellation is routine while streamed Chunks are arriving. The worker
+        // returns no result instead of throwing so Visual Studio's first-chance
+        // exception setting cannot interrupt normal gameplay.
+        if (result is null) return;
+        if (result.Version != _staticGeometryVersion) return;
+
+        foreach ((ChunkCoordinate chunk, CachedStaticChunkGeometry geometry) in result.UpdatedChunks)
+        {
+            _staticChunkGeometryCache[chunk] = geometry;
+            _dirtyStaticGeometryChunks.Remove(chunk);
+        }
+        _staticEmissiveCandidates.Clear();
+        _staticEmissiveCandidates.AddRange(result.EmissiveLights);
+        TracedMicroVoxelTriangleCount = result.MicroVoxelTriangleCount;
+        LastStaticGeometryBuildMilliseconds = result.BuildMilliseconds;
+        MaximumStaticGeometryBuildMilliseconds = Math.Max(
+            MaximumStaticGeometryBuildMilliseconds,
+            result.BuildMilliseconds);
         WorldVertex[] dynamicVertices = BuildPhysicsGridVertices();
-        RebuildAccelerationStructures(staticVertices, dynamicVertices, preserveStatic: false);
+        RebuildAccelerationStructures(result.Vertices, dynamicVertices, preserveStatic: false);
+    }
+
+    private void ScheduleStaticGeometryBuild()
+    {
+        BlockDefinition[] definitions = _blocks.CreateLookupSnapshot();
+        IEnumerable<ChunkCoordinate> sourceChunks = _visibilityCullingReady
+            ? _visibleChunks
+            : _world.SnapshotLoadedChunks();
+        ChunkCoordinate[] chunks = sourceChunks
+            .OrderBy(chunk => chunk.Z)
+            .ThenBy(chunk => chunk.X)
+            .ToArray();
+        var inputs = new List<StaticChunkBuildInput>(chunks.Length);
+        foreach (ChunkCoordinate chunk in chunks)
+        {
+            if (!_staticChunkGeometryCache.TryGetValue(chunk, out CachedStaticChunkGeometry? cached) ||
+                _dirtyStaticGeometryChunks.Contains(chunk))
+            {
+                inputs.Add(new StaticChunkBuildInput(
+                    chunk,
+                    null,
+                    _world.CreateChunkMeshingSnapshot(chunk),
+                    _world.SnapshotChunk(chunk)));
+            }
+            else
+            {
+                inputs.Add(new StaticChunkBuildInput(chunk, cached, null, null));
+            }
+        }
+        int version = _staticGeometryVersion;
+        _staticGeometryBuildCancellation = new CancellationTokenSource();
+        CancellationToken cancellation = _staticGeometryBuildCancellation.Token;
+        _staticGeometryBuildTask = Task.Factory.StartNew(() =>
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                return BuildStaticWorldGeometry(version, inputs, definitions, cancellation);
+            },
+            // Do not associate the cooperative token with Task scheduling. If the
+            // token is canceled before the delegate starts, TPL would manufacture a
+            // Canceled task whose GetResult throws OperationCanceledException.
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
     }
 
     private void RebuildDynamicAccelerationStructures()
@@ -494,7 +599,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         bool preserveStatic)
     {
         long buildStarted = Stopwatch.GetTimestamp();
-        WaitIdle();
+        // Render/AS submissions are synchronously fenced by ExecuteCommands before
+        // returning. A second empty signal/wait here only adds a scheduler round trip.
         if (preserveStatic) DisposeDynamicGeometryResources();
         else DisposeGeometryResources();
 
@@ -513,7 +619,12 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 staticInputs = CreateBottomLevelInputs(
                     _staticVertexBuffer, staticVertices.Length, stride, allowUpdate: false);
                 staticInfo = _device.GetRaytracingAccelerationStructurePrebuildInfo(staticInputs);
+                _staticBlasBytes = staticInfo.Value.ResultDataMaxSizeInBytes;
                 _staticBlas = CreateAccelerationStructure(staticInfo.Value.ResultDataMaxSizeInBytes);
+            }
+            else
+            {
+                _staticBlasBytes = 0;
             }
         }
         if (_staticVertexBuffer is null)
@@ -528,7 +639,12 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             dynamicInputs = CreateBottomLevelInputs(
                 _dynamicVertexBuffer, dynamicVertices.Length, stride, allowUpdate: true);
             dynamicInfo = _device.GetRaytracingAccelerationStructurePrebuildInfo(dynamicInputs);
+            _dynamicBlasBytes = dynamicInfo.Value.ResultDataMaxSizeInBytes;
             _dynamicBlas = CreateAccelerationStructure(dynamicInfo.Value.ResultDataMaxSizeInBytes);
+        }
+        else
+        {
+            _dynamicBlasBytes = 0;
         }
 
         var instances = new List<RaytracingInstanceDescription>(2);
@@ -549,6 +665,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         };
         RaytracingAccelerationStructurePrebuildInfo topInfo =
             _device.GetRaytracingAccelerationStructurePrebuildInfo(topInputs);
+        _tlasBytes = topInfo.ResultDataMaxSizeInBytes;
         _tlas = CreateAccelerationStructure(topInfo.ResultDataMaxSizeInBytes);
 
         _instanceBuffer = _device.CreateCommittedResource(HeapType.Upload,
@@ -608,6 +725,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _lastAccelerationStructureBuildMs = Environment.TickCount64;
         double elapsed = (Stopwatch.GetTimestamp() - buildStarted) * 1000.0 / Stopwatch.Frequency;
         LastAccelerationStructureBuildMilliseconds = elapsed;
+        RecordAccelerationStructureTiming(elapsed);
         if (preserveStatic)
         {
             LastDynamicAccelerationStructureBuildMilliseconds = elapsed;
@@ -625,7 +743,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     {
         long buildStarted = Stopwatch.GetTimestamp();
         ID3D12Resource dynamicBlas = _dynamicBlas!;
-        WaitIdle();
+        // The previous frame's trace was already fenced by ExecuteCommands.
         dynamicVertices.AsSpan().CopyTo(_dynamicVertexBuffer!.Map<WorldVertex>(0, dynamicVertices.Length));
         _dynamicVertexBuffer.Unmap(0);
 
@@ -654,9 +772,15 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
         ulong scratchSize = Math.Max(topInfo.UpdateScratchDataSizeInBytes,
             dynamicInfo.UpdateScratchDataSizeInBytes);
-        using ID3D12Resource scratch = _device.CreateCommittedResource(HeapType.Default,
-            ResourceDescription.Buffer(scratchSize, ResourceFlags.AllowUnorderedAccess),
-            ResourceStates.Common);
+        if (_dynamicUpdateScratch is null || _dynamicUpdateScratchBytes < scratchSize)
+        {
+            _dynamicUpdateScratch?.Dispose();
+            _dynamicUpdateScratchBytes = scratchSize;
+            _dynamicUpdateScratch = _device.CreateCommittedResource(HeapType.Default,
+                ResourceDescription.Buffer(scratchSize, ResourceFlags.AllowUnorderedAccess),
+                ResourceStates.Common);
+        }
+        ID3D12Resource scratch = _dynamicUpdateScratch;
 
         BeginCommands();
         _commands.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
@@ -683,10 +807,33 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _lastAccelerationStructureBuildMs = Environment.TickCount64;
         double elapsed = (Stopwatch.GetTimestamp() - buildStarted) * 1000.0 / Stopwatch.Frequency;
         LastAccelerationStructureBuildMilliseconds = elapsed;
+        RecordAccelerationStructureTiming(elapsed);
         LastDynamicAccelerationStructureBuildMilliseconds = elapsed;
         DynamicAccelerationStructureBuildCount++;
         TlasUpdateCount++;
         AccelerationStructureBuildCount++;
+    }
+
+    public void ResetPerformanceCounters()
+    {
+        AccelerationStructureBuildCount = 0;
+        StaticAccelerationStructureBuildCount = 0;
+        DynamicAccelerationStructureBuildCount = 0;
+        TlasUpdateCount = 0;
+        LastAccelerationStructureBuildMilliseconds = 0;
+        LastStaticAccelerationStructureBuildMilliseconds = 0;
+        LastDynamicAccelerationStructureBuildMilliseconds = 0;
+        MaximumAccelerationStructureBuildMilliseconds = 0;
+        AccelerationStructureBuildTotalMilliseconds = 0;
+        LastStaticGeometryBuildMilliseconds = 0;
+        MaximumStaticGeometryBuildMilliseconds = 0;
+    }
+
+    private void RecordAccelerationStructureTiming(double milliseconds)
+    {
+        AccelerationStructureBuildTotalMilliseconds += milliseconds;
+        MaximumAccelerationStructureBuildMilliseconds = Math.Max(
+            MaximumAccelerationStructureBuildMilliseconds, milliseconds);
     }
 
     private ID3D12Resource CreateVertexBuffer(WorldVertex[] vertices, int stride)
@@ -719,7 +866,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             Flags = allowUpdate
                 ? RaytracingAccelerationStructureBuildFlags.PreferFastBuild |
                   RaytracingAccelerationStructureBuildFlags.AllowUpdate
-                : RaytracingAccelerationStructureBuildFlags.PreferFastTrace,
+                : RaytracingAccelerationStructureBuildFlags.PreferFastBuild,
             Layout = ElementsLayout.Array,
             DescriptorsCount = 1,
             GeometryDescriptions = new[] { geometry },
@@ -901,7 +1048,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             new Vector4(right, 0), new Vector4(up, 0),
             new Vector4(primaryLightDirection, 0),
             new Vector4(LastHardwareQuality, (int)quality.HardwareRayTracingRenderStyle,
-                _emissiveLightCount, cameraUnderwater ? 1f : 0f));
+                _emissiveLightCount, cameraUnderwater ? 1f : 0f),
+            new Vector4(Math.Clamp(quality.HardwareRayTracingReflectionBounces, 1, MaximumReflectionBounces), 0, 0, 0));
 
         BeginCommands();
         _commands.ResourceBarrierTransition(_output, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
@@ -997,53 +1145,91 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _readback.Unmap(0);
     }
 
-    private WorldVertex[] BuildStaticWorldVertices()
+    private static StaticWorldGeometryBuild? BuildStaticWorldGeometry(
+        int version,
+        IReadOnlyList<StaticChunkBuildInput> inputs,
+        IReadOnlyList<BlockDefinition> definitions,
+        CancellationToken cancellation)
     {
+        long buildStarted = Stopwatch.GetTimestamp();
         var vertices = new List<WorldVertex>(100_000);
-        _staticEmissiveCandidates.Clear();
-        TracedMicroVoxelTriangleCount = 0;
-        IReadOnlyCollection<ChunkCoordinate> chunks = _visibilityCullingReady
-            ? _visibleChunks
-            : _world.SnapshotLoadedChunks();
-        foreach (ChunkCoordinate chunk in chunks)
+        var emissiveLights = new List<EmissiveLight>();
+        var updated = new Dictionary<ChunkCoordinate, CachedStaticChunkGeometry>();
+        int microVoxelTriangles = 0;
+        foreach (StaticChunkBuildInput input in inputs)
         {
-            VoxelChunkSnapshot snapshot = _world.SnapshotChunk(chunk);
-            foreach (StoredVoxel voxel in snapshot.Voxels)
+            if (cancellation.IsCancellationRequested) return null;
+            CachedStaticChunkGeometry cached = input.Cached ?? BuildStaticChunkGeometry(
+                input.Coordinate,
+                input.MeshingSnapshot!,
+                input.VoxelSnapshot!,
+                definitions);
+            if (input.Cached is null)
             {
-                int x = chunk.MinimumX + voxel.LocalX;
-                int z = chunk.MinimumZ + voxel.LocalZ;
-                BlockDefinition material = _blocks.Get(voxel.MaterialId);
-                AddVoxelFaces(vertices, x, voxel.Y, z, material);
-                AddStaticEmissiveCandidate(new Vector3(x + 0.5f, voxel.Y + 0.5f, z + 0.5f), material);
+                updated[input.Coordinate] = cached;
             }
-            foreach (StoredMicroVoxel micro in snapshot.MicroVoxels)
+            vertices.AddRange(cached.Vertices);
+            emissiveLights.AddRange(cached.EmissiveLights);
+            microVoxelTriangles += cached.MicroVoxelTriangleCount;
+        }
+        double milliseconds = (Stopwatch.GetTimestamp() - buildStarted) * 1000.0 / Stopwatch.Frequency;
+        return new StaticWorldGeometryBuild(
+            version,
+            vertices.ToArray(),
+            emissiveLights.ToArray(),
+            microVoxelTriangles,
+            updated,
+            milliseconds);
+    }
+
+    private static CachedStaticChunkGeometry BuildStaticChunkGeometry(
+        ChunkCoordinate chunk,
+        ChunkMeshingSnapshot meshingSnapshot,
+        VoxelChunkSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        var vertices = new List<WorldVertex>(8_000);
+        var emissiveLights = new List<EmissiveLight>();
+        int microVoxelTriangles = 0;
+        AddGreedyChunkFaces(vertices, meshingSnapshot, definitions);
+        foreach (StoredVoxel voxel in snapshot.Voxels)
+        {
+            int x = chunk.MinimumX + voxel.LocalX;
+            int z = chunk.MinimumZ + voxel.LocalZ;
+            BlockDefinition material = definitions[voxel.MaterialId];
+            if (TryCreateEmissiveLight(
+                    new Vector3(x + 0.5f, voxel.Y + 0.5f, z + 0.5f), material, out EmissiveLight light))
+                emissiveLights.Add(light);
+        }
+        foreach (StoredMicroVoxel micro in snapshot.MicroVoxels)
+        {
+            float inverse = 1f / micro.Snapshot.Resolution;
+            foreach (MicroVoxelBox box in micro.Snapshot.Boxes)
             {
-                float inverse = 1f / micro.Snapshot.Resolution;
-                foreach (MicroVoxelBox box in micro.Snapshot.Boxes)
-                {
-                    int before = vertices.Count;
-                    Vector3 minimum = new(
-                        chunk.MinimumX + micro.LocalX + box.MinX * inverse,
-                        micro.Y + box.MinY * inverse,
-                        chunk.MinimumZ + micro.LocalZ + box.MinZ * inverse);
-                    Vector3 maximum = new(
-                        chunk.MinimumX + micro.LocalX + box.MaxX * inverse,
-                        micro.Y + box.MaxY * inverse,
-                        chunk.MinimumZ + micro.LocalZ + box.MaxZ * inverse);
-                    BlockDefinition material = _blocks.Get(box.MaterialId);
-                    AddBoxFaces(vertices, minimum, maximum, material, AllFaces, null);
-                    TracedMicroVoxelTriangleCount += (vertices.Count - before) / 3;
-                    AddStaticEmissiveCandidate((minimum + maximum) * 0.5f, material);
-                }
+                int before = vertices.Count;
+                Vector3 minimum = new(
+                    chunk.MinimumX + micro.LocalX + box.MinX * inverse,
+                    micro.Y + box.MinY * inverse,
+                    chunk.MinimumZ + micro.LocalZ + box.MinZ * inverse);
+                Vector3 maximum = new(
+                    chunk.MinimumX + micro.LocalX + box.MaxX * inverse,
+                    micro.Y + box.MaxY * inverse,
+                    chunk.MinimumZ + micro.LocalZ + box.MaxZ * inverse);
+                BlockDefinition material = definitions[box.MaterialId];
+                AddBoxFaces(vertices, minimum, maximum, material, AllFaces, null);
+                microVoxelTriangles += (vertices.Count - before) / 3;
+                if (TryCreateEmissiveLight((minimum + maximum) * 0.5f, material, out EmissiveLight light))
+                    emissiveLights.Add(light);
             }
         }
-
-        return vertices.ToArray();
+        return new CachedStaticChunkGeometry(
+            vertices.ToArray(), emissiveLights.ToArray(), microVoxelTriangles);
     }
 
     private WorldVertex[] BuildPhysicsGridVertices()
     {
         var vertices = new List<WorldVertex>(16_000);
+        BlockDefinition[] definitions = _blocks.CreateLookupSnapshot();
         TracedPhysicsGridCount = 0;
         TracedPhysicsGridTriangleCount = 0;
         var activeGridIds = _world.PhysicsGrids.Grids.Select(grid => grid.Id).ToHashSet();
@@ -1055,7 +1241,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             if (!_gridGeometryCache.TryGetValue(grid.Id, out CachedGridGeometry? cached) ||
                 cached.TopologyVersion != grid.TopologyVersion)
             {
-                cached = BuildLocalGridGeometry(grid);
+                cached = BuildLocalGridGeometry(grid, definitions);
                 _gridGeometryCache[grid.Id] = cached;
                 DynamicTopologyBuildCount++;
             }
@@ -1087,28 +1273,24 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                    _cullingCameraPosition, _cullingCameraForward, _cullingFieldOfView);
     }
 
-    private CachedGridGeometry BuildLocalGridGeometry(PhysicsGrid grid)
+    private CachedGridGeometry BuildLocalGridGeometry(
+        PhysicsGrid grid,
+        IReadOnlyList<BlockDefinition> definitions)
     {
         var vertices = new List<WorldVertex>(Math.Max(36, grid.Elements.Count * 18));
         var lights = new List<LocalEmissiveLight>();
-        var includeFaces = new bool[6];
         foreach (PhysicsGridElement element in grid.Elements)
         {
-            BlockDefinition material = _blocks.Get(element.MaterialId);
-            for (int face = 0; face < includeFaces.Length; face++)
-                includeFaces[face] = ShouldRenderGridFace(grid, element, material, face);
-            AddBoxFaces(vertices, element.Minimum, element.Maximum, material, includeFaces, null);
+            BlockDefinition material = definitions[element.MaterialId];
+            byte faceMask = 0;
+            for (int face = 0; face < 6; face++)
+                if (ShouldRenderGridFace(grid, element, material, face, definitions)) faceMask |= (byte)(1 << face);
+            AddBoxFaces(vertices, element.Minimum, element.Maximum, material, faceMask, null);
             if (TryCreateEmissiveLight(
                     (element.Minimum + element.Maximum) * 0.5f, material, out EmissiveLight light))
                 lights.Add(new LocalEmissiveLight(light.Position, light.Radius, light.Color, light.Intensity));
         }
         return new CachedGridGeometry(grid.TopologyVersion, vertices.ToArray(), lights.ToArray());
-    }
-
-    private void AddStaticEmissiveCandidate(Vector3 position, BlockDefinition material)
-    {
-        if (TryCreateEmissiveLight(position, material, out EmissiveLight light))
-            _staticEmissiveCandidates.Add(light);
     }
 
     private static bool TryCreateEmissiveLight(
@@ -1135,7 +1317,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         PhysicsGrid grid,
         PhysicsGridElement element,
         BlockDefinition material,
-        int face)
+        int face,
+        IReadOnlyList<BlockDefinition> definitions)
     {
         Vector3 expectedMinimum = new(element.CellX, element.CellY, element.CellZ);
         if (Vector3.DistanceSquared(element.Minimum, expectedMinimum) > 0.000001f ||
@@ -1156,44 +1339,153 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 element.CellZ + offset.Z,
                 out ushort adjacentId)) return true;
         if (adjacentId == material.Id) return false;
-        BlockDefinition adjacent = _blocks.Get(adjacentId);
+        BlockDefinition adjacent = definitions[adjacentId];
         return material.Transmission > 0f || material.IsTransparent || material.IsFluid ||
                adjacent.Transmission > 0f || adjacent.IsTransparent || adjacent.IsFluid;
     }
 
-    private void AddVoxelFaces(List<WorldVertex> vertices, int x, int y, int z, BlockDefinition material)
+    private static void AddGreedyChunkFaces(
+        List<WorldVertex> vertices,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
     {
-        Vector3 minimum = new(x, y, z);
-        Vector3 maximum = minimum + new Vector3(1f,
-            material.IsFluid && !_world.IsFluid(x, y + 1, z) ? VoxelWorld.FluidSurfaceHeight : 1f, 1f);
-        bool[] includeFaces = new bool[6];
-        if (material.IsFluid)
-        {
-            ushort above = _world.GetLoadedBlockId(x, y + 1, z);
-            includeFaces[0] = above == 0 || !_blocks.Get(above).IsFluid;
-            AddBoxFaces(vertices, minimum, maximum, material, includeFaces, null);
-            return;
-        }
-        (int X, int Y, int Z)[] neighbors = { (0, 1, 0), (-1, 0, 0), (1, 0, 0), (0, 0, -1), (0, 0, 1), (0, -1, 0) };
+        if (snapshot.MaximumYExclusive <= snapshot.MinimumY) return;
+        int verticalCells = snapshot.MaximumYExclusive - snapshot.MinimumY;
+        var mask = new ushort[Math.Max(ChunkCoordinate.Size * ChunkCoordinate.Size,
+            ChunkCoordinate.Size * verticalCells)];
+
         for (int face = 0; face < 6; face++)
         {
-            var neighbor = neighbors[face];
-            ushort neighborId = _world.GetLoadedBlockId(x + neighbor.X, y + neighbor.Y, z + neighbor.Z);
-            if (neighborId == 0)
+            bool horizontal = face is 0 or 5;
+            int sliceCount = horizontal ? verticalCells : ChunkCoordinate.Size;
+            int maskWidth = ChunkCoordinate.Size;
+            int maskHeight = horizontal ? ChunkCoordinate.Size : verticalCells;
+            for (int slice = 0; slice < sliceCount; slice++)
             {
-                includeFaces[face] = true;
-                continue;
+                Array.Clear(mask, 0, maskWidth * maskHeight);
+                for (int v = 0; v < maskHeight; v++)
+                for (int u = 0; u < maskWidth; u++)
+                {
+                    (int x, int y, int z) = FaceCell(snapshot, face, slice, u, v);
+                    ushort materialId = snapshot.GetBlock(x, y, z);
+                    if (materialId == 0) continue;
+                    BlockDefinition material = definitions[materialId];
+                    if (material.IsFluid && face != 0) continue;
+                    (int offsetX, int offsetY, int offsetZ) = FaceNeighborOffset(face);
+                    ushort neighborId = snapshot.GetBlock(x + offsetX, y + offsetY, z + offsetZ);
+                    if (ShouldIncludeGreedyFace(face, materialId, neighborId, definitions))
+                        mask[u + maskWidth * v] = materialId;
+                }
+
+                for (int v = 0; v < maskHeight; v++)
+                for (int u = 0; u < maskWidth;)
+                {
+                    ushort materialId = mask[u + maskWidth * v];
+                    if (materialId == 0)
+                    {
+                        u++;
+                        continue;
+                    }
+                    int width = 1;
+                    while (u + width < maskWidth && mask[u + width + maskWidth * v] == materialId) width++;
+                    int height = 1;
+                    while (v + height < maskHeight)
+                    {
+                        bool same = true;
+                        for (int offset = 0; offset < width; offset++)
+                            if (mask[u + offset + maskWidth * (v + height)] != materialId)
+                            {
+                                same = false;
+                                break;
+                            }
+                        if (!same) break;
+                        height++;
+                    }
+
+                    AddGreedyFace(vertices, snapshot, definitions[materialId], face,
+                        slice, u, v, width, height);
+                    for (int clearV = 0; clearV < height; clearV++)
+                    for (int clearU = 0; clearU < width; clearU++)
+                        mask[u + clearU + maskWidth * (v + clearV)] = 0;
+                    u += width;
+                }
             }
-            if (neighborId == material.Id)
-            {
-                includeFaces[face] = false;
-                continue;
-            }
-            BlockDefinition adjacent = _blocks.Get(neighborId);
-            includeFaces[face] = material.IsFluid || material.IsTransparent || material.Transmission > 0f ||
-                                 adjacent.IsFluid || adjacent.IsTransparent || adjacent.Transmission > 0f;
         }
-        AddBoxFaces(vertices, minimum, maximum, material, includeFaces, null);
+    }
+
+    private static bool ShouldIncludeGreedyFace(
+        int face,
+        ushort materialId,
+        ushort neighborId,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        BlockDefinition material = definitions[materialId];
+        if (material.IsFluid)
+            return face == 0 && (neighborId == 0 || !definitions[neighborId].IsFluid);
+        if (neighborId == 0) return true;
+        if (neighborId == materialId) return false;
+        BlockDefinition adjacent = definitions[neighborId];
+        return material.IsTransparent || material.Transmission > 0f ||
+               adjacent.IsFluid || adjacent.IsTransparent || adjacent.Transmission > 0f;
+    }
+
+    private static (int X, int Y, int Z) FaceCell(
+        ChunkMeshingSnapshot snapshot,
+        int face,
+        int slice,
+        int u,
+        int v) => face switch
+        {
+            0 or 5 => (snapshot.Coordinate.MinimumX + u, snapshot.MinimumY + slice,
+                snapshot.Coordinate.MinimumZ + v),
+            1 or 2 => (snapshot.Coordinate.MinimumX + slice, snapshot.MinimumY + v,
+                snapshot.Coordinate.MinimumZ + u),
+            _ => (snapshot.Coordinate.MinimumX + u, snapshot.MinimumY + v,
+                snapshot.Coordinate.MinimumZ + slice),
+        };
+
+    private static (int X, int Y, int Z) FaceNeighborOffset(int face) => face switch
+    {
+        0 => (0, 1, 0),
+        1 => (-1, 0, 0),
+        2 => (1, 0, 0),
+        3 => (0, 0, -1),
+        4 => (0, 0, 1),
+        _ => (0, -1, 0),
+    };
+
+    private static void AddGreedyFace(
+        List<WorldVertex> vertices,
+        ChunkMeshingSnapshot snapshot,
+        BlockDefinition material,
+        int face,
+        int slice,
+        int u,
+        int v,
+        int width,
+        int height)
+    {
+        (int x, int y, int z) = FaceCell(snapshot, face, slice, u, v);
+        Vector3 minimum;
+        Vector3 maximum;
+        if (face is 0 or 5)
+        {
+            float maximumY = material.IsFluid ? y + VoxelWorld.FluidSurfaceHeight : y + 1f;
+            minimum = new Vector3(x, y, z);
+            maximum = new Vector3(x + width, maximumY, z + height);
+        }
+        else if (face is 1 or 2)
+        {
+            minimum = new Vector3(x, y, z);
+            maximum = new Vector3(x + 1f, y + height, z + width);
+        }
+        else
+        {
+            minimum = new Vector3(x, y, z);
+            maximum = new Vector3(x + width, y + height, z + 1f);
+        }
+        AddBoxFaces(vertices, minimum, maximum, material, (byte)(1 << face), null,
+            new Vector2(width, height));
     }
 
     private static void AddBoxFaces(
@@ -1201,42 +1493,80 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         Vector3 minimum,
         Vector3 maximum,
         BlockDefinition material,
-        IReadOnlyList<bool> includeFaces,
-        PhysicsGrid? grid)
+        byte faceMask,
+        PhysicsGrid? grid,
+        Vector2 uvScale = default)
     {
-        Vector3[][] faces =
-        {
-            new[] { new Vector3(minimum.X, maximum.Y, minimum.Z), new Vector3(maximum.X, maximum.Y, minimum.Z), new Vector3(maximum.X, maximum.Y, maximum.Z), new Vector3(minimum.X, maximum.Y, maximum.Z) },
-            new[] { new Vector3(minimum.X, minimum.Y, maximum.Z), new Vector3(minimum.X, minimum.Y, minimum.Z), new Vector3(minimum.X, maximum.Y, minimum.Z), new Vector3(minimum.X, maximum.Y, maximum.Z) },
-            new[] { new Vector3(maximum.X, minimum.Y, minimum.Z), new Vector3(maximum.X, minimum.Y, maximum.Z), new Vector3(maximum.X, maximum.Y, maximum.Z), new Vector3(maximum.X, maximum.Y, minimum.Z) },
-            new[] { new Vector3(minimum.X, minimum.Y, minimum.Z), new Vector3(maximum.X, minimum.Y, minimum.Z), new Vector3(maximum.X, maximum.Y, minimum.Z), new Vector3(minimum.X, maximum.Y, minimum.Z) },
-            new[] { new Vector3(maximum.X, minimum.Y, maximum.Z), new Vector3(minimum.X, minimum.Y, maximum.Z), new Vector3(minimum.X, maximum.Y, maximum.Z), new Vector3(maximum.X, maximum.Y, maximum.Z) },
-            new[] { new Vector3(minimum.X, minimum.Y, maximum.Z), new Vector3(maximum.X, minimum.Y, maximum.Z), new Vector3(maximum.X, minimum.Y, minimum.Z), new Vector3(minimum.X, minimum.Y, minimum.Z) },
-        };
-        Vector3[] normals = { Vector3.UnitY, -Vector3.UnitX, Vector3.UnitX, -Vector3.UnitZ, Vector3.UnitZ, -Vector3.UnitY };
-        Vector2[] uvs = { new(0f, 0f), new(1f, 0f), new(1f, 1f), new(0f, 1f) };
-        int[] triangles = { 0, 1, 2, 0, 2, 3 };
+        if (uvScale.X <= 0f || uvScale.Y <= 0f) uvScale = Vector2.One;
         for (int face = 0; face < 6; face++)
         {
-            if (!includeFaces[face]) continue;
+            if ((faceMask & (1 << face)) == 0) continue;
             uint atlasFace = face == 0 ? 0u : face == 5 ? 2u : 1u;
-            foreach (int corner in triangles)
+            Vector3 normal = face switch
             {
-                Vector3 position = faces[face][corner];
-                Vector3 normal = normals[face];
+                0 => Vector3.UnitY,
+                1 => -Vector3.UnitX,
+                2 => Vector3.UnitX,
+                3 => -Vector3.UnitZ,
+                4 => Vector3.UnitZ,
+                _ => -Vector3.UnitY,
+            };
+            for (int vertex = 0; vertex < 6; vertex++)
+            {
+                int corner = vertex switch { 0 => 0, 1 => 1, 2 => 2, 3 => 0, 4 => 2, _ => 3 };
+                Vector3 position = BoxFaceCorner(minimum, maximum, face, corner);
+                Vector3 transformedNormal = normal;
                 if (grid is not null)
                 {
                     position = grid.LocalToWorld(position);
-                    normal = Vector3.Normalize(grid.LocalDirectionToWorld(normal));
+                    transformedNormal = Vector3.Normalize(grid.LocalDirectionToWorld(normal));
                 }
-                vertices.Add(new WorldVertex(position, normal, uvs[corner], material.Id,
+                Vector2 uv = corner switch
+                {
+                    0 => Vector2.Zero,
+                    1 => Vector2.UnitX,
+                    2 => Vector2.One,
+                    _ => Vector2.UnitY,
+                };
+                uv *= uvScale;
+                vertices.Add(new WorldVertex(position, transformedNormal, uv, material.Id,
                     atlasFace, material.Roughness, material.Metallic, grid is null ? 0u : 1u,
                     material.Transmission,
-                    (material.IsFluid ? 1u : 0u) | (material.IsTransparent ? 2u : 0u),
+                    (material.IsFluid ? 1u : 0u) | (material.IsTransparent ? 2u : 0u) |
+                    ((uint)Math.Clamp((int)MathF.Round(material.IndexOfRefraction * 100f), 100, 255) << 8),
                     material.Emission));
             }
         }
     }
+
+    private static Vector3 BoxFaceCorner(Vector3 minimum, Vector3 maximum, int face, int corner) =>
+        (face, corner) switch
+        {
+            (0, 0) => new(minimum.X, maximum.Y, minimum.Z),
+            (0, 1) => new(maximum.X, maximum.Y, minimum.Z),
+            (0, 2) => new(maximum.X, maximum.Y, maximum.Z),
+            (0, _) => new(minimum.X, maximum.Y, maximum.Z),
+            (1, 0) => new(minimum.X, minimum.Y, maximum.Z),
+            (1, 1) => new(minimum.X, minimum.Y, minimum.Z),
+            (1, 2) => new(minimum.X, maximum.Y, minimum.Z),
+            (1, _) => new(minimum.X, maximum.Y, maximum.Z),
+            (2, 0) => new(maximum.X, minimum.Y, minimum.Z),
+            (2, 1) => new(maximum.X, minimum.Y, maximum.Z),
+            (2, 2) => new(maximum.X, maximum.Y, maximum.Z),
+            (2, _) => new(maximum.X, maximum.Y, minimum.Z),
+            (3, 0) => new(minimum.X, minimum.Y, minimum.Z),
+            (3, 1) => new(maximum.X, minimum.Y, minimum.Z),
+            (3, 2) => new(maximum.X, maximum.Y, minimum.Z),
+            (3, _) => new(minimum.X, maximum.Y, minimum.Z),
+            (4, 0) => new(maximum.X, minimum.Y, maximum.Z),
+            (4, 1) => new(minimum.X, minimum.Y, maximum.Z),
+            (4, 2) => new(minimum.X, maximum.Y, maximum.Z),
+            (4, _) => new(maximum.X, maximum.Y, maximum.Z),
+            (5, 0) => new(minimum.X, minimum.Y, maximum.Z),
+            (5, 1) => new(maximum.X, minimum.Y, maximum.Z),
+            (5, 2) => new(maximum.X, minimum.Y, minimum.Z),
+            _ => new(minimum.X, minimum.Y, minimum.Z),
+        };
 
     private void BeginCommands()
     {
@@ -1260,21 +1590,49 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _fenceEvent.WaitOne();
     }
 
-    private void OnVoxelChanged(int x, int y, int z, VoxelMaterial material) => MarkStaticGeometryDirty();
+    private void OnVoxelChanged(int x, int y, int z, VoxelMaterial material)
+    {
+        foreach (ChunkCoordinate chunk in ChunkCoordinate.MeshDependenciesForVoxel(x, z))
+            _dirtyStaticGeometryChunks.Add(chunk);
+        MarkStaticGeometryDirty();
+    }
     private void OnWorldReloaded()
     {
         _gridGeometryCache.Clear();
+        _staticChunkGeometryCache.Clear();
+        _dirtyStaticGeometryChunks.Clear();
         _staticEmissiveCandidates.Clear();
         MarkStaticGeometryDirty(forceImmediate: true);
     }
-    private void OnMicroVoxelCellChanged(int x, int y, int z) => MarkStaticGeometryDirty();
-    private void OnMicroVoxelsReloaded() => MarkStaticGeometryDirty(forceImmediate: true);
+    private void OnMicroVoxelCellChanged(int x, int y, int z)
+    {
+        foreach (ChunkCoordinate chunk in ChunkCoordinate.MeshDependenciesForVoxel(x, z))
+            _dirtyStaticGeometryChunks.Add(chunk);
+        MarkStaticGeometryDirty();
+    }
+    private void OnMicroVoxelsReloaded()
+    {
+        _staticChunkGeometryCache.Clear();
+        _dirtyStaticGeometryChunks.Clear();
+        MarkStaticGeometryDirty(forceImmediate: true);
+    }
+    private void OnChunkGenerated(ChunkCoordinate chunk)
+    {
+        _dirtyStaticGeometryChunks.Add(chunk);
+        _dirtyStaticGeometryChunks.Add(chunk with { X = chunk.X - 1 });
+        _dirtyStaticGeometryChunks.Add(chunk with { X = chunk.X + 1 });
+        _dirtyStaticGeometryChunks.Add(chunk with { Z = chunk.Z - 1 });
+        _dirtyStaticGeometryChunks.Add(chunk with { Z = chunk.Z + 1 });
+        MarkStaticGeometryDirty();
+    }
 
     private void MarkStaticGeometryDirty(bool forceImmediate = false)
     {
         long now = Environment.TickCount64;
         if (!_geometryDirty) _staticGeometryDirtySinceMs = now;
         _geometryDirty = true;
+        _staticGeometryVersion++;
+        _staticGeometryBuildCancellation?.Cancel();
         _lastStaticGeometryChangeMs = now;
         _forceImmediateStaticRebuild |= forceImmediate;
     }
@@ -1292,9 +1650,14 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _dynamicBlas?.Dispose(); _dynamicBlas = null;
         _staticBlas?.Dispose(); _staticBlas = null;
         _dynamicVertexBuffer?.Dispose(); _dynamicVertexBuffer = null;
+        _dynamicUpdateScratch?.Dispose(); _dynamicUpdateScratch = null;
+        _dynamicUpdateScratchBytes = 0;
         _staticVertexBuffer?.Dispose(); _staticVertexBuffer = null;
         _emissiveLightBuffer?.Dispose(); _emissiveLightBuffer = null;
         _emissiveLightCapacity = 0;
+        _staticBlasBytes = 0;
+        _dynamicBlasBytes = 0;
+        _tlasBytes = 0;
     }
 
     private void DisposeDynamicGeometryResources()
@@ -1305,6 +1668,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _dynamicVertexBuffer?.Dispose(); _dynamicVertexBuffer = null;
         _emissiveLightBuffer?.Dispose(); _emissiveLightBuffer = null;
         _emissiveLightCapacity = 0;
+        _dynamicBlasBytes = 0;
+        _tlasBytes = 0;
     }
 
     private void WriteDebugMessages(bool throwOnError = false)
@@ -1331,7 +1696,12 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _world.WorldReloaded -= OnWorldReloaded;
         _world.MicroVoxelCellChanged -= OnMicroVoxelCellChanged;
         _world.MicroVoxelsReloaded -= OnMicroVoxelsReloaded;
+        _world.ChunkGenerated -= OnChunkGenerated;
         _world.PhysicsGrids.Changed -= OnPhysicsGridsChanged;
+        _staticGeometryBuildCancellation?.Cancel();
+        _staticGeometryBuildCancellation?.Dispose();
+        _staticGeometryBuildCancellation = null;
+        _staticGeometryBuildTask = null;
         WaitIdle();
         DisposeGeometryResources();
         _readback?.Dispose();
@@ -1378,6 +1748,20 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         Vector3 LocalPosition, float Radius, Vector3 Color, float Intensity);
     private sealed record CachedGridGeometry(
         int TopologyVersion, WorldVertex[] Vertices, LocalEmissiveLight[] Lights);
+    private sealed record CachedStaticChunkGeometry(
+        WorldVertex[] Vertices, EmissiveLight[] EmissiveLights, int MicroVoxelTriangleCount);
+    private sealed record StaticChunkBuildInput(
+        ChunkCoordinate Coordinate,
+        CachedStaticChunkGeometry? Cached,
+        ChunkMeshingSnapshot? MeshingSnapshot,
+        VoxelChunkSnapshot? VoxelSnapshot);
+    private sealed record StaticWorldGeometryBuild(
+        int Version,
+        WorldVertex[] Vertices,
+        EmissiveLight[] EmissiveLights,
+        int MicroVoxelTriangleCount,
+        IReadOnlyDictionary<ChunkCoordinate, CachedStaticChunkGeometry> UpdatedChunks,
+        double BuildMilliseconds);
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct CameraConstants(
@@ -1386,5 +1770,6 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         Vector4 CameraRight,
         Vector4 CameraUp,
         Vector4 SunDirection,
-        Vector4 RenderOptions);
+        Vector4 RenderOptions,
+        Vector4 TraceOptions);
 }

@@ -22,6 +22,24 @@ public readonly record struct PhysicsGridElement(
     }
 }
 
+public readonly record struct PhysicsGridCollisionElement(
+    Vector3 Minimum,
+    Vector3 Maximum,
+    float Density)
+{
+    public Vector3 Center => (Minimum + Maximum) * 0.5f;
+    public Vector3 HalfExtents => (Maximum - Minimum) * 0.5f;
+    public float Volume
+    {
+        get
+        {
+            Vector3 size = Maximum - Minimum;
+            return size.X * size.Y * size.Z;
+        }
+    }
+    public float Mass => MathF.Max(0.001f, Volume * MathF.Max(0.05f, Density));
+}
+
 public readonly record struct PhysicsGridRayHit(
     ulong GridId,
     int CellX,
@@ -39,13 +57,13 @@ public readonly record struct PhysicsGridRayHit(
 public sealed class PhysicsGrid
 {
     private readonly List<PhysicsGridElement> _elements;
-    private readonly List<PhysicsGridElement> _collisionElements = new();
+    private readonly List<PhysicsGridCollisionElement> _collisionElements = new();
     private readonly Dictionary<(int X, int Y, int Z), List<int>> _cellElements = new();
     private readonly Func<ushort, float> _density;
 
     public ulong Id { get; }
     public IReadOnlyList<PhysicsGridElement> Elements => _elements;
-    public IReadOnlyList<PhysicsGridElement> CollisionElements => _collisionElements;
+    public IReadOnlyList<PhysicsGridCollisionElement> CollisionElements => _collisionElements;
     public int TopologyVersion { get; private set; } = 1;
     public Vector3 Position { get; internal set; }
     public Quaternion Orientation { get; internal set; } = Quaternion.Identity;
@@ -270,7 +288,7 @@ public sealed class PhysicsGrid
         correction = Vector3.Zero;
         float largestRequiredCorrection = 0f;
 
-        foreach (PhysicsGridElement element in _collisionElements)
+        foreach (PhysicsGridCollisionElement element in _collisionElements)
         {
             Vector3 boxCenter = LocalToWorld(element.Center);
             Vector3 boxHalfExtents = element.HalfExtents;
@@ -417,21 +435,69 @@ public sealed class PhysicsGrid
     private void RebuildCollisionElements()
     {
         _collisionElements.Clear();
+        var fullCells = new Dictionary<(int X, int Y, int Z), (PhysicsGridElement Element, float Density)>();
         foreach (PhysicsGridElement element in _elements)
         {
-            // Precision geometry stays exact. Full cells fully surrounded by six other
-            // cells are interior mass and can never be the first static-world contact.
             bool full = Vector3.DistanceSquared(element.Minimum, new Vector3(element.CellX, element.CellY, element.CellZ)) < 0.000001f &&
                         Vector3.DistanceSquared(element.Maximum, new Vector3(element.CellX + 1, element.CellY + 1, element.CellZ + 1)) < 0.000001f;
-            if (!full ||
-                !ContainsCell(element.CellX - 1, element.CellY, element.CellZ) ||
-                !ContainsCell(element.CellX + 1, element.CellY, element.CellZ) ||
-                !ContainsCell(element.CellX, element.CellY - 1, element.CellZ) ||
-                !ContainsCell(element.CellX, element.CellY + 1, element.CellZ) ||
-                !ContainsCell(element.CellX, element.CellY, element.CellZ - 1) ||
-                !ContainsCell(element.CellX, element.CellY, element.CellZ + 1))
-                _collisionElements.Add(element);
+            var cell = (element.CellX, element.CellY, element.CellZ);
+            if (full && _cellElements.TryGetValue(cell, out List<int>? members) && members.Count == 1)
+                fullCells[cell] = (element, MathF.Max(0.05f, _density(element.MaterialId)));
+            else
+                _collisionElements.Add(new PhysicsGridCollisionElement(
+                    element.Minimum, element.Maximum, _density(element.MaterialId)));
         }
+
+        // BEPU does not need one child shape per voxel. Greedily combine adjacent
+        // full cells of the same physical density into exact cuboids; precision cells remain
+        // untouched above. A solid 8x8x4 falling structure becomes one collision
+        // child instead of a shell containing hundreds of children.
+        var consumed = new HashSet<(int X, int Y, int Z)>();
+        foreach (KeyValuePair<(int X, int Y, int Z), (PhysicsGridElement Element, float Density)> pair in fullCells
+                     .OrderBy(entry => entry.Key.Y)
+                     .ThenBy(entry => entry.Key.Z)
+                     .ThenBy(entry => entry.Key.X))
+        {
+            (int startX, int startY, int startZ) = pair.Key;
+            (int X, int Y, int Z) cell = pair.Key;
+            float density = pair.Value.Density;
+            if (consumed.Contains(cell)) continue;
+            int width = 1;
+            while (Matches(startX + width, startY, startZ, density)) width++;
+
+            int depth = 1;
+            while (true)
+            {
+                for (int x = 0; x < width; x++)
+                    if (!Matches(startX + x, startY, startZ + depth, density)) goto DepthComplete;
+                depth++;
+            }
+            DepthComplete:
+
+            int height = 1;
+            while (true)
+            {
+                for (int z = 0; z < depth; z++)
+                for (int x = 0; x < width; x++)
+                    if (!Matches(startX + x, startY + height, startZ + z, density)) goto HeightComplete;
+                height++;
+            }
+            HeightComplete:
+
+            for (int y = 0; y < height; y++)
+            for (int z = 0; z < depth; z++)
+            for (int x = 0; x < width; x++)
+                consumed.Add((startX + x, startY + y, startZ + z));
+            _collisionElements.Add(new PhysicsGridCollisionElement(
+                new Vector3(startX, startY, startZ),
+                new Vector3(startX + width, startY + height, startZ + depth),
+                density));
+        }
+
+        bool Matches(int x, int y, int z, float density) =>
+            !consumed.Contains((x, y, z)) &&
+            fullCells.TryGetValue((x, y, z), out var candidate) &&
+            candidate.Density == density;
     }
 
     private void RecalculateMass()

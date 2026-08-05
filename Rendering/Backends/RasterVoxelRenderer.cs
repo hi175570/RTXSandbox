@@ -1,4 +1,6 @@
 using System.Numerics;
+using System.Diagnostics;
+using System.Buffers;
 using OpenTK.Graphics.OpenGL4;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.Gameplay;
@@ -15,6 +17,9 @@ namespace RTXSandbox.Rendering.Backends;
 /// </summary>
 public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
 {
+    private const int MeshResidencyRadiusChunks = 16;
+    private const double MeshEditCoalesceMilliseconds = 25.0;
+    private const double RepeatedMeshEditCoalesceMilliseconds = 200.0;
     private const int FloatsPerVertex = 20;
     private const float CullingFrustumScale = 1.6f;
     private const int DirectionalShadowMapSize = 2048;
@@ -36,11 +41,19 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private readonly Dictionary<ChunkCoordinate, MeshBuffer> _chunkMeshes = new();
     private readonly Dictionary<ulong, PhysicsGridMesh> _physicsGridMeshes = new();
     private readonly HashSet<ChunkCoordinate> _dirtyChunks = new();
+    private readonly Dictionary<ChunkCoordinate, int> _chunkMeshVersions = new();
+    private readonly Dictionary<ChunkCoordinate, long> _chunkMeshLastDirtyTimestamps = new();
+    private readonly Dictionary<ChunkCoordinate, int> _chunkMeshDirtyCounts = new();
+    private readonly Dictionary<ChunkCoordinate, ChunkMeshBuildJob> _chunkMeshBuildJobs = new();
     private readonly List<MeshBuffer> _visibleChunkMeshes = new();
     private readonly HashSet<ChunkCoordinate> _visibleChunkCoordinates = new();
     private readonly HashSet<ulong> _visiblePhysicsGridIds = new();
+    private ChunkCoordinate _meshResidencyCenter;
+    private bool _meshResidencyInitialized;
+    private int _meshResidencyLoadedChunkCount = -1;
     private readonly int _materialAtlasTexture;
     private readonly int _materialDetailTexture;
+    private BlockDefinition[] _blockDefinitions;
     private ProceduralMaterialAtlas _materialAtlas = null!;
     private int _width;
     private int _height;
@@ -96,12 +109,33 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     public int VisibleChunkCount => _visibleChunkMeshes.Count;
     public int CulledChunkCount => _chunkMeshes.Count - _visibleChunkMeshes.Count;
     public int VisiblePhysicsGridCount => _visiblePhysicsGridIds.Count;
+    public int ResidentChunkMeshCount => _chunkMeshes.Count;
+    public int EvictedChunkMeshCount { get; private set; }
     public int ShadowCasterChunkCount { get; private set; }
     public int DirectionalShadowDrawCount { get; private set; }
     public int DirectionalShadowMapUpdateCount { get; private set; }
     public int StaticShadowMapUpdateCount { get; private set; }
     public int DynamicShadowMapUpdateCount { get; private set; }
     public int PhysicsGridMeshUploadCount { get; private set; }
+    public int ChunkMeshBuildCount { get; private set; }
+    public int ChunkGpuUploadCount { get; private set; }
+    public long ChunkGpuUploadBytes { get; private set; }
+    public int PendingChunkMeshJobCount => _chunkMeshBuildJobs.Count;
+    public double ChunkMeshBuildTotalMilliseconds { get; private set; }
+    public double MaximumChunkMeshBuildMilliseconds { get; private set; }
+    public double ChunkGpuUploadTotalMilliseconds { get; private set; }
+    public double MaximumChunkGpuUploadMilliseconds { get; private set; }
+    public double DeferredShadowUpdateTotalMilliseconds { get; private set; }
+    public double MaximumDeferredShadowUpdateMilliseconds { get; private set; }
+    // CPU mesh lists are released after their versioned GPU upload; only pending
+    // background results retain CPU vertices.
+    public long ResidentCpuMeshBytes => _chunkMeshBuildJobs.Values
+        .Where(job => job.Build.IsCompletedSuccessfully)
+        .Sum(job => (long)job.Build.Result.Vertices.Count * sizeof(float));
+    public long ResidentGpuMeshBytes =>
+        _chunkMeshes.Values.Sum(mesh => (long)mesh.VertexCount * FloatsPerVertex * sizeof(float)) +
+        _physicsGridMeshes.Values.Sum(mesh =>
+            (long)mesh.Buffer.VertexCount * FloatsPerVertex * sizeof(float));
     public int PendingVisibleMeshRebuildCount =>
         _dirtyChunks.Count(_visibleChunkCoordinates.Contains);
     public float ViewCullingExpansion => CullingFrustumScale;
@@ -137,6 +171,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _classic = classic;
         _hybrid = hybrid;
         _deferred = deferred || hybrid;
+        _blockDefinitions = _blocks.CreateLookupSnapshot();
         string shaderRoot = Path.Combine(RuntimePaths.OutputRoot, "Shaders");
         _shader = new ShaderProgram(
             (ShaderType.VertexShader, File.ReadAllText(Path.Combine(shaderRoot, "voxel_raster.vert.glsl"))),
@@ -162,7 +197,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         foreach (ChunkCoordinate chunk in _world.SnapshotLoadedChunks())
         {
             _chunkMeshes.Add(chunk, CreateMeshBuffer());
-            _dirtyChunks.Add(chunk);
+            MarkChunkDirty(chunk);
             if (_deferred) _dirtyDeferredLightChunks.Add(chunk);
         }
         _materialAtlasTexture = GL.GenTexture();
@@ -198,6 +233,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         RenderQualitySettings quality,
         float exposure)
     {
+        UpdateChunkMeshResidency(cameraPosition);
         UpdateVisibleGeometry(cameraPosition, camera, timeOfDay);
         RebuildDirtyMeshes();
         SynchronizePhysicsGridMeshes();
@@ -564,7 +600,9 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         if ((_directionalShadowDirty || !_hasDirectionalShadowMap) &&
             (staticGeometryReady || !_hasDirectionalShadowMap))
         {
+            long shadowStart = Stopwatch.GetTimestamp();
             RenderShadowLayer(_directionalShadowBuffer, drawDynamic: false);
+            RecordShadowUpdate(ElapsedMilliseconds(shadowStart));
             _directionalShadowDirty = false;
             _hasDirectionalShadowMap = true;
             StaticShadowMapUpdateCount++;
@@ -572,7 +610,9 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
         if (_dynamicDirectionalShadowDirty || !_hasDynamicDirectionalShadowMap)
         {
+            long shadowStart = Stopwatch.GetTimestamp();
             RenderShadowLayer(_dynamicDirectionalShadowBuffer, drawDynamic: true);
+            RecordShadowUpdate(ElapsedMilliseconds(shadowStart));
             _dynamicDirectionalShadowDirty = false;
             _hasDynamicDirectionalShadowMap = true;
             DynamicShadowMapUpdateCount++;
@@ -731,6 +771,60 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
     }
 
+    private void UpdateChunkMeshResidency(Vector3 cameraPosition)
+    {
+        ChunkCoordinate center = ChunkCoordinate.FromVoxel(
+            (int)MathF.Floor(cameraPosition.X),
+            (int)MathF.Floor(cameraPosition.Z));
+        int loadedCount = _world.LoadedChunkCount;
+        if (_meshResidencyInitialized && center == _meshResidencyCenter &&
+            loadedCount == _meshResidencyLoadedChunkCount) return;
+
+        _meshResidencyInitialized = true;
+        _meshResidencyCenter = center;
+        _meshResidencyLoadedChunkCount = loadedCount;
+        HashSet<ChunkCoordinate> desired = _world.SnapshotLoadedChunks()
+            .Where(IsInsideMeshResidency)
+            .ToHashSet();
+
+        foreach (ChunkCoordinate stale in _chunkMeshes.Keys.Where(chunk => !desired.Contains(chunk)).ToArray())
+        {
+            _chunkMeshes[stale].Dispose();
+            _chunkMeshes.Remove(stale);
+            _dirtyChunks.Remove(stale);
+            _chunkMeshVersions.Remove(stale);
+            _chunkMeshLastDirtyTimestamps.Remove(stale);
+            _chunkMeshDirtyCounts.Remove(stale);
+            _chunkMeshBuildJobs.Remove(stale);
+            _deferredLightsByChunk.Remove(stale);
+            _dirtyDeferredLightChunks.Remove(stale);
+            EvictedChunkMeshCount++;
+        }
+        foreach (ChunkCoordinate chunk in desired)
+        {
+            if (_chunkMeshes.ContainsKey(chunk)) continue;
+            _chunkMeshes.Add(chunk, CreateMeshBuffer());
+            MarkChunkDirty(chunk);
+            if (_deferred) _dirtyDeferredLightChunks.Add(chunk);
+        }
+        if (_deferred) _deferredLightsDirty = true;
+    }
+
+    private bool IsInsideMeshResidency(ChunkCoordinate chunk) =>
+        Math.Max(
+            Math.Abs(chunk.X - _meshResidencyCenter.X),
+            Math.Abs(chunk.Z - _meshResidencyCenter.Z)) <= MeshResidencyRadiusChunks;
+
+    private bool IsMeshEditQuiet(ChunkCoordinate chunk)
+    {
+        if (!_chunkMeshLastDirtyTimestamps.TryGetValue(chunk, out long changedAt)) return true;
+        double quietMilliseconds = _chunkMeshDirtyCounts.TryGetValue(chunk, out int dirtyCount) && dirtyCount > 1
+            ? RepeatedMeshEditCoalesceMilliseconds
+            : MeshEditCoalesceMilliseconds;
+        return (Stopwatch.GetTimestamp() - changedAt) * 1000.0 / Stopwatch.Frequency >=
+               quietMilliseconds;
+    }
+
     private static bool IsSphereInView(
         Vector3 center,
         float radius,
@@ -786,65 +880,136 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
 
     private void RebuildDirtyMeshes()
     {
-        ChunkCoordinate[] dirtyChunks = _dirtyChunks
-            .Where(_chunkMeshes.ContainsKey)
-            .Where(chunk => _deferred || _visibleChunkCoordinates.Contains(chunk))
-            .OrderBy(chunk => _visibleChunkCoordinates.Contains(chunk) ? 0 : 1)
-            .Take(1)
-            .ToArray();
-        foreach (ChunkCoordinate chunk in dirtyChunks)
+        // CPU meshing never touches OpenGL and runs on one background job. Completed
+        // data is version-checked and uploaded under the shared per-frame profile.
+        int remainingUploads = FrameWorkBudget.Default.MaximumUploadsPerFrame;
+        foreach ((ChunkCoordinate chunk, ChunkMeshBuildJob job) in _chunkMeshBuildJobs
+                     .Where(pair => pair.Value.Build.IsCompleted)
+                     .OrderBy(pair => _visibleChunkCoordinates.Contains(pair.Key) ? 0 : 1)
+                     .ToArray())
         {
-            RebuildChunkMesh(chunk);
-            _dirtyChunks.Remove(chunk);
-        }
-    }
-
-    private void RebuildChunkMesh(ChunkCoordinate chunk)
-    {
-        var vertices = new List<float>(32_000);
-        VoxelChunkSnapshot chunkSnapshot = _world.SnapshotChunk(chunk);
-        foreach (StoredVoxel voxel in chunkSnapshot.Voxels)
-        {
-            AddRegularVoxel(
-                vertices,
-                chunk.MinimumX + voxel.LocalX,
-                voxel.Y,
-                chunk.MinimumZ + voxel.LocalZ,
-                voxel.MaterialId);
-        }
-
-        foreach (StoredMicroVoxel micro in chunkSnapshot.MicroVoxels)
-        {
-            int x = chunk.MinimumX + micro.LocalX;
-            int y = micro.Y;
-            int z = chunk.MinimumZ + micro.LocalZ;
-            MicroVoxelSnapshot snapshot = micro.Snapshot;
-            float inverse = 1f / snapshot.Resolution;
-            foreach (MicroVoxelBox box in snapshot.Boxes)
+            _chunkMeshBuildJobs.Remove(chunk);
+            ChunkMeshData data;
+            try
             {
-                AddBox(
-                    vertices,
-                    new Vector3(x + box.MinX * inverse, y + box.MinY * inverse, z + box.MinZ * inverse),
-                    new Vector3(x + box.MaxX * inverse, y + box.MaxY * inverse, z + box.MaxZ * inverse),
-                    box.MaterialId,
-                    face => true,
-                    x, y, z, 0);
+                data = job.Build.GetAwaiter().GetResult();
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine($"Chunk mesh build failed for {chunk}: {error.Message}");
+                continue;
+            }
+            using (data)
+            {
+                if (!_chunkMeshes.TryGetValue(chunk, out MeshBuffer? mesh) ||
+                    !_chunkMeshVersions.TryGetValue(chunk, out int currentVersion) ||
+                    currentVersion != job.Version)
+                    continue;
+
+                ChunkMeshBuildCount++;
+                ChunkMeshBuildTotalMilliseconds += data.BuildMilliseconds;
+                MaximumChunkMeshBuildMilliseconds = Math.Max(
+                    MaximumChunkMeshBuildMilliseconds, data.BuildMilliseconds);
+                long uploadStart = Stopwatch.GetTimestamp();
+                ApplyChunkMesh(mesh, data);
+                RecordGpuUpload(
+                    ElapsedMilliseconds(uploadStart),
+                    Math.Max(data.Vertices.Count, FloatsPerVertex) * sizeof(float));
+                _dirtyChunks.Remove(chunk);
+                _chunkMeshLastDirtyTimestamps.Remove(chunk);
+                _chunkMeshDirtyCounts.Remove(chunk);
+                _directionalShadowDirty = true;
+                if (--remainingUploads <= 0) break;
             }
         }
 
-        MeshBuffer mesh = _chunkMeshes[chunk];
-        int minimumY = chunkSnapshot.Voxels.Count == 0
-            ? int.MaxValue
-            : chunkSnapshot.Voxels.Min(voxel => voxel.Y);
-        int maximumY = chunkSnapshot.Voxels.Count == 0
-            ? int.MinValue
-            : chunkSnapshot.Voxels.Max(voxel => voxel.Y) + 1;
-        foreach (StoredMicroVoxel micro in chunkSnapshot.MicroVoxels)
+        if (_chunkMeshBuildJobs.Count != 0) return;
+        ChunkCoordinate? nextChunk = _dirtyChunks
+            .Where(_chunkMeshes.ContainsKey)
+            .Where(IsMeshEditQuiet)
+            .Where(chunk => _deferred || _visibleChunkCoordinates.Contains(chunk))
+            .OrderBy(chunk => _visibleChunkCoordinates.Contains(chunk) ? 0 : 1)
+            .Cast<ChunkCoordinate?>()
+            .FirstOrDefault();
+        if (!nextChunk.HasValue) return;
+
+        ChunkCoordinate coordinate = nextChunk.Value;
+        int version = _chunkMeshVersions[coordinate];
+        ChunkMeshingSnapshot snapshot = _world.CreateChunkMeshingSnapshot(coordinate);
+        BlockDefinition[] definitions = _blockDefinitions;
+        _chunkMeshBuildJobs[coordinate] = new ChunkMeshBuildJob(
+            version,
+            Task.Run(() => BuildChunkMesh(snapshot, definitions)));
+    }
+
+    private static ChunkMeshData BuildChunkMesh(
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        long buildStart = Stopwatch.GetTimestamp();
+        var vertices = new PooledFloatBuffer(32_000);
+        int minimumY = int.MaxValue;
+        int maximumY = int.MinValue;
+        ChunkCoordinate chunk = snapshot.Coordinate;
+        try
         {
-            if (micro.Snapshot.Boxes.Count == 0) continue;
-            minimumY = Math.Min(minimumY, micro.Y);
-            maximumY = Math.Max(maximumY, micro.Y + 1);
+            for (int z = chunk.MinimumZ; z < chunk.MinimumZ + ChunkCoordinate.Size; z++)
+            for (int y = snapshot.MinimumY; y < snapshot.MaximumYExclusive; y++)
+            for (int x = chunk.MinimumX; x < chunk.MinimumX + ChunkCoordinate.Size; x++)
+            {
+                ushort material = snapshot.GetBlock(x, y, z);
+                if (material == 0) continue;
+                BlockDefinition definition = definitions[material];
+                // Full opaque cubes and fluid tops are emitted by the greedy pass below.
+                // Transparent/special boundaries retain the exact per-cell path.
+                if (!IsGreedyOpaque(definition) && !definition.IsFluid)
+                    AddRegularVoxel(vertices, x, y, z, material, snapshot, definitions);
+                minimumY = Math.Min(minimumY, y);
+                maximumY = Math.Max(maximumY, y + 1);
+            }
+
+            AddGreedyChunkFaces(vertices, snapshot, definitions);
+
+            foreach (StoredMicroVoxel micro in snapshot.MicroVoxels)
+            {
+                int x = chunk.MinimumX + micro.LocalX;
+                int y = micro.Y;
+                int z = chunk.MinimumZ + micro.LocalZ;
+                MicroVoxelSnapshot microSnapshot = micro.Snapshot;
+                float inverse = 1f / microSnapshot.Resolution;
+                foreach (MicroVoxelBox box in microSnapshot.Boxes)
+                {
+                    AddBox(
+                        vertices,
+                        new Vector3(x + box.MinX * inverse, y + box.MinY * inverse, z + box.MinZ * inverse),
+                        new Vector3(x + box.MaxX * inverse, y + box.MaxY * inverse, z + box.MaxZ * inverse),
+                        box.MaterialId,
+                        0b0011_1111,
+                        x, y, z, 0,
+                        definitions);
+                }
+                if (micro.Snapshot.Boxes.Count == 0) continue;
+                minimumY = Math.Min(minimumY, micro.Y);
+                maximumY = Math.Max(maximumY, micro.Y + 1);
+            }
+
+            return new ChunkMeshData(
+                vertices,
+                minimumY,
+                maximumY,
+                ElapsedMilliseconds(buildStart));
         }
+        catch
+        {
+            vertices.Dispose();
+            throw;
+        }
+    }
+
+    private static void ApplyChunkMesh(MeshBuffer mesh, ChunkMeshData data)
+    {
+        int minimumY = data.MinimumY;
+        int maximumY = data.MaximumYExclusive;
         if (minimumY == int.MaxValue)
         {
             mesh.BoundsCenterY = 0f;
@@ -855,8 +1020,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             mesh.BoundsCenterY = (minimumY + maximumY) * 0.5f;
             mesh.BoundsHalfHeight = Math.Max(1f, (maximumY - minimumY) * 0.5f);
         }
-        UploadMesh(mesh, vertices, BufferUsageHint.StaticDraw);
-        _directionalShadowDirty = true;
+        UploadMesh(mesh, data.Vertices, BufferUsageHint.StaticDraw);
     }
 
     private void SynchronizePhysicsGridMeshes()
@@ -894,27 +1058,35 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private PhysicsGridMesh BuildPhysicsGridMesh(PhysicsGrid grid, int signature)
     {
         int estimatedFloats = Math.Clamp(grid.Elements.Count * 6 * FloatsPerVertex, 120, 2_000_000);
-        var vertices = new List<float>(estimatedFloats);
-        var includeFaces = new bool[6];
-        Func<int, bool> includeFace = face => includeFaces[face];
+        using var vertices = new PooledFloatBuffer(estimatedFloats);
+        BlockDefinition[] definitions = _blockDefinitions;
         foreach (PhysicsGridElement element in grid.Elements)
         {
             // Geometry stays in Grid-local coordinates. Movement and rotation are
             // supplied as a model matrix, so physics no longer rebuilds/uploads every
             // vertex on every simulation step.
-            for (int face = 0; face < includeFaces.Length; face++)
-                includeFaces[face] = ShouldRenderGridFace(grid, element, face);
-            AddBox(vertices, element.Minimum, element.Maximum, element.MaterialId, includeFace,
-                element.CellX, element.CellY, element.CellZ, (int)grid.Id);
+            byte faceMask = 0;
+            for (int face = 0; face < 6; face++)
+                if (ShouldRenderGridFace(grid, element, face, definitions)) faceMask |= (byte)(1 << face);
+            AddBox(vertices, element.Minimum, element.Maximum, element.MaterialId, faceMask,
+                element.CellX, element.CellY, element.CellZ, (int)grid.Id, definitions);
         }
         MeshBuffer buffer = CreateMeshBuffer();
+        long uploadStart = Stopwatch.GetTimestamp();
         UploadMesh(buffer, vertices, BufferUsageHint.StaticDraw);
+        RecordGpuUpload(
+            ElapsedMilliseconds(uploadStart),
+            Math.Max(vertices.Count, FloatsPerVertex) * sizeof(float));
         PhysicsGridMeshUploadCount++;
         Matrix4 model = CreatePhysicsGridModel(grid);
         return new PhysicsGridMesh(buffer, signature, model);
     }
 
-    private bool ShouldRenderGridFace(PhysicsGrid grid, PhysicsGridElement element, int face)
+    private static bool ShouldRenderGridFace(
+        PhysicsGrid grid,
+        PhysicsGridElement element,
+        int face,
+        IReadOnlyList<BlockDefinition> definitions)
     {
         Vector3 expectedMinimum = new(element.CellX, element.CellY, element.CellZ);
         if (Vector3.DistanceSquared(element.Minimum, expectedMinimum) > 0.000001f ||
@@ -935,8 +1107,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                 element.CellZ + offset.Z,
                 out ushort adjacentId)) return true;
         if (adjacentId == element.MaterialId) return false;
-        BlockDefinition current = _blocks.Get(element.MaterialId);
-        BlockDefinition adjacent = _blocks.Get(adjacentId);
+        BlockDefinition current = definitions[element.MaterialId];
+        BlockDefinition adjacent = definitions[adjacentId];
         return current.Transmission > 0f || current.IsTransparent || current.IsFluid ||
                adjacent.Transmission > 0f || adjacent.IsTransparent || adjacent.IsFluid;
     }
@@ -1031,11 +1203,18 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
     }
 
-    private static void UploadMesh(MeshBuffer mesh, List<float> vertices, BufferUsageHint usage)
+    private static unsafe void UploadMesh(MeshBuffer mesh, PooledFloatBuffer vertices, BufferUsageHint usage)
     {
-        float[] data = vertices.Count == 0 ? new float[FloatsPerVertex] : vertices.ToArray();
         GL.BindBuffer(BufferTarget.ArrayBuffer, mesh.VertexBuffer);
-        GL.BufferData(BufferTarget.ArrayBuffer, data.Length * sizeof(float), data, usage);
+        if (vertices.Count == 0)
+        {
+            GL.BufferData(BufferTarget.ArrayBuffer, FloatsPerVertex * sizeof(float), IntPtr.Zero, usage);
+        }
+        else
+        {
+            fixed (float* data = vertices.AsSpan())
+                GL.BufferData(BufferTarget.ArrayBuffer, vertices.Count * sizeof(float), (IntPtr)data, usage);
+        }
         GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
         mesh.VertexCount = vertices.Count / FloatsPerVertex;
     }
@@ -1047,89 +1226,326 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.DrawArrays(PrimitiveType.Triangles, 0, mesh.VertexCount);
     }
 
-    private void AddRegularVoxel(List<float> vertices, int x, int y, int z, ushort material)
+    public void ResetPerformanceCounters()
     {
-        bool fluid = _blocks.Get(material).IsFluid;
-        ushort above = _world.GetLoadedBlockId(x, y + 1, z);
-        bool fluidAbove = above != 0 && _blocks.Get(above).IsFluid;
+        ChunkMeshBuildCount = 0;
+        ChunkGpuUploadCount = 0;
+        ChunkGpuUploadBytes = 0;
+        ChunkMeshBuildTotalMilliseconds = 0;
+        MaximumChunkMeshBuildMilliseconds = 0;
+        ChunkGpuUploadTotalMilliseconds = 0;
+        MaximumChunkGpuUploadMilliseconds = 0;
+        DeferredShadowUpdateTotalMilliseconds = 0;
+        MaximumDeferredShadowUpdateMilliseconds = 0;
+        DirectionalShadowMapUpdateCount = 0;
+        StaticShadowMapUpdateCount = 0;
+        DynamicShadowMapUpdateCount = 0;
+        PhysicsGridMeshUploadCount = 0;
+    }
+
+    private void RecordGpuUpload(double milliseconds, long bytes)
+    {
+        ChunkGpuUploadCount++;
+        ChunkGpuUploadBytes += Math.Max(0, bytes);
+        ChunkGpuUploadTotalMilliseconds += milliseconds;
+        MaximumChunkGpuUploadMilliseconds = Math.Max(MaximumChunkGpuUploadMilliseconds, milliseconds);
+    }
+
+    private void RecordShadowUpdate(double milliseconds)
+    {
+        DeferredShadowUpdateTotalMilliseconds += milliseconds;
+        MaximumDeferredShadowUpdateMilliseconds = Math.Max(MaximumDeferredShadowUpdateMilliseconds, milliseconds);
+    }
+
+    private static double ElapsedMilliseconds(long started) =>
+        (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+
+    private static void AddRegularVoxel(
+        PooledFloatBuffer vertices,
+        int x,
+        int y,
+        int z,
+        ushort material,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        bool fluid = definitions[material].IsFluid;
+        ushort above = snapshot.GetBlock(x, y + 1, z);
+        bool fluidAbove = above != 0 && definitions[above].IsFluid;
         float maximumY = fluid && !fluidAbove
             ? y + VoxelWorld.FluidSurfaceHeight
             : y + 1f;
-        AddBox(
-            vertices,
-            new Vector3(x, y, z),
-            new Vector3(x + 1f, maximumY, z + 1f),
-            material,
-            face => face switch
-            {
-                // A fluid volume is represented by one continuous, double-sided top
-                // surface. Per-block side/bottom faces caused visible four-sided cubes
-                // through alpha blending at oblique camera angles.
-                0 => !fluidAbove && ShouldRenderFace(x, y + 1, z, material),
-                _ when fluid => false,
-                1 => ShouldRenderFace(x - 1, y, z, material),
-                2 => ShouldRenderFace(x + 1, y, z, material),
-                3 => ShouldRenderFace(x, y, z - 1, material),
-                4 => ShouldRenderFace(x, y, z + 1, material),
-                _ => ShouldRenderFace(x, y - 1, z, material),
-            },
-            x, y, z, 0);
+        byte faceMask = 0;
+        // A fluid volume is represented by one continuous, double-sided top surface.
+        // Per-block side/bottom faces would expose every transparent fluid cell.
+        if (!fluidAbove && ShouldRenderFace(x, y + 1, z, material, snapshot, definitions)) faceMask |= 1 << 0;
+        if (!fluid)
+        {
+            if (ShouldRenderFace(x - 1, y, z, material, snapshot, definitions)) faceMask |= 1 << 1;
+            if (ShouldRenderFace(x + 1, y, z, material, snapshot, definitions)) faceMask |= 1 << 2;
+            if (ShouldRenderFace(x, y, z - 1, material, snapshot, definitions)) faceMask |= 1 << 3;
+            if (ShouldRenderFace(x, y, z + 1, material, snapshot, definitions)) faceMask |= 1 << 4;
+            if (ShouldRenderFace(x, y - 1, z, material, snapshot, definitions)) faceMask |= 1 << 5;
+        }
+        AddBox(vertices, new Vector3(x, y, z), new Vector3(x + 1f, maximumY, z + 1f),
+            material, faceMask, x, y, z, 0, definitions);
     }
 
-    private bool ShouldRenderFace(int x, int y, int z, ushort currentMaterial)
+    private static bool IsGreedyOpaque(BlockDefinition definition) =>
+        !definition.IsFluid && !definition.IsTransparent && definition.Transmission <= 0f;
+
+    private static void AddGreedyChunkFaces(
+        PooledFloatBuffer vertices,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
     {
-        if (!_world.IsInside(x, y, z)) return true;
-        ushort neighbor = _world.GetLoadedBlockId(x, y, z);
+        int height = snapshot.MaximumYExclusive - snapshot.MinimumY;
+        if (height <= 0) return;
+        ChunkCoordinate chunk = snapshot.Coordinate;
+        int planarArea = ChunkCoordinate.Size * ChunkCoordinate.Size;
+        ushort[] mask = ArrayPool<ushort>.Shared.Rent(Math.Max(planarArea, ChunkCoordinate.Size * height));
+        try
+        {
+
+        // Horizontal opaque faces and continuous fluid top planes.
+        for (int y = snapshot.MinimumY; y < snapshot.MaximumYExclusive; y++)
+        {
+            Array.Clear(mask, 0, planarArea);
+            for (int localZ = 0; localZ < ChunkCoordinate.Size; localZ++)
+            for (int localX = 0; localX < ChunkCoordinate.Size; localX++)
+            {
+                int x = chunk.MinimumX + localX;
+                int z = chunk.MinimumZ + localZ;
+                ushort material = snapshot.GetBlock(x, y, z);
+                if (material != 0 && IsGreedyOpaque(definitions[material]) &&
+                    ShouldRenderFace(x, y + 1, z, material, snapshot, definitions))
+                    mask[localX + ChunkCoordinate.Size * localZ] = material;
+            }
+            EmitGreedyMask(vertices, mask, ChunkCoordinate.Size, ChunkCoordinate.Size,
+                face: 0, slice: y, chunk, snapshot.MinimumY, definitions, topHeight: 1f);
+
+            Array.Clear(mask, 0, planarArea);
+            for (int localZ = 0; localZ < ChunkCoordinate.Size; localZ++)
+            for (int localX = 0; localX < ChunkCoordinate.Size; localX++)
+            {
+                int x = chunk.MinimumX + localX;
+                int z = chunk.MinimumZ + localZ;
+                ushort material = snapshot.GetBlock(x, y, z);
+                if (material != 0 && IsGreedyOpaque(definitions[material]) &&
+                    ShouldRenderFace(x, y - 1, z, material, snapshot, definitions))
+                    mask[localX + ChunkCoordinate.Size * localZ] = material;
+            }
+            EmitGreedyMask(vertices, mask, ChunkCoordinate.Size, ChunkCoordinate.Size,
+                face: 5, slice: y, chunk, snapshot.MinimumY, definitions, topHeight: 1f);
+
+            Array.Clear(mask, 0, planarArea);
+            for (int localZ = 0; localZ < ChunkCoordinate.Size; localZ++)
+            for (int localX = 0; localX < ChunkCoordinate.Size; localX++)
+            {
+                int x = chunk.MinimumX + localX;
+                int z = chunk.MinimumZ + localZ;
+                ushort material = snapshot.GetBlock(x, y, z);
+                if (material == 0 || !definitions[material].IsFluid) continue;
+                ushort above = snapshot.GetBlock(x, y + 1, z);
+                bool fluidAbove = above != 0 && definitions[above].IsFluid;
+                if (!fluidAbove && ShouldRenderFace(x, y + 1, z, material, snapshot, definitions))
+                    mask[localX + ChunkCoordinate.Size * localZ] = material;
+            }
+            EmitGreedyMask(vertices, mask, ChunkCoordinate.Size, ChunkCoordinate.Size,
+                face: 0, slice: y, chunk, snapshot.MinimumY, definitions,
+                topHeight: VoxelWorld.FluidSurfaceHeight);
+        }
+
+        // X-facing opaque walls. U is Z and V is Y.
+        for (int localX = 0; localX < ChunkCoordinate.Size; localX++)
+        for (int face = 1; face <= 2; face++)
+        {
+            int x = chunk.MinimumX + localX;
+            Array.Clear(mask, 0, ChunkCoordinate.Size * height);
+            for (int localY = 0; localY < height; localY++)
+            for (int localZ = 0; localZ < ChunkCoordinate.Size; localZ++)
+            {
+                int y = snapshot.MinimumY + localY;
+                int z = chunk.MinimumZ + localZ;
+                ushort material = snapshot.GetBlock(x, y, z);
+                int neighborX = face == 1 ? x - 1 : x + 1;
+                if (material != 0 && IsGreedyOpaque(definitions[material]) &&
+                    ShouldRenderFace(neighborX, y, z, material, snapshot, definitions))
+                    mask[localZ + ChunkCoordinate.Size * localY] = material;
+            }
+            EmitGreedyMask(vertices, mask, ChunkCoordinate.Size, height,
+                face, localX, chunk, snapshot.MinimumY, definitions, topHeight: 1f);
+        }
+
+        // Z-facing opaque walls. U is X and V is Y.
+        for (int localZ = 0; localZ < ChunkCoordinate.Size; localZ++)
+        for (int face = 3; face <= 4; face++)
+        {
+            int z = chunk.MinimumZ + localZ;
+            Array.Clear(mask, 0, ChunkCoordinate.Size * height);
+            for (int localY = 0; localY < height; localY++)
+            for (int localX = 0; localX < ChunkCoordinate.Size; localX++)
+            {
+                int x = chunk.MinimumX + localX;
+                int y = snapshot.MinimumY + localY;
+                ushort material = snapshot.GetBlock(x, y, z);
+                int neighborZ = face == 3 ? z - 1 : z + 1;
+                if (material != 0 && IsGreedyOpaque(definitions[material]) &&
+                    ShouldRenderFace(x, y, neighborZ, material, snapshot, definitions))
+                    mask[localX + ChunkCoordinate.Size * localY] = material;
+            }
+            EmitGreedyMask(vertices, mask, ChunkCoordinate.Size, height,
+                face, localZ, chunk, snapshot.MinimumY, definitions, topHeight: 1f);
+        }
+        }
+        finally
+        {
+            ArrayPool<ushort>.Shared.Return(mask);
+        }
+    }
+
+    private static void EmitGreedyMask(
+        PooledFloatBuffer vertices,
+        ushort[] mask,
+        int width,
+        int height,
+        int face,
+        int slice,
+        ChunkCoordinate chunk,
+        int minimumY,
+        IReadOnlyList<BlockDefinition> definitions,
+        float topHeight)
+    {
+        for (int v = 0; v < height; v++)
+        for (int u = 0; u < width; u++)
+        {
+            int index = u + width * v;
+            ushort material = mask[index];
+            if (material == 0) continue;
+            int runWidth = 1;
+            while (u + runWidth < width && mask[index + runWidth] == material) runWidth++;
+            int runHeight = 1;
+            bool canGrow = true;
+            while (v + runHeight < height && canGrow)
+            {
+                int row = index + runHeight * width;
+                for (int x = 0; x < runWidth; x++)
+                    if (mask[row + x] != material) { canGrow = false; break; }
+                if (canGrow) runHeight++;
+            }
+            for (int clearV = 0; clearV < runHeight; clearV++)
+                Array.Clear(mask, index + clearV * width, runWidth);
+
+            Vector3 minimum;
+            Vector3 maximum;
+            if (face is 0 or 5)
+            {
+                minimum = new Vector3(chunk.MinimumX + u, slice, chunk.MinimumZ + v);
+                maximum = new Vector3(
+                    chunk.MinimumX + u + runWidth,
+                    slice + topHeight,
+                    chunk.MinimumZ + v + runHeight);
+            }
+            else if (face is 1 or 2)
+            {
+                minimum = new Vector3(
+                    chunk.MinimumX + slice,
+                    minimumY + v,
+                    chunk.MinimumZ + u);
+                maximum = new Vector3(
+                    chunk.MinimumX + slice + 1,
+                    minimumY + v + runHeight,
+                    chunk.MinimumZ + u + runWidth);
+            }
+            else
+            {
+                minimum = new Vector3(
+                    chunk.MinimumX + u,
+                    minimumY + v,
+                    chunk.MinimumZ + slice);
+                maximum = new Vector3(
+                    chunk.MinimumX + u + runWidth,
+                    minimumY + v + runHeight,
+                    chunk.MinimumZ + slice + 1);
+            }
+            AddBox(vertices, minimum, maximum, material, (byte)(1 << face),
+                (int)minimum.X, (int)minimum.Y, (int)minimum.Z, 0, definitions,
+                tileUv: true);
+        }
+    }
+
+    private static bool ShouldRenderFace(
+        int x,
+        int y,
+        int z,
+        ushort currentMaterial,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        if (y < VoxelWorld.MinimumY || y >= VoxelWorld.MaximumY) return true;
+        ushort neighbor = snapshot.GetBlock(x, y, z);
         if (neighbor == 0) return true;
         if (neighbor == currentMaterial) return false;
-        BlockDefinition current = _blocks.Get(currentMaterial);
-        BlockDefinition adjacent = _blocks.Get(neighbor);
+        BlockDefinition current = definitions[currentMaterial];
+        BlockDefinition adjacent = definitions[neighbor];
         if (current.IsFluid && adjacent.IsFluid) return false;
         return current.Transmission > 0f || current.IsFluid || adjacent.Transmission > 0f || adjacent.IsFluid;
     }
 
-    private void AddBox(
-        List<float> vertices,
+    private static void AddBox(
+        PooledFloatBuffer vertices,
         Vector3 minimum,
         Vector3 maximum,
         ushort materialId,
-        Func<int, bool> includeFace,
+        byte faceMask,
         int cellX,
         int cellY,
         int cellZ,
         int gridId,
-        PhysicsGrid? grid = null)
+        IReadOnlyList<BlockDefinition> definitions,
+        PhysicsGrid? grid = null,
+        bool tileUv = false)
     {
         // Face order is top, -X, +X, -Z, +Z, bottom. Atlas face is top/side/bottom.
-        Vector3[][] faces =
+        BlockDefinition definition = definitions[materialId];
+        for (int face = 0; face < 6; face++)
         {
-            new[] { new Vector3(minimum.X, maximum.Y, minimum.Z), new Vector3(maximum.X, maximum.Y, minimum.Z), new Vector3(maximum.X, maximum.Y, maximum.Z), new Vector3(minimum.X, maximum.Y, maximum.Z) },
-            new[] { new Vector3(minimum.X, minimum.Y, maximum.Z), new Vector3(minimum.X, minimum.Y, minimum.Z), new Vector3(minimum.X, maximum.Y, minimum.Z), new Vector3(minimum.X, maximum.Y, maximum.Z) },
-            new[] { new Vector3(maximum.X, minimum.Y, minimum.Z), new Vector3(maximum.X, minimum.Y, maximum.Z), new Vector3(maximum.X, maximum.Y, maximum.Z), new Vector3(maximum.X, maximum.Y, minimum.Z) },
-            new[] { new Vector3(minimum.X, minimum.Y, minimum.Z), new Vector3(maximum.X, minimum.Y, minimum.Z), new Vector3(maximum.X, maximum.Y, minimum.Z), new Vector3(minimum.X, maximum.Y, minimum.Z) },
-            new[] { new Vector3(maximum.X, minimum.Y, maximum.Z), new Vector3(minimum.X, minimum.Y, maximum.Z), new Vector3(minimum.X, maximum.Y, maximum.Z), new Vector3(maximum.X, maximum.Y, maximum.Z) },
-            new[] { new Vector3(minimum.X, minimum.Y, maximum.Z), new Vector3(maximum.X, minimum.Y, maximum.Z), new Vector3(maximum.X, minimum.Y, minimum.Z), new Vector3(minimum.X, minimum.Y, minimum.Z) },
-        };
-        Vector3[] normals = { Vector3.UnitY, -Vector3.UnitX, Vector3.UnitX, -Vector3.UnitZ, Vector3.UnitZ, -Vector3.UnitY };
-        Vector2[] uvs = { new(0f, 0f), new(1f, 0f), new(1f, 1f), new(0f, 1f) };
-        int[] triangles = { 0, 1, 2, 0, 2, 3 };
-        BlockDefinition definition = _blocks.Get(materialId);
-        for (int face = 0; face < faces.Length; face++)
-        {
-            if (!includeFace(face)) continue;
+            if ((faceMask & (1 << face)) == 0) continue;
             int atlasFace = face == 0 ? 0 : face == 5 ? 2 : 1;
-            foreach (int corner in triangles)
+            Vector3 normal = face switch
             {
-                Vector3 position = faces[face][corner];
-                Vector3 normal = normals[face];
+                0 => Vector3.UnitY,
+                1 => -Vector3.UnitX,
+                2 => Vector3.UnitX,
+                3 => -Vector3.UnitZ,
+                4 => Vector3.UnitZ,
+                _ => -Vector3.UnitY,
+            };
+            for (int vertex = 0; vertex < 6; vertex++)
+            {
+                int corner = vertex switch { 0 => 0, 1 => 1, 2 => 2, 3 => 0, 4 => 2, _ => 3 };
+                Vector3 position = BoxFaceCorner(minimum, maximum, face, corner);
+                Vector3 transformedNormal = normal;
                 if (grid is not null)
                 {
                     position = grid.LocalToWorld(position);
-                    normal = Vector3.Normalize(grid.LocalDirectionToWorld(normal));
+                    transformedNormal = Vector3.Normalize(grid.LocalDirectionToWorld(normal));
                 }
-                Vector2 uv = uvs[corner];
+                Vector2 uvScale = !tileUv ? Vector2.One : face switch
+                {
+                    0 or 5 => new Vector2(maximum.X - minimum.X, maximum.Z - minimum.Z),
+                    1 or 2 => new Vector2(maximum.Z - minimum.Z, maximum.Y - minimum.Y),
+                    _ => new Vector2(maximum.X - minimum.X, maximum.Y - minimum.Y),
+                };
+                Vector2 uv = corner switch
+                {
+                    0 => Vector2.Zero,
+                    1 => new Vector2(uvScale.X, 0f),
+                    2 => uvScale,
+                    _ => new Vector2(0f, uvScale.Y),
+                };
                 vertices.Add(position.X); vertices.Add(position.Y); vertices.Add(position.Z);
-                vertices.Add(normal.X); vertices.Add(normal.Y); vertices.Add(normal.Z);
+                vertices.Add(transformedNormal.X); vertices.Add(transformedNormal.Y); vertices.Add(transformedNormal.Z);
                 vertices.Add(uv.X); vertices.Add(uv.Y);
                 vertices.Add(materialId); vertices.Add(atlasFace); vertices.Add(definition.Roughness); vertices.Add(definition.Metallic);
                 // A negative packed transmission preserves the existing vertex layout
@@ -1144,6 +1560,35 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             }
         }
     }
+
+    private static Vector3 BoxFaceCorner(Vector3 minimum, Vector3 maximum, int face, int corner) =>
+        (face, corner) switch
+        {
+            (0, 0) => new(minimum.X, maximum.Y, minimum.Z),
+            (0, 1) => new(maximum.X, maximum.Y, minimum.Z),
+            (0, 2) => new(maximum.X, maximum.Y, maximum.Z),
+            (0, _) => new(minimum.X, maximum.Y, maximum.Z),
+            (1, 0) => new(minimum.X, minimum.Y, maximum.Z),
+            (1, 1) => new(minimum.X, minimum.Y, minimum.Z),
+            (1, 2) => new(minimum.X, maximum.Y, minimum.Z),
+            (1, _) => new(minimum.X, maximum.Y, maximum.Z),
+            (2, 0) => new(maximum.X, minimum.Y, minimum.Z),
+            (2, 1) => new(maximum.X, minimum.Y, maximum.Z),
+            (2, 2) => new(maximum.X, maximum.Y, maximum.Z),
+            (2, _) => new(maximum.X, maximum.Y, minimum.Z),
+            (3, 0) => new(minimum.X, minimum.Y, minimum.Z),
+            (3, 1) => new(maximum.X, minimum.Y, minimum.Z),
+            (3, 2) => new(maximum.X, maximum.Y, minimum.Z),
+            (3, _) => new(minimum.X, maximum.Y, minimum.Z),
+            (4, 0) => new(maximum.X, minimum.Y, maximum.Z),
+            (4, 1) => new(minimum.X, minimum.Y, maximum.Z),
+            (4, 2) => new(minimum.X, maximum.Y, maximum.Z),
+            (4, _) => new(maximum.X, maximum.Y, maximum.Z),
+            (5, 0) => new(minimum.X, minimum.Y, maximum.Z),
+            (5, 1) => new(maximum.X, minimum.Y, maximum.Z),
+            (5, 2) => new(maximum.X, minimum.Y, minimum.Z),
+            _ => new(minimum.X, minimum.Y, minimum.Z),
+        };
 
     private void UploadMaterialAtlas()
     {
@@ -1262,16 +1707,55 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         return new MeshBuffer(vertexArray, vertexBuffer);
     }
 
+    private void MarkChunkDirty(ChunkCoordinate chunk)
+    {
+        bool alreadyDirty = !_dirtyChunks.Add(chunk);
+        _chunkMeshLastDirtyTimestamps[chunk] = Stopwatch.GetTimestamp();
+        _chunkMeshDirtyCounts[chunk] = alreadyDirty && _chunkMeshDirtyCounts.TryGetValue(chunk, out int dirtyCount)
+            ? dirtyCount + 1
+            : 1;
+        _chunkMeshVersions[chunk] = _chunkMeshVersions.TryGetValue(chunk, out int version)
+            ? unchecked(version + 1)
+            : 1;
+    }
+
     private void OnVoxelChanged(VoxelChangedEvent change)
     {
         bool lightChanged = IsEmissive(change.OldBlockId) || IsEmissive(change.NewBlockId);
         if (_deferred && lightChanged)
         {
-            _dirtyDeferredLightChunks.Add(ChunkCoordinate.FromVoxel(change.X, change.Z));
-            _deferredLightsDirty = true;
+            ChunkCoordinate lightChunk = ChunkCoordinate.FromVoxel(change.X, change.Z);
+            if (_chunkMeshes.ContainsKey(lightChunk))
+            {
+                _dirtyDeferredLightChunks.Add(lightChunk);
+                _deferredLightsDirty = true;
+            }
         }
+        if (!lightChanged && IsCompletelyOccludedOpaqueReplacement(change)) return;
         foreach (ChunkCoordinate chunk in ChunkCoordinate.MeshDependenciesForVoxel(change.X, change.Z))
-            _dirtyChunks.Add(chunk);
+            if (_chunkMeshes.ContainsKey(chunk)) MarkChunkDirty(chunk);
+    }
+
+    private bool IsCompletelyOccludedOpaqueReplacement(VoxelChangedEvent change)
+    {
+        if (change.OldBlockId == 0 || change.NewBlockId == 0 ||
+            !IsGreedyOpaque(_blocks.Get(change.OldBlockId)) ||
+            !IsGreedyOpaque(_blocks.Get(change.NewBlockId))) return false;
+
+        ReadOnlySpan<(int X, int Y, int Z)> neighbors = stackalloc (int, int, int)[]
+        {
+            (1, 0, 0), (-1, 0, 0), (0, 1, 0),
+            (0, -1, 0), (0, 0, 1), (0, 0, -1),
+        };
+        foreach ((int offsetX, int offsetY, int offsetZ) in neighbors)
+        {
+            ushort neighbor = _world.GetLoadedBlockId(
+                change.X + offsetX,
+                change.Y + offsetY,
+                change.Z + offsetZ);
+            if (neighbor == 0 || !IsGreedyOpaque(_blocks.Get(neighbor))) return false;
+        }
+        return true;
     }
 
     private bool IsEmissive(ushort materialId) =>
@@ -1295,45 +1779,57 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
 
     private void OnChunkGenerated(ChunkCoordinate chunk)
     {
+        // ChunkGenerated already tells us exactly which entry changed.  Keeping the
+        // observed count current avoids rebuilding a HashSet of every loaded chunk
+        // once per streamed chunk; a camera-cell change still performs a complete
+        // residency reconciliation below.
+        _meshResidencyLoadedChunkCount = _world.LoadedChunkCount;
+        if (_meshResidencyInitialized && !IsInsideMeshResidency(chunk)) return;
         if (!_chunkMeshes.ContainsKey(chunk)) _chunkMeshes.Add(chunk, CreateMeshBuffer());
-        _dirtyChunks.Add(chunk);
+        MarkChunkDirty(chunk);
         foreach (ChunkCoordinate neighbor in new[]
                  {
                      chunk with { X = chunk.X - 1 }, chunk with { X = chunk.X + 1 },
                      chunk with { Z = chunk.Z - 1 }, chunk with { Z = chunk.Z + 1 },
                  })
-            if (_chunkMeshes.ContainsKey(neighbor)) _dirtyChunks.Add(neighbor);
+            if (_chunkMeshes.ContainsKey(neighbor)) MarkChunkDirty(neighbor);
         _deferredLightsDirty = true;
         if (_deferred) _dirtyDeferredLightChunks.Add(chunk);
     }
 
     private void ReconcileLoadedChunkMeshes()
     {
-        HashSet<ChunkCoordinate> loaded = _world.SnapshotLoadedChunks().ToHashSet();
+        HashSet<ChunkCoordinate> loaded = _world.SnapshotLoadedChunks()
+            .Where(chunk => !_meshResidencyInitialized || IsInsideMeshResidency(chunk))
+            .ToHashSet();
         foreach (ChunkCoordinate stale in _chunkMeshes.Keys.Where(chunk => !loaded.Contains(chunk)).ToArray())
         {
             _chunkMeshes[stale].Dispose();
             _chunkMeshes.Remove(stale);
             _dirtyChunks.Remove(stale);
+            _chunkMeshVersions.Remove(stale);
+            _chunkMeshLastDirtyTimestamps.Remove(stale);
+            _chunkMeshDirtyCounts.Remove(stale);
+            _chunkMeshBuildJobs.Remove(stale);
             _deferredLightsByChunk.Remove(stale);
             _dirtyDeferredLightChunks.Remove(stale);
         }
         foreach (ChunkCoordinate chunk in loaded)
         {
             if (!_chunkMeshes.ContainsKey(chunk)) _chunkMeshes.Add(chunk, CreateMeshBuffer());
-            _dirtyChunks.Add(chunk);
+            MarkChunkDirty(chunk);
         }
     }
 
     private void OnMicroVoxelCellChanged(int x, int y, int z)
     {
         foreach (ChunkCoordinate chunk in ChunkCoordinate.MeshDependenciesForVoxel(x, z))
-            _dirtyChunks.Add(chunk);
+            if (_chunkMeshes.ContainsKey(chunk)) MarkChunkDirty(chunk);
     }
 
     private void OnMicroVoxelsReloaded()
     {
-        foreach (ChunkCoordinate chunk in _chunkMeshes.Keys) _dirtyChunks.Add(chunk);
+        foreach (ChunkCoordinate chunk in _chunkMeshes.Keys) MarkChunkDirty(chunk);
     }
 
     private void OnPhysicsGridsChanged()
@@ -1345,6 +1841,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
 
     private void OnDefinitionsChanged()
     {
+        _blockDefinitions = _blocks.CreateLookupSnapshot();
         UploadMaterialAtlas();
         OnWorldReloaded();
     }
@@ -1388,6 +1885,50 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private readonly record struct LocalDeferredLight(
         Vector3 LocalPosition, Vector3 Color, float Intensity, float Radius);
     private sealed record CachedGridLights(int TopologyVersion, LocalDeferredLight[] Lights);
+    private sealed record ChunkMeshData(
+        PooledFloatBuffer Vertices,
+        int MinimumY,
+        int MaximumYExclusive,
+        double BuildMilliseconds) : IDisposable
+    {
+        public void Dispose() => Vertices.Dispose();
+    }
+    private sealed record ChunkMeshBuildJob(int Version, Task<ChunkMeshData> Build);
+
+    private sealed class PooledFloatBuffer : IDisposable
+    {
+        private float[]? _buffer;
+
+        public int Count { get; private set; }
+
+        public PooledFloatBuffer(int initialCapacity)
+        {
+            _buffer = ArrayPool<float>.Shared.Rent(Math.Max(1, initialCapacity));
+        }
+
+        public void Add(float value)
+        {
+            float[] buffer = _buffer ?? throw new ObjectDisposedException(nameof(PooledFloatBuffer));
+            if (Count == buffer.Length)
+            {
+                float[] expanded = ArrayPool<float>.Shared.Rent(checked(buffer.Length * 2));
+                buffer.AsSpan(0, Count).CopyTo(expanded);
+                ArrayPool<float>.Shared.Return(buffer);
+                _buffer = buffer = expanded;
+            }
+            buffer[Count++] = value;
+        }
+
+        public Span<float> AsSpan() =>
+            (_buffer ?? throw new ObjectDisposedException(nameof(PooledFloatBuffer))).AsSpan(0, Count);
+
+        public void Dispose()
+        {
+            float[]? buffer = Interlocked.Exchange(ref _buffer, null);
+            if (buffer is not null) ArrayPool<float>.Shared.Return(buffer);
+            Count = 0;
+        }
+    }
 
     private sealed class PhysicsGridMesh : IDisposable
     {

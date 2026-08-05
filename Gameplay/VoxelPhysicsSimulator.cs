@@ -26,6 +26,7 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     private float _analysisAccumulator;
     private Vector3? _lastRemovedSupportCenter;
     private BepuPhysicsBackend? _rigidBodyBackend;
+    private Vector3 _simulationFocus;
 
     public int ChangesLastStep { get; private set; }
     public int SimulationSubstepsLastStep { get; private set; }
@@ -34,6 +35,18 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     public string Status { get; private set; } = "Grid physics ready";
     public string ModeName => "StructuralGrid";
     public string BackendName => _rigidBodyBackend?.Name ?? "BEPUphysics 2";
+    public int PendingColliderBuildCount => _rigidBodyBackend?.PendingColliderBuildCount ?? 0;
+    public int PendingStructuralEvaluationCount => _dirty.Count;
+    public int ColliderBuildCount => _rigidBodyBackend?.ColliderBuildCount ?? 0;
+    public double ColliderBuildTotalMilliseconds => _rigidBodyBackend?.ColliderBuildTotalMilliseconds ?? 0;
+    public double MaximumColliderBuildMilliseconds => _rigidBodyBackend?.MaximumColliderBuildMilliseconds ?? 0;
+    public double MaximumDynamicReconcileMilliseconds =>
+        _rigidBodyBackend?.MaximumDynamicReconcileMilliseconds ?? 0;
+    public double MaximumSimulationMilliseconds => _rigidBodyBackend?.MaximumSimulationMilliseconds ?? 0;
+    public double MaximumSingleSimulationStepMilliseconds =>
+        _rigidBodyBackend?.MaximumSingleSimulationStepMilliseconds ?? 0;
+    public double MaximumStaticResidencyMilliseconds =>
+        _rigidBodyBackend?.MaximumStaticResidencyMilliseconds ?? 0;
 
     public VoxelPhysicsSimulator(VoxelWorld world, BlockRegistry blocks)
     {
@@ -80,7 +93,8 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
 
         if (_world.PhysicsGrids.Count > 0 || _rigidBodyBackend is not null)
         {
-            _rigidBodyBackend ??= new BepuPhysicsBackend(_world);
+            _rigidBodyBackend ??= new BepuPhysicsBackend(_world, _simulationFocus);
+            _rigidBodyBackend.SetSimulationFocus(_simulationFocus);
             _rigidBodyBackend.Step(deltaSeconds);
             SimulationSubstepsLastStep = _rigidBodyBackend.CollisionStepsLastFrame;
             Status = $"BEPUphysics 2: {_rigidBodyBackend.DynamicBodyCount} bodies, " +
@@ -99,6 +113,14 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         AnalyzeDirtyComponents(int.MaxValue);
         return ChangesLastStep;
     }
+
+    public void SetSimulationFocus(Vector3 position)
+    {
+        _simulationFocus = position;
+        _rigidBodyBackend?.SetSimulationFocus(position);
+    }
+
+    public void ResetPerformanceCounters() => _rigidBodyBackend?.ResetPerformanceCounters();
 
     public bool TryRemoveGridCell(ulong gridId, int localX, int localY, int localZ)
     {
@@ -232,11 +254,42 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     private void OnVoxelChanged(VoxelChangedEvent change)
     {
         if (_suppressWorldEvents) return;
-        if (IsStructural(change.OldBlockId) && !IsStructural(change.NewBlockId))
-            _lastRemovedSupportCenter = new Vector3(change.X + 0.5f, change.Y + 0.5f, change.Z + 0.5f);
-        Enqueue(change.X, change.Y, change.Z);
-        foreach (VoxelPoint offset in FaceNeighbors)
-            Enqueue(change.X + offset.X, change.Y + offset.Y, change.Z + offset.Z);
+        bool oldStructural = IsStructural(change.OldBlockId);
+        bool newStructural = IsStructural(change.NewBlockId);
+
+        // Replacing one full structural voxel with another does not alter support
+        // topology.  Enqueuing it used to launch a terrain-wide connectivity flood
+        // for ordinary material painting, despite the occupied shape being identical.
+        if (oldStructural && newStructural) return;
+        if (!oldStructural && !newStructural) return;
+        if (!oldStructural)
+        {
+            // A newly placed cell with direct support cannot detach anything that
+            // already existed. Standalone/cantilever placement still enters the
+            // structural queue and can become a Physics Grid.
+            if (IsStructuralAt(change.X, change.Y - 1, change.Z)) return;
+            Enqueue(change.X, change.Y, change.Z);
+            return;
+        }
+
+        _lastRemovedSupportCenter = new Vector3(change.X + 0.5f, change.Y + 0.5f, change.Z + 0.5f);
+        // Only cells above or beside a removed support can depend on it. A candidate
+        // with its own direct support below is already stable and must not launch a
+        // terrain-wide connectivity flood after an ordinary surface block break.
+        ReadOnlySpan<VoxelPoint> candidates = stackalloc VoxelPoint[]
+        {
+            new(change.X, change.Y + 1, change.Z),
+            new(change.X + 1, change.Y, change.Z),
+            new(change.X - 1, change.Y, change.Z),
+            new(change.X, change.Y, change.Z + 1),
+            new(change.X, change.Y, change.Z - 1),
+        };
+        foreach (VoxelPoint candidate in candidates)
+        {
+            if (IsStructuralAt(candidate.X, candidate.Y, candidate.Z) &&
+                !IsStructuralAt(candidate.X, candidate.Y - 1, candidate.Z))
+                Enqueue(candidate.X, candidate.Y, candidate.Z);
+        }
     }
 
     private void OnMicroVoxelCellChanged(int x, int y, int z)
@@ -267,8 +320,8 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         while (seeds < maximumSeeds && _dirty.TryDequeue(out VoxelPoint seed))
         {
             _queued.Remove(seed);
-            seeds++;
             if (!IsStructuralAt(seed.X, seed.Y, seed.Z) || analyzed.Contains(seed)) continue;
+            seeds++;
             List<VoxelPoint> component = FloodComponent(seed, analyzed, out bool anchored);
             if (!anchored && component.Count > 0) ExtractComponent(component);
         }

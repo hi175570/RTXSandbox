@@ -1,5 +1,89 @@
 # RTX Sandbox Roadmap
 
+## Hardware DXR emissive visibility（2026-08-06）
+
+| Item | Status | Evidence |
+|---|---|---|
+| Emissive blocks leaking through opaque walls | **Completed** | Each contributing Hardware DXR emissive light now traces a visibility ray to the emitter. Opaque geometry rejects the contribution; transparent surfaces remain transmissive. |
+| Raster/Deferred emissive shadowing | **Not changed** | This round addresses the reported Hardware DXR light leak only. |
+
+## Surface glass material set（2026-08-06）
+
+| Item | Status | Evidence |
+|---|---|---|
+| Existing colored glass | **Already existed / verified** | Clear, blue, red, green, yellow, purple, smoked, diamond and prismatic glass were already present and were not duplicated. |
+| Existing frosted glass | **Already existed / enhanced** | The existing ID 31 material now has explicit transmission plus a frosted color/height/roughness generator; no duplicate block was retained. |
+| Matte, mosaic, acrylic, ribbed and etched glass | **Completed** | Five new data-driven blocks use distinct transmission, roughness, IOR and procedural color/height/roughness textures. |
+| Shared renderer detail | **Completed** | Raster uses roughness-controlled refraction blur, Compute PT applies atlas normal detail during transmission, and Hardware DXR reads per-material IOR plus atlas normal detail. |
+| Camera-obscura / pinhole projection | **Not completed** | Current Hardware DXR is direct/reflection/refraction rendering, not a light-transport projection solver. Compute PT may transport indirect light but has no dedicated stable projection benchmark yet. |
+
+## Reflection termination and bounce limits（2026-08-06）
+
+| Item | Status | Evidence |
+|---|---|---|
+| RTX over-limit mirror layer | **Completed** | At the configured limit no additional reflection ray is emitted. Reflective candidates are ignored by Any-Hit so the same ray continues to real geometry/sky behind them, avoiding black output, fake lighting and the mirror's white base color. |
+| Compute Path Tracing maximum bounces | **Completed** | Settings, shortcut cycle and compute shader loop now permit 1–50 bounces. |
+| Hardware RTX maximum reflections | **Partially completed** | Safe, fully DXR-lit recursive limit is 29. D3D12 declares a hard maximum TraceRay recursion depth of 31; 50 needs a separate non-recursive wavefront DXR implementation. |
+
+## 草方塊側面貼圖方向（2026-08-06）
+
+| 項目 | 狀態 | 驗證證據 |
+|---|---|---|
+| 草方塊側面草帶上下顛倒 | **已完成** | Procedural atlas 改為在側面 V 的上端產生草帶；self-test 直接比較側面頂端與底端色彩，防止回歸。 |
+
+## Hardware RTX 多重反射（2026-08-06）
+
+| 項目 | 狀態 | 驗證證據 |
+|---|---|---|
+| 鏡面反射追蹤 DXR 世界 | **已完成** | Closest Hit 可遞迴發出反射射線；次級命中也執行 DXR 陰影與材質光照，不再只呈現無陰影的局部光照。 |
+| RTX 反射次數設定 | **已完成** | Hardware RTX 設定新增 1～12 次，預設 3 次；DXR Pipeline 最大遞迴深度為 14。 |
+| 打蠟模式反射強度 | **已完成** | 有效反射混合提高為原效果 1.7 倍，非金屬材質仍保留底色。 |
+| RTX 5050 實機驗證 | **已完成** | RTX 5050 Laptop GPU、DXR Tier 1.1；Hardware smoke 實際走到第三次反射的像素 53,582，112 frames，OpenGL 顯示 readback 通過，無 fallback。 |
+| 更高次數效能與最終畫質調校 | **尚未完成** | 允許 4～12 次，但 GPU 成本會上升；本輪未進行各反射次數的完整效能基準。 |
+
+## 本輪：120 FPS 串流／編輯／Physics Grid 優化（2026-08-05）
+
+| 項目 | 狀態 | 驗證證據 |
+|---|---|---|
+| Raster mesh／GPU upload | ✅ **【已完成－本輪優化】** | CPU vertex／greedy mask 使用 pooled buffer、移除 VBO upload 的 `ToArray()`，並合併重複 dirty；比較 run 的 upload max `35.03 → 1.19 ms`，配置量約 `1.54 GB → 1.18 GB`。 |
+| Static collider／Physics Grid | ✅ **【已完成－本輪優化】** | collider shape 背景建立、玩家／Grid 鄰近駐留、逐幀 eviction、full-cell cuboid greedy merge、單 Box body、adaptive CCD、低 body count 單執行緒及最多 2 個 120 Hz catch-up step 均已接入。79/79 self-tests 通過。 |
+| Compute streaming | ✅ **【已完成－ring V1】** | Camera 跨一個 Chunk 時只更新 3D texture 新 edge，不再搬移整個 `64×576×64` window；最高品質比較 run 的 upload max `201.4 → 50.5 ms`、Boundary `209.4 → 64.4 ms`。 |
+| DXR dynamic update | ✅ **【已完成－scratch cache V1】** | dynamic BLAS refit scratch 重用並移除重複 idle wait；RTX 5050 strict smoke 實際 Trace Rays 91 frames、Tier 1.1、無 fallback。 |
+| 所有指定操作不低於 120 FPS | 🟡 **【部分完成－尚未達標】** | 固定唯讀 V5 壓力世界實測：Classic `107.4 FPS / 1% low 15.6`、Compute 最高品質 `10.1 / 0.4`、Hardware DXR `111.8 / 23.2`；操作尖峰仍超過 8.33 ms，故不標完成。詳細階段數據與後續瓶頸見 [ROADMAP_OPTIMIZATION.md](ROADMAP_OPTIMIZATION.md)。 |
+
+### 本輪追加修正
+
+- ✅ **【已完成】** DXR 串流期間取消過期 static geometry job 不再呼叫 `ThrowIfCancellationRequested()`，也不把 cancellation token 交給 Task scheduler。背景工作以 `null` 結果安靜淘汰，避免正常 Chunk invalidation 觸發 `System.OperationCanceledException`／Visual Studio first-chance 中斷。隔離 Debug 與正常 Release 建置皆 0 warning／0 error、79/79 self-tests 通過；RTX 5050 Hardware DXR 雙 7×7 streaming smoke 實跑 163 frames、60,308 triangles、4 次 AS build 且無取消例外、無 fallback。
+
+## 本輪：視窗啟動不搶焦點（2026-08-05）
+
+| 項目 | 狀態 | 驗證證據 |
+|---|---|---|
+| 啟動視窗不搶前台 | ✅ **【已完成－本輪】** | OpenTK 視窗使用 `StartFocused = false`，初始化時未取得焦點便不抓取滑鼠；使用者點擊後仍可正常取得焦點。Win32 前台句柄探針完整監測 Classic smoke：啟動前／結束後前台 PID 均為 `24276`，RTX Sandbox PID `20340` 從未成為前台，smoke 正常渲染 100 frames 並以 exit code 0 結束。Debug／Release 皆為 0 warnings、0 errors。 |
+
+## 本輪：世界串流與全引擎效能工程（2026-08-05）
+
+詳細的固定世界、1／5／10／20／50／100 Chunk、六 Renderer Before／After、驗證證據與未完成限制已集中記錄於 [ROADMAP_OPTIMIZATION.md](ROADMAP_OPTIMIZATION.md)。
+
+| 項目 | 狀態 | 摘要 |
+|---|---|---|
+| 固定可重複效能測試 | ✅ **【已完成－本輪】** | baseline 已升級至唯讀 v5；Cold／Warm-up／Measured；同世界包含 100-Chunk、10 秒 route、100 place/break、256-cell Physics Grid、Region scratch 與 JSON／Markdown 完整 metrics。Benchmark 忽略實體鍵盤且不能保存 baseline。 |
+| 世界串流主執行緒尖峰 | ✅ **【已完成－V1 可運作】** | 可重用且逐提交授權的低優先 worker、Chunk 所有權直接移交、背景 Raster mesh、集中式 count-based `FrameWorkBudget`、allocation-free collider scan 與背景 autosave 已接入。六 Renderer 的 20-Chunk 隊列皆完整消化且無一秒 freeze。 |
+| Raster 幾何／記憶體 | ✅ **【已完成－本輪】** | 不透明方塊與連續水頂面使用安全 greedy merge；Classic 同條件配置量 -59%、GPU mesh/upload 約 -84%，六條 smoke 證明陰影／透明／水與 framebuffer 未消失。 |
+| 全部附件架構 | 🟡 **【部分完成】** | ✅ Compute ring／edge upload 已完成。❌ 正式多階段 Job DAG、可調 ms/byte budget、Region dirty payload merge、Section＋Palette、遠距 unload、DXR per-Chunk/per-Grid BLAS 與非同步 readback尚未完成；均未以介面或 TODO 假標完成。 |
+
+## 本轮：新区块载入卡顿再修正（2026-08-05）
+
+用户实测确认上一轮「新区块生成卡死」仍然存在，因此原本的完成标记已更正为部分完成；本轮以当前 Repository 重新检查后，确认地形计算虽已在 worker，但主线程与 Renderer 仍有以下实际热点。
+
+| 项目 | 状态 | 当前实现与验证证据 |
+|---|---|---|
+| worker 结果提交 | ✅ **【已完成－本轮】** | 背景生成完成后直接把完整 `VoxelChunkStore` 所有权移交给 live world；不再先转成数万笔 sparse voxel，再于 update thread 逐格复制进第二个 16×576×16 dense Chunk。原有取消、版本隔离和每帧最多提交一 Chunk 保持不变。 |
+| Raster Chunk／Grid 网格建立 | ✅ **【已完成－本轮】** | Classic、Forward、Deferred、Hybrid 的 box-face 输出改为 bit mask 与 allocation-free corner 计算；移除每方块反复建立的 face jagged arrays、normal／UV／index arrays 与捕获 lambda。Chunk CPU meshing 现使用带一格边界的不可变快照在单一背景 job 建立，主线程只做每帧最多一个完成 VBO upload；版本检查可丢弃编辑／邻接变化后的过期结果。材质、UV、法线、透明面与选择资料不变。 |
+| DXR 静态／动态几何 CPU 建立 | ✅ **【已完成－本轮】** | Hardware RT 使用同一套 allocation-free face 输出与只读材质 lookup；静態普通方塊進一步用同材質、同平面的 greedy face 合併，UV 仍逐格重複，micro／水／透明保持原語義。每 Chunk 的 CPU greedy 結果已有版本化 cache，BLAS 改採 `PreferFastBuild`。標準 strict 場景由 `116,498` 降至 `1,772` triangles，最終 static／refit `5.49／5.56 ms`，命中／陰影／反射／透明／framebuffer 證據不變。Natural 雙 7×7 window 為 `60,532` triangles，最終一次 static／refit `49.42／0.79 ms`。 |
+| 實際 Natural 新區塊流程 | ✅ **【已完成－本輪自動實機驗證】** | 新增 streaming smoke：先完成 Natural 7×7 window，再橫移 8 Chunk 進入完全未載入的第二個 7×7 window，等待生成、Raster 背景 mesh／upload 或 DXR AS 更新全部完成。生成改由獨立 `BelowNormal` worker 執行，避免與 render thread 爭搶。RTX 5050 最終結果：Classic 最大／平均 frame delta `13.86／8.61 ms`，Deferred `17.03／8.56 ms`；Hardware DXR `115.14／11.04 ms`，且完成正式 Trace Rays 與 framebuffer 驗證。 |
+| 完整消除長距離探索尖峰 | 🟡 **【部分完成】** | Raster 的實際雙 window 流程已沒有原本 0.5～1 秒級主執行緒 terrain copy／meshing 卡死；但 Hardware DXR 仍有一次約 `115.14 ms` 尖峰，來源是同步 build 單一靜態 BLAS，再以 D3D12 readback 回傳 OpenGL。每 Chunk BLAS instance、非同步 readback、time-based GPU upload budget 與遠距 unload 仍為後續項目，不假標為完成。 |
+
 ## V1 現況稽核（2026-08-04）
 
 這一節是後續工作的優先比對表。開始修改前仍須用目前程式碼或測試確認；不得只因這裡曾記載問題就重複修改。
@@ -53,11 +137,11 @@
 
 | 項目 | 狀態 | Repository 現況與實機證據 |
 |---|---|---|
-| 新 Chunk 生成卡死 | ✅ **【已完成－本輪可運作版】** | 地形 noise／洞穴／植被改由隔離的背景 `VoxelWorld` 生成；單一 worker 連續處理佇列，live world 只在 update thread 每幀提交一個。Chunk snapshot 枚舉也只掃實際垂直 occupied bounds，不再固定掃 576 層。新增非同步提交測試並通過。 |
+| 新 Chunk 生成卡死 | 🟡 **【部分完成－2026-08-05 再驗證】** | 地形 noise／洞穴／植被由獨立低優先級 worker 執行；本輪移除 live world 的逐 voxel 重複製、Raster／DXR 每方塊臨時陣列，並完成 Raster 背景 meshing。Natural 雙 7×7 實測 Raster 最大 frame delta 已降至 `17.03 ms`；Hardware DXR 仍有 `115.14 ms` 單體 BLAS 尖峰，因此整體不標記為全部完成。 |
 | 放置方塊卡頓 | ✅ **【已完成－本輪可運作版】** | Raster 每幀最多重建一個 dirty Chunk，且只讀該 Chunk 的 micro voxels；BEPU 每幀最多重建一個靜態 Chunk。Deferred 不再因任何方塊修改重掃全世界發光方塊，改為每 Chunk light cache，普通方塊只更新 mesh／shadow，發光變更只掃受影響 Chunk。 |
 | Raster 水面方塊接縫 | ✅ **【已完成－本輪】** | Classic／Forward／Deferred transparency／Hybrid 的靜態水只建立最高層雙面 top surface，不再 alpha 疊加每格四側／底面；同類 fluid 內部面一律剔除，水色與波紋改為連續 world-space 模型，不再逐格重複取樣不連續 atlas。DXR 靜態水同樣只保留最高 top surface。 |
 | Physics Grid 渲染負載 | ✅ **【已完成－本輪可運作版】** | Raster 與 DXR 共用「只保留 Grid 外露面」規則，完整相鄰 cell 的內部面不再上傳。實際使用者存檔診斷由 465,408 Grid triangles 降至 31,176（約 -93%）；固定 strict 場景為 96 triangles 且 145,898 Grid-hit pixels，證明不是把 Grid 隱藏。 |
-| Hardware DXR 切換／轉視角／更新 | 🟡 **【部分完成－本輪顯著修正】** | 移除建構期與第一幀重複的完整 BLAS/TLAS；品質 1–3 使用方向無關的 235 格 ray neighborhood，轉視角不再改 mask；串流／放置變更合併後才重建，且動態 refit 不再誤清靜態 dirty flag。Grid topology／燈已快取，TLAS 使用正式原地 update；Hardware backend 切走後保留快取。RTX 5050 final strict smoke：2 static builds＋3 dynamic refits＋2 TLAS updates，static/refit 55.83/4.77 ms。❌ 同步 D3D12 readback→OpenGL upload、每 Chunk／每 Grid 獨立 BLAS 與純 transform TLAS-only instance 仍是後續瓶頸。 |
+| Hardware DXR 切換／轉視角／更新 | 🟡 **【部分完成－本輪顯著修正】** | 移除建構期與第一幀重複的完整 BLAS/TLAS；品質 1–3 使用方向無關的 235 格 ray neighborhood，轉視角不再改 mask；串流／放置變更合併後才重建，且動態 refit 不再誤清靜態 dirty flag。Grid topology／燈與每 Chunk CPU greedy geometry 已快取，TLAS 使用正式原地 update；Hardware backend 切走後保留快取。RTX 5050 final strict smoke：`1,772` triangles、2 static builds＋3 dynamic refits＋2 TLAS updates，static／refit `5.49／5.56 ms`。❌ 同步 D3D12 readback→OpenGL upload、每 Chunk／每 Grid 獨立 BLAS 與純 transform TLAS-only instance 仍是後續瓶頸。 |
 
 ## V2-A（物理、RTX、暫停與背包）
 
@@ -66,7 +150,7 @@
 | 1. Physics Grid 擠壓玩家 | ✅ **【已完成－本輪再次降速】** | 防卡推出維持 8 個水平安全方向，但固定降為每秒 2.4 格；完全移除 Physics Grid 表面速度加成，因此高速撞击不会把防卡逻辑变成额外冲量。60 FPS 每帧最多 0.04 格，静止与 120 格／秒 Grid 的测试步长完全相同；连续推出仍可解除重叠且不向上瞬移。 |
 | 2. RTX 水材質 | ✅ **【已完成－本輪】** | 水／Transmission 幾何正式進入 DXR BLAS；Closest Hit 執行 Fresnel 反射、簡化折射、Albedo tint 與水色吸收，攝影機在水中時依命中距離套用水下霧。RTX 5050 一般場景 40,889 個透明主射線命中；水下場景 242,674 個透明命中且 framebuffer range 13–238。 |
 | 3. RTX 發光方塊 | ✅ **【已完成－本輪】** | 世界與 Physics Grid 的發光材質建立最多 32 個 DXR emissive lights；Closest Hit 依距離、半徑、法線與能量照亮附近表面，不再只有自發光材質。一般 smoke 實際上傳 7 個光源，水下展示場景上傳 32 個。 |
-| 4. RTX 效能 | 🟡 **【部分完成－本輪更新】** | 靜態世界與 Physics Grid 已拆成兩個 BLAS／TLAS instance；同拓撲 Grid 使用正式 `ALLOW_UPDATE`＋`PERFORM_UPDATE`。Grid exposed topology、靜／動發光候選與 upload capacity 已快取；TLAS 現在也正式原地 update。RTX 5050 final strict smoke 為 116,498 total／96 Grid／36 micro triangles、2 static builds＋3 dynamic refits＋2 TLAS updates、55.83/4.77 ms。❌ 每 Chunk／每 Grid 獨立 BLAS、純 transform TLAS-only instance、非同步 D3D12/OpenGL interop 與大型 benchmark 仍未完成。 |
+| 4. RTX 效能 | 🟡 **【部分完成－本輪更新】** | 靜態世界與 Physics Grid 已拆成兩個 BLAS／TLAS instance；同拓撲 Grid 使用正式 `ALLOW_UPDATE`＋`PERFORM_UPDATE`。Grid exposed topology、靜／動發光候選、每 Chunk CPU greedy geometry 與 upload capacity 已快取；TLAS 現在也正式原地 update。RTX 5050 final strict smoke 為 `1,772` total／96 Grid／36 micro triangles、2 static builds＋3 dynamic refits＋2 TLAS updates、static／refit `5.49／5.56 ms`。Natural 串流仍有 `115.14 ms` 單體靜態 BLAS 尖峰。❌ 每 Chunk BLAS、純 transform TLAS-only instance、非同步 D3D12/OpenGL interop 與大型 benchmark 仍未完成。 |
 | 5. ESC 與暫停選單 | ✅ **【已完成－本輪】** | ESC 開啟獨立暫停選單；再次 ESC 先成功存檔才關閉；切到 Windows 背景會自動開啟暫停並釋放滑鼠。✅ 後續修正：ImGui 的一般 `WantCaptureKeyboard` 不再攔截全域 ESC，設定／模組／物品欄都可關閉；只有真正進行中的 Windows IME composition 優先取得 Escape。 |
 | 6. 背包 UI 外觀 | ✅ **【已完成－本輪】** | 保留 ImGui 與原功能，改為置中的方塊／物品面板、Minecraft 風格深灰底、粗暗邊框、較方正元件、獨立內容區與一致間距。✅ 物品欄取得 ImGui keyboard focus 後仍可用 ESC 或原開關鍵 E／I／Tab 關閉；文字搜尋欄正在輸入時不會誤把 E／I 當關閉鍵。 |
 
@@ -86,7 +170,7 @@
 | 方塊、材質與內容資料 | ✅ **【已完成－本輪】** | 原有 namespaced ID、Fallback、Base Content 與 16-bit Registry 已可用；本輪新增 `ExamplePack`，實際載入 `examplepack:cyan_lamp` 並由測試驗證。 |
 | 世界與 Chunk | 🟡 **【部分完成－本輪背景串流】** | ✅ 16×16 Chunk-owned 資料已支援負 X／Z 與 Y -64..511；玩家周圍半徑 3 Chunk 由單一 worker 背景生成，32×32 Chunk 合併成單一 Region 檔。❌ 遠距 unload／重新載入與 LOD 尚未完成。 |
 | 世界生成 | ✅ **【已完成－本輪可運作版】** | Seed、確定性地形、地質、洞穴、植被與跨長距離 Pure Nature 氣候帶可按 Chunk 在背景生成，正常地形限制在 -64..256；live world 每幀最多提交一個完成 Chunk。79 項測試包含 queued generation 非同步提交、舊 window cancellation 與最終內容驗證。 |
-| Chunk Mesh 與基本效能 | 🟡 **【部分完成－本輪 frame budget】** | Raster camera pass 已按 Chunk 建 mesh、剔除遮蔽面、分離透明幾何；每幀只重建一個 dirty Chunk，micro snapshot 不再全世界掃描；Physics Grid 只上傳外露面與拓撲變更，BEPU 每幀只重建一個靜態 Chunk。❌ 背景 meshing job、byte/time GPU upload budget、Greedy Mesh 與大型世界壓力驗證尚未完成。 |
+| Chunk Mesh 與基本效能 | 🟡 **【部分完成－本輪背景 meshing】** | Raster camera pass 已按 Chunk 建 mesh、剔除遮蔽面、分離透明幾何；Chunk CPU meshing 已迁移到单一背景 job，主线程每帧最多上传一个版本匹配结果；box-face allocation 与每 voxel Registry lock 已移除。Physics Grid 只上傳外露面與拓撲變更，BEPU 每幀只重建一個靜態 Chunk。DXR 静态方块已使用 greedy face。❌ byte/time GPU upload budget、Raster Greedy Mesh、远距 unload 與長時間大型世界壓力驗證尚未完成。 |
 | Renderer 架構與切換 | ✅ **【已完成－本輪】** | Compute Path Tracing、PBR Forward、Classic、Deferred、Hardware DXR 保持可用；Renderer 選單依序加入正式的 Hybrid PBR Raster，位於 Deferred 與 Compute PT 之間並通過 GPU smoke。 |
 | Renderer Capability／圖形設定 | 🟡 **【部分完成－本輪有進度】** | ✅ Deferred 已有 Renderer／G-Buffer／Lighting／Shadow／Reflection／AO／Water／Transparency／Fog／Post 品質，以及 HDR、Bloom、Tone Mapping、Exposure、10 種 Debug View。✅ Hardware RT 的打蠟開關已整理成 Render Style：Default／Wax／Reference／Debug。❌ Deferred Cascade Shadow／SSGI／OIT／Clustered 與 DXR 折射／GI／降噪仍是後續。 |
 | 水 | ✅ **【已完成－本輪更新】** | 游泳／上岸輸入規則維持已完成狀態。本輪修正所有 Raster 的方塊水接縫：只畫最高層 top surface、剔除 fluid 內部面、使用連續 world-space 水色／波紋；DXR 靜態水也只保留最高表面。水下 framebuffer average 181.10、range 13–238。 |
@@ -107,7 +191,8 @@
 - `--self-test`：79/79 通過；包含 queued Chunk 非同步提交／取消、occupied bounds、urgent collision rebuild 與大型 Grid bounds。
 - Direct3D 12 DXR V1、Compute、Deferred、Hybrid PBR Raster、PBR Forward、Classic GPU smoke：最終版全部通過且都等待 49 個測試 Chunk 串流完成。Classic／Forward 為 43 visible／6 culled。
 - Deferred／Hybrid strict GPU smoke：feature mask 1023、16 point lights、1 spot light、35 shadow draws、shadow depth 0.76569–1.0、49 visible Chunk 與非黑 framebuffer 通過。
-- DXR strict GPU smoke：Tier 1.1、116,498 triangles、96 Grid／36 micro triangles、147,826 Grid-hit pixels、2 static builds＋3 dynamic refits＋2 TLAS updates，static/refit 55.83/4.77 ms；shadow／reflection／transparent／textured hits 與 framebuffer average 217.83、range 13–220 全通過，拒絕 fallback。
+- DXR strict GPU smoke：Tier 1.1、`1,772` triangles、96 Grid／36 micro triangles、147,826 Grid-hit pixels、2 static builds＋3 dynamic refits＋2 TLAS updates，static／refit `5.49／5.56 ms`；shadow／reflection／transparent／textured hits 與 framebuffer average 217.83、range 13–220 全通過，拒絕 fallback。
+- Natural streaming smoke（兩個完整 7×7 window）：Classic 最大／平均 `13.86／8.61 ms`，Deferred `17.03／8.56 ms`，Hardware DXR `115.14／11.04 ms`；DXR `60,532` triangles、static／refit `49.42／0.79 ms`，實際 Trace Rays 與 framebuffer 通過。
 - 暫停選單（8 controls）、設定、獨立模組畫面、背包、主選單、世界建立與水下 framebuffer smoke：全部通過。Shortcut smoke 額外讓物品欄／設定先取得 ImGui keyboard focus，再驗證 E／ESC 的共用實際關閉分支成功。
 - `--gpu-smoke-ime`：提交中／日／韓／泰／西里爾文字串、觸發 Win32 IME 候選位置 callback，並驗證文字欄位取得鍵盤所有權；此項不再記成真正 OS 中文組字的替代證據。
 - `--mod-diagnostics`：BepInEx 實際載入 Example Mod，並準確回報 `SoftBlockPhysicsMod.dll` 目標 .NET 9、高於遊戲 .NET 6，且缺少 BepInPlugin／BasePlugin 插件入口。
@@ -224,7 +309,7 @@
 - [x] 六面連通支撐、局部 Grid 剛體、連續重力／旋轉／碰撞／休眠（取代逐格落下）。
 - [x] 網格歸屬轉移工具；限制為座標對齊且六面相鄰。
 - [x] 正式切換為 BEPUphysics 2：Chunk 靜態碰撞體、Grid 動態 compound、CCD、接觸流形、摩擦與休眠。
-- [x] 120 Hz 固定時間步、六步追幀上限與世界重載／釋放生命週期。
+- [x] 120 Hz 固定時間步、兩步追幀上限與世界重載／釋放生命週期；避免長幀後連跑六次 simulation 形成卡頓螺旋。
 - [ ] 以 BEPU 接觸事件實作撞擊二次斷裂；舊的未接線實驗選項已移除。
 - [x] BepInEx 自訂 Build Tool API 與強制覆蓋。
 - [x] 時間循環與 GUI 調時、1–12 bounce 渲染設定。
@@ -252,6 +337,7 @@
 - [x] 所有內建與 Mod 材質共用真正的 16×16 程序圖集，包含 top/side/bottom、逐像素 roughness 與高度法線細節。
 - [x] 自然材質以 namespaced key、材質種子與方塊座標做確定性變化；純色材質可保持零雜訊。
 - [x] Creative Library 使用等角 3D 方塊預覽、搜尋、分類、收藏與最近使用。
+- [x] **【已完成－2026-08-06】**「全部」頁使用穩定的簡單分類排序；普通、彩色及特殊表面玻璃會連續排列，彩色材質採固定色序；新增的磨砂、霧面、馬賽克、壓克力、壓紋與蝕刻玻璃均顯示中文名稱。79/79 自我測試通過。
 - [x] 九格快捷欄可配置並以 namespaced key 持久化；數字鍵、滾輪與中鍵吸取共用同一套選取邏輯。
 - [x] 有黑色外框的情境準星，可辨識放置、移除、選取與碰撞阻擋，並可在設定調整。
 - [x] Natural v2：domain warp、多噪聲大陸度／侵蝕／山脊／氣候／河道、地質分層、3D 洞穴與群落式植被。
@@ -315,11 +401,11 @@
 | 2 | Occlusion Culling | ❌ | 沒有 Hi-Z、occlusion query 或 software occluder。必須先有可重現 benchmark，避免目前僅 16 Chunk 時查詢成本高於收益。 |
 | 3 | Chunk Culling | 🟡 | Raster 已整個 Chunk 不送 draw；DXR 只有品質 0 在重建 monolithic BLAS 前略過 Chunk，尚非獨立 BLAS／instance culling。 |
 | 4 | Backface Culling | 🟡 | Mesher 已不產生被相鄰不透明方塊遮住的內部面，但 Raster 明確 `GL.Disable(CullFace)`，尚未啟用真正 GPU backface culling。 |
-| 5 | Greedy Mesh | ❌ | 目前每個可見 voxel face 都產生獨立兩個 triangle，未合併同材質共面 Quad。 |
+| 5 | Greedy Mesh | ✅ | Raster 不透明 full blocks、連續同材質水頂面、DXR 靜態 full blocks 與 BEPU full-cell collider 都已使用對應的精確 greedy merge；Micro／透明幾何保留精確路徑。 |
 | 6 | Mesh Cache | ✅ | Raster 以 `_chunkMeshes` 長期持有每 Chunk VBO，不會每幀重建所有 Chunk。 |
-| 7 | Dirty Chunk Update | 🟡 | Raster 與 BEPU 靜態碰撞只標記變更 Chunk；Compute PT 單一 voxel 使用 `TexSubImage3D`。Raster Grid 以 `TopologyVersion` 區分拓撲與 transform，移動不再重建 VBO；DXR 靜態 voxel 變更仍會重建整體 static AS。 |
-| 8 | Multi-thread Chunk Build | ❌ | Chunk meshing 仍在 render thread 同步執行。 |
-| 9 | Async Upload | ❌ | Raster 使用同步 `GL.BufferData`；沒有 staging ring、fence 或每幀 upload queue。 |
+| 7 | Dirty Chunk Update | 🟡 | Raster／BEPU／Compute 只排入變更 Chunk 並合併重複 edit；Raster Grid 以 `TopologyVersion` 區分拓撲與 transform。DXR CPU geometry 有 per-Chunk cache，但任何靜態 topology commit 最終仍重建 monolithic static BLAS。 |
+| 8 | Multi-thread Chunk Build | ✅ | Natural generation、Raster CPU mesh、BEPU collider shape 與 DXR static CPU geometry 均由版本化背景工作建立；render／simulation thread 只提交仍有效結果。 |
+| 9 | Async Upload | 🟡 | CPU mesh build 與提交已拆開，Raster／Compute 每幀最多上傳 1 Chunk；但實際 OpenGL `BufferData`／`TexSubImage3D` 仍同步，尚無 persistent staging ring／fence。 |
 | 10 | Physics Sleeping | ✅ | BEPU body 的 `Awake` 狀態會同步為 `PhysicsGrid.IsSleeping`，睡眠 Grid 不再持續發布 render invalidation。 |
 
 ### 二、GPU Raster（11–20）
@@ -385,10 +471,10 @@
 |---:|---|:---:|---|
 | 48 | Texture Streaming | ❌ | atlas／voxel textures 一次常駐。 |
 | 49 | Mesh Streaming | ❌ | Raster 為固定世界全部 Chunk 配置 mesh object。 |
-| 50 | Chunk Streaming | 🟡 | 已完成無邊界 X／Z、半徑 3 Chunk 同步生成與 Raster／Compute／DXR 接入；遠距卸載、背景生成與 upload budget 尚未完成。 |
-| 51 | GPU Upload Budget | ❌ | dirty mesh 與資源更新沒有 byte/time budget。 |
-| 52 | Arena Allocator | 🟡 | BEPU 使用 `BufferPool`；render mesh、DXR geometry 與一般遊戲資料尚無 frame／persistent arena。 |
-| 53 | Object Pool | 🟡 | BEPU buffer/body 基礎設施會重用底層配置；遊戲、mesh build list 與 UI 尚無通用 object pool。 |
+| 50 | Chunk Streaming | 🟡 | 無邊界 X／Z、半徑 3 Chunk 背景生成、逐幀 commit、Raster background mesh、Compute ring edge upload 與 DXR background CPU geometry 已接入；遠距 world unload／Region read cache／LOD 尚未完成。 |
+| 51 | GPU Upload Budget | 🟡 | Raster／Compute 已有每幀 1 Chunk count budget，`FrameWorkBudget` 也保存 byte／ms 目標；尚未依實測成本做跨幀 byte/time cutoff 或 staging fence。 |
+| 52 | Arena Allocator | 🟡 | BEPU 使用 `BufferPool`，Raster vertex／greedy mask 使用 `ArrayPool`；DXR geometry 與一般遊戲資料尚無統一 frame／persistent arena。 |
+| 53 | Object Pool | 🟡 | BEPU buffer/body 與 Raster mesh build arrays 會重用底層配置；遊戲與 UI 尚無通用 object pool。 |
 
 ### 七、Voxel（54–58）
 
@@ -414,10 +500,10 @@
 
 | # | 項目 | 現況 | Repository 證據／下一步 |
 |---:|---|:---:|---|
-| 64 | Update Budget | 🟡 | 結構分析每次最多處理 6 個 dirty seeds；DXR Grid dynamic BLAS refit 最快 120 ms 合併一次；Raster Grid transform 不再上傳 mesh，但一般 dirty Chunk mesh 仍無每幀 time/byte budget。 |
-| 65 | Save Budget | ❌ | 保存會在一次同步操作完成整代 chunk／metadata。 |
-| 66 | Async Save | ❌ | `WorldSaveService.Save` 與 `SandboxGame.SaveWorld` 仍同步。 |
-| 67 | Async Generate | ❌ | `VoxelWorld.Regenerate`／generator 同步。 |
+| 64 | Update Budget | 🟡 | 結構分析每次最多 6 個 dirty seeds；Chunk／collider commit、Raster／Compute upload、autosave snapshot 均有 count budget；DXR Grid update 以 120 ms coalesce。尚缺可自適應的硬性 ms／byte cutoff。 |
+| 65 | Save Budget | 🟡 | Autosave 每幀最多擷取 1 個 Chunk snapshot，背景單寫者處理 Region；手動明確保存仍會等待完整 generation 完成。 |
+| 66 | Async Save | 🟡 | 自動保存與 benchmark Region write 已在背景單寫者執行；手動 `SaveWorld` 為維持離開世界的完成語意仍同步等待。 |
+| 67 | Async Generate | 🟡 | 玩家周圍 Natural Chunk 使用可取消的 `BelowNormal` worker 與逐幀 commit；整個世界的管理介面 `Regenerate` 仍是明確同步操作。 |
 | 68 | Async Lighting | ❌ | 沒有背景 lighting job；目前主要 lighting 是每幀 shader。 |
 
 ### 十、UI（69–70）
@@ -431,14 +517,14 @@
 
 原清單中的 Frustum Culling、Chunk Culling、Mesh Cache、Dirty Chunk、Physics Sleeping、Texture Atlas、Shadow Cache、Russian Roulette、基本 Importance Sampling 與 Shader Table reuse 已全部或部分存在，因此不再把它們當成「從零開始」的前十項。下一輪建議依相依性安排：
 
-1. Greedy Mesh（先保留材質、face、UV、micro voxel 與透明邊界正確性）。
-2. Multi-thread Chunk Build（只在 worker 建 CPU mesh data）。
-3. GPU Upload Budget＋staging／persistent ring（由 render thread 有界提交）。
-4. Raster MultiDraw／Indirect Draw（Greedy Mesh 穩定後再減 Draw Call）。
-5. DXR Static per-Chunk BLAS cache。
-6. DXR Dynamic per-Grid BLAS。
-7. Multi-instance TLAS＋只更新 transform／instance mask。
-8. TLAS／Dynamic BLAS update/refit（以 ALLOW_UPDATE 正式建立）。
+1. DXR Static per-Chunk BLAS cache。
+2. DXR Dynamic per-Grid BLAS。
+3. Multi-instance TLAS＋只更新 transform／instance mask。
+4. D3D12→OpenGL 非同步／共享資源，移除同步 readback。
+5. GPU staging／persistent upload ring 與依 ms／byte 的跨幀 budget。
+6. Raster MultiDraw／Indirect Draw，減少每 Chunk Draw Call。
+7. Region dirty payload merge 與遠距 Chunk／mesh／AS unload。
+8. sparse vertical Section＋Palette，降低生成／快照配置量。
 9. 保守 RTX instance culling（包含 shadow/reflection/refraction ray 可達性驗收）。
 10. Deferred Tiled Light Culling；Clustered Deferred 待大型燈光壓力測試後接續。
 
@@ -450,12 +536,12 @@ Compute PT 的 Adaptive Sampling、Blue Noise、Wavefront／Ray Sorting、Tempor
 
 | Pipeline | 目前可用 | 下一階段專屬優化 |
 |---|---|---|
-| Classic | Frustum／Chunk culling、Mesh cache、Dirty Chunk、Material atlas | Greedy Mesh、Backface Culling、背景 meshing、upload budget、MultiDraw |
+| Classic | Frustum／Chunk culling、Greedy Mesh、pooled Mesh cache、Dirty coalesce、背景 meshing、count upload budget、Material atlas | Backface Culling、persistent upload ring、MultiDraw |
 | Forward PBR | Classic 基礎＋共用 PBR material batching | 量測後決定 Depth Pre-pass、透明 Render Queue、MultiDraw／Indirect |
 | Deferred | Raster 基礎＋Depth Pre-pass、Light radius rejection、Shadow cache | Tiled Light Culling、Clustered Deferred、Light Volume／Shadow atlas cache |
 | Hybrid PBR Raster | Deferred opaque 流程＋Forward water／glass | 與 Deferred 共用 tile/cluster，另保留透明 queue／reflection cache |
-| Compute Path Tracing | 單 voxel 增量上傳、跨幀 accumulation、Russian Roulette、基本 Importance Sampling | Adaptive Sampling、Blue Noise，之後才是 Wavefront、Ray Sorting、Temporal reservoir／ReSTIR |
-| Hardware RTX | 固定 ray distance、單一 BLAS／TLAS、runtime Pipeline／Shader Table reuse、品質 0 保守 build mask | Static/Dynamic BLAS 分離、BLAS cache、多 instance TLAS、update/refit、ray-aware instance culling |
+| Compute Path Tracing | per-Chunk 增量上傳、3D texture ring edge streaming、跨幀 accumulation、Russian Roulette、基本 Importance Sampling | 大型 teleport upload budget、Adaptive Sampling、Blue Noise，之後才是 Wavefront、Ray Sorting、Temporal reservoir／ReSTIR |
+| Hardware RTX | 固定 ray distance、static/dynamic BLAS 分離、dynamic refit、雙 instance TLAS、runtime Pipeline／Shader Table／scratch reuse、品質 0 保守 build mask | per-Chunk/per-Grid BLAS cache、multi-instance TLAS、transform-only update、非同步 readback、ray-aware instance culling |
 
 ## 1.0 — Platform Release
 

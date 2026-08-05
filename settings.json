@@ -13,6 +13,7 @@
   "pbrReflectionQuality": 2,
   "classicLightingQuality": 1,
   "hardwareRayTracingQuality": 2,
+  "hardwareRayTracingReflectionBounces": 3,
   "hardwareRayTracingDenoiser": true,
   "exposure": 1,
   "fieldOfView": 72,

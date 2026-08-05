@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Numerics;
 using RTXSandbox.ModAPI;
 
@@ -20,10 +21,19 @@ public sealed class VoxelWorld : IVoxelWorld
     private readonly ConcurrentQueue<ChunkGenerationRequest> _pendingChunkGeneration = new();
     private readonly ConcurrentQueue<ChunkGenerationResult> _completedChunkGeneration = new();
     private readonly ConcurrentDictionary<ChunkCoordinate, byte> _queuedChunkGeneration = new();
+    private readonly SemaphoreSlim _chunkGenerationPermit = new(0, 1);
     private readonly BlockRegistry _blocks;
     private int _chunkGenerationWorkerRunning;
+    private VoxelWorld? _chunkGenerationWorkerWorld;
+    private int _chunkGenerationWorkerWorldVersion = int.MinValue;
     private int _chunkGenerationVersion;
     private bool _proceduralGenerationEnabled;
+    private long _chunkGenerationTotalTicks;
+    private long _chunkGenerationMaximumTicks;
+    private long _chunkCommitTotalTicks;
+    private long _chunkCommitMaximumTicks;
+    private int _chunkGenerationCompletedCount;
+    private int _chunkCommitCount;
     public PhysicsGridWorld PhysicsGrids { get; } = new();
     public int Seed { get; private set; }
     public WorldGenerationSettings GenerationSettings { get; private set; }
@@ -45,10 +55,50 @@ public sealed class VoxelWorld : IVoxelWorld
             chunk.MinimumX, chunk.MinimumZ, ChunkCoordinate.Size, ChunkCoordinate.Size);
     public int LoadedChunkCount => _storage.ChunkCount;
     public int PendingChunkGenerationCount => _queuedChunkGeneration.Count;
+    public int CompletedChunkGenerationPendingCommitCount => _completedChunkGeneration.Count;
+    public int CompletedChunkGenerationCount => Volatile.Read(ref _chunkGenerationCompletedCount);
+    public int CommittedChunkGenerationCount => Volatile.Read(ref _chunkCommitCount);
+    public double ChunkGenerationTotalMilliseconds => TicksToMilliseconds(Interlocked.Read(ref _chunkGenerationTotalTicks));
+    public double MaximumChunkGenerationMilliseconds => TicksToMilliseconds(Interlocked.Read(ref _chunkGenerationMaximumTicks));
+    public double ChunkCommitTotalMilliseconds => TicksToMilliseconds(Interlocked.Read(ref _chunkCommitTotalTicks));
+    public double MaximumChunkCommitMilliseconds => TicksToMilliseconds(Interlocked.Read(ref _chunkCommitMaximumTicks));
     public int MicroVoxelContainerCount => _storage.MicroVoxelContainerCount;
     public IReadOnlyList<ChunkCoordinate> SnapshotLoadedChunks() => _storage.SnapshotCoordinates();
     public IReadOnlyCollection<ChunkCoordinate> SnapshotGeneratedChunks() => _generatedChunks.ToArray();
     internal VoxelChunkSnapshot SnapshotChunk(ChunkCoordinate coordinate) => _storage.SnapshotChunk(coordinate);
+    internal ChunkMeshingSnapshot CreateChunkMeshingSnapshot(ChunkCoordinate coordinate)
+    {
+        int minimumY = int.MaxValue;
+        int maximumY = int.MinValue;
+        for (int offsetZ = -1; offsetZ <= 1; offsetZ++)
+        for (int offsetX = -1; offsetX <= 1; offsetX++)
+        {
+            var neighbor = new ChunkCoordinate(coordinate.X + offsetX, coordinate.Z + offsetZ);
+            if (!_storage.TryGetVerticalBounds(neighbor, out int neighborMinimum, out int neighborMaximum)) continue;
+            minimumY = Math.Min(minimumY, neighborMinimum);
+            maximumY = Math.Max(maximumY, neighborMaximum);
+        }
+
+        IReadOnlyList<StoredMicroVoxel> microVoxels = _storage.SnapshotChunk(coordinate).MicroVoxels;
+        if (minimumY == int.MaxValue)
+            return new ChunkMeshingSnapshot(coordinate, 0, 0, Array.Empty<ushort>(), microVoxels);
+
+        minimumY = Math.Max(MinimumY, minimumY - 1);
+        maximumY = Math.Min(MaximumY, maximumY + 1);
+        const int widthWithBorder = ChunkCoordinate.Size + 2;
+        int height = maximumY - minimumY;
+        var blocks = new ushort[checked(widthWithBorder * height * widthWithBorder)];
+        for (int localZ = 0; localZ < widthWithBorder; localZ++)
+        for (int y = minimumY; y < maximumY; y++)
+        for (int localX = 0; localX < widthWithBorder; localX++)
+        {
+            int worldX = coordinate.MinimumX + localX - 1;
+            int worldZ = coordinate.MinimumZ + localZ - 1;
+            blocks[localX + widthWithBorder * ((y - minimumY) + height * localZ)] =
+                _storage.GetBlock(worldX, y, worldZ);
+        }
+        return new ChunkMeshingSnapshot(coordinate, minimumY, maximumY, blocks, microVoxels);
+    }
     internal bool TryGetChunkVerticalBounds(
         ChunkCoordinate coordinate,
         out int minimumY,
@@ -108,6 +158,13 @@ public sealed class VoxelWorld : IVoxelWorld
         materialId != 0 && _blocks.Get(materialId).IsFluid;
     internal bool IsCollidableMaterial(ushort materialId) =>
         materialId != 0 && _blocks.Get(materialId).IsCollidable;
+    internal BlockDefinition[] CreateBlockDefinitionLookupSnapshot() =>
+        _blocks.CreateLookupSnapshot();
+    internal event Action BlockDefinitionsChanged
+    {
+        add => _blocks.DefinitionsChanged += value;
+        remove => _blocks.DefinitionsChanged -= value;
+    }
 
     public bool IsSolidForCollision(int x, int y, int z)
     {
@@ -464,15 +521,54 @@ public sealed class VoxelWorld : IVoxelWorld
         return queued;
     }
 
+    /// <summary>
+    /// Queues an exact, caller-ordered set without expanding it to the normal streaming
+    /// radius. This is used by the repeatable stress benchmark and keeps nearest-first
+    /// order supplied by the caller.
+    /// </summary>
+    public int QueueChunkBurst(IEnumerable<ChunkCoordinate> chunks)
+    {
+        int queued = 0;
+        foreach (ChunkCoordinate chunk in chunks.Distinct())
+        {
+            if (_generatedChunks.Contains(chunk) || !_queuedChunkGeneration.TryAdd(chunk, 0)) continue;
+            _pendingChunkGeneration.Enqueue(new ChunkGenerationRequest(
+                chunk,
+                GenerationSettings.Clone(),
+                _chunkGenerationVersion));
+            queued++;
+        }
+        StartChunkGenerationWorker();
+        return queued;
+    }
+
+    /// <summary>
+    /// Pays the one-time Natural generator JIT/allocation setup while the world is on
+    /// its loading screen, rather than on the first unexplored Chunk boundary. The
+    /// generated probe is isolated and never enters the live world or save.
+    /// </summary>
+    public void WarmUpChunkGeneration()
+    {
+        if (!_proceduralGenerationEnabled || GenerationSettings.Preset == WorldPreset.Void) return;
+        var probe = new VoxelWorld(
+            generate: false,
+            _blocks,
+            seed: GenerationSettings.Seed,
+            generationSettings: GenerationSettings);
+        probe.EnsureChunkGenerated(new ChunkCoordinate(8191, -8191));
+    }
+
     /// <summary>Commits at most <paramref name="maximumChunks"/> completed worker results.</summary>
     public int ProcessPendingChunkGeneration(int maximumChunks = 1)
     {
         maximumChunks = Math.Max(0, maximumChunks);
         int committed = 0;
+        bool handledCompletedResult = false;
         while (committed < maximumChunks &&
                _completedChunkGeneration.TryDequeue(out ChunkGenerationResult? result))
         {
             if (result is null) continue;
+            handledCompletedResult = true;
             ChunkCoordinate coordinate = result.Coordinate;
             if (result.Version != _chunkGenerationVersion) continue;
             if (!_queuedChunkGeneration.TryRemove(coordinate, out _)) continue;
@@ -481,13 +577,27 @@ public sealed class VoxelWorld : IVoxelWorld
                 Console.Error.WriteLine($"Chunk generation failed for {coordinate}: {result.Error.Message}");
                 continue;
             }
-            if (result.Snapshot is not null && _generatedChunks.Add(coordinate))
+            if (result.Storage is not null && _generatedChunks.Add(coordinate))
             {
-                _storage.StoreChunk(result.Snapshot);
+                long commitStart = Stopwatch.GetTimestamp();
+                // The isolated worker no longer owns this Chunk. Move its dense voxel
+                // storage directly into the live world instead of enumerating tens of
+                // thousands of sparse cells and allocating/copying a second dense array
+                // on the update thread.
+                _storage.AdoptChunk(result.Storage, coordinate);
                 ChunkGenerated?.Invoke(coordinate);
                 committed++;
+                RecordTiming(
+                    Stopwatch.GetTimestamp() - commitStart,
+                    ref _chunkCommitTotalTicks,
+                    ref _chunkCommitMaximumTicks,
+                    ref _chunkCommitCount);
             }
         }
+        // Grant exactly one more generation after a completed result was consumed.
+        // This preserves the per-frame CPU pacing without creating a new OS Thread for
+        // every Chunk in a burst.
+        if (handledCompletedResult) SignalChunkGenerationWorker();
         return committed;
     }
 
@@ -499,6 +609,7 @@ public sealed class VoxelWorld : IVoxelWorld
         // worker. Its eventual queued result is now obsolete and must not keep the world
         // in a false "generation pending" state.
         _queuedChunkGeneration.TryRemove(chunk, out _);
+        SignalChunkGenerationWorker();
         return true;
     }
 
@@ -525,32 +636,66 @@ public sealed class VoxelWorld : IVoxelWorld
 
     private void StartChunkGenerationWorker()
     {
-        if (_pendingChunkGeneration.IsEmpty ||
-            Interlocked.CompareExchange(ref _chunkGenerationWorkerRunning, 1, 0) != 0) return;
+        if (_pendingChunkGeneration.IsEmpty) return;
+        if (Interlocked.CompareExchange(ref _chunkGenerationWorkerRunning, 1, 0) != 0)
+        {
+            ReleaseChunkGenerationPermit();
+            return;
+        }
         BlockRegistry registry = _blocks;
-        _ = Task.Run(() =>
+        var worker = new Thread(() =>
         {
             try
             {
-                while (_pendingChunkGeneration.TryDequeue(out ChunkGenerationRequest? request))
+                while (true)
                 {
-                    if (request is null) continue;
-                    if (request.Version != _chunkGenerationVersion ||
-                        !_queuedChunkGeneration.ContainsKey(request.Coordinate))
+                    if (!_chunkGenerationPermit.Wait(millisecondsTimeout: 2_000))
+                    {
+                        if (_pendingChunkGeneration.IsEmpty) break;
                         continue;
+                    }
+                    ChunkGenerationRequest? request = null;
+                    while (_pendingChunkGeneration.TryDequeue(out ChunkGenerationRequest? candidate))
+                    {
+                        if (candidate is not null && candidate.Version == _chunkGenerationVersion &&
+                            _queuedChunkGeneration.ContainsKey(candidate.Coordinate))
+                        {
+                            request = candidate;
+                            break;
+                        }
+                    }
+                    if (request is null) continue;
                     try
                     {
                         // The worker owns this temporary storage completely. The live
                         // world and renderer/physics events stay on the game thread.
-                        var generator = new VoxelWorld(
-                            generate: false,
-                            registry,
-                            seed: request.Settings.Seed,
-                            generationSettings: request.Settings);
+                        if (_chunkGenerationWorkerWorld is null ||
+                            _chunkGenerationWorkerWorldVersion != request.Version)
+                        {
+                            _chunkGenerationWorkerWorld = new VoxelWorld(
+                                generate: false,
+                                registry,
+                                seed: request.Settings.Seed,
+                                generationSettings: request.Settings);
+                            _chunkGenerationWorkerWorldVersion = request.Version;
+                        }
+                        VoxelWorld generator = _chunkGenerationWorkerWorld;
+                        long generationStart = Stopwatch.GetTimestamp();
                         generator.EnsureChunkGenerated(request.Coordinate);
+                        RecordTiming(
+                            Stopwatch.GetTimestamp() - generationStart,
+                            ref _chunkGenerationTotalTicks,
+                            ref _chunkGenerationMaximumTicks,
+                            ref _chunkGenerationCompletedCount);
+                        VoxelChunkStore.OwnedChunk generatedChunk =
+                            generator._storage.ExtractChunk(request.Coordinate);
+                        // Vegetation may briefly touch a neighbour. The old isolated
+                        // worker discarded those side writes after every request; clear
+                        // them here too so reuse changes allocation cost, not terrain.
+                        generator._storage.Clear();
                         _completedChunkGeneration.Enqueue(new ChunkGenerationResult(
                             request.Coordinate,
-                            generator.SnapshotChunk(request.Coordinate),
+                            generatedChunk,
                             request.Version,
                             null));
                     }
@@ -564,12 +709,61 @@ public sealed class VoxelWorld : IVoxelWorld
             finally
             {
                 Interlocked.Exchange(ref _chunkGenerationWorkerRunning, 0);
-                // Close the enqueue/worker-exit race without running more than one
-                // generator at a time.
+                // Close the idle-exit race: a request may have arrived immediately
+                // before the running flag was cleared.
                 if (!_pendingChunkGeneration.IsEmpty) StartChunkGenerationWorker();
             }
-        });
+        })
+        {
+            IsBackground = true,
+            Name = "RTX Sandbox Chunk Generator",
+            Priority = ThreadPriority.BelowNormal,
+        };
+        worker.Start();
+        ReleaseChunkGenerationPermit();
     }
+
+    private void SignalChunkGenerationWorker()
+    {
+        if (_pendingChunkGeneration.IsEmpty) return;
+        if (Volatile.Read(ref _chunkGenerationWorkerRunning) == 0)
+            StartChunkGenerationWorker();
+        else
+            ReleaseChunkGenerationPermit();
+    }
+
+    private void ReleaseChunkGenerationPermit()
+    {
+        if (_chunkGenerationPermit.CurrentCount != 0) return;
+        try { _chunkGenerationPermit.Release(); }
+        catch (SemaphoreFullException) { }
+    }
+
+    public void ResetChunkPerformanceCounters()
+    {
+        Interlocked.Exchange(ref _chunkGenerationTotalTicks, 0);
+        Interlocked.Exchange(ref _chunkGenerationMaximumTicks, 0);
+        Interlocked.Exchange(ref _chunkCommitTotalTicks, 0);
+        Interlocked.Exchange(ref _chunkCommitMaximumTicks, 0);
+        Interlocked.Exchange(ref _chunkGenerationCompletedCount, 0);
+        Interlocked.Exchange(ref _chunkCommitCount, 0);
+    }
+
+    private static void RecordTiming(long ticks, ref long total, ref long maximum, ref int count)
+    {
+        Interlocked.Add(ref total, ticks);
+        Interlocked.Increment(ref count);
+        long observed = Interlocked.Read(ref maximum);
+        while (ticks > observed)
+        {
+            long previous = Interlocked.CompareExchange(ref maximum, ticks, observed);
+            if (previous == observed) break;
+            observed = previous;
+        }
+    }
+
+    private static double TicksToMilliseconds(long ticks) =>
+        ticks * 1000.0 / Stopwatch.Frequency;
 
     private void ClearPendingChunkGeneration()
     {
@@ -1319,7 +1513,7 @@ public sealed class VoxelWorld : IVoxelWorld
 
     private sealed record ChunkGenerationResult(
         ChunkCoordinate Coordinate,
-        VoxelChunkSnapshot? Snapshot,
+        VoxelChunkStore.OwnedChunk? Storage,
         int Version,
         Exception? Error);
 }

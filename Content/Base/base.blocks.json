@@ -364,11 +364,16 @@
       "displayName": "Frosted Glass",
       "category": "Optical / Specialty Glass",
       "albedo": [0.67, 0.83, 0.9],
-      "roughness": 0.28,
+      "roughness": 0.72,
       "metallic": 0.02,
       "hardnessSeconds": 0.3,
       "isTransparent": true,
-      "indexOfRefraction": 1.48
+      "transmission": 0.72,
+      "indexOfRefraction": 1.48,
+      "tags": ["glass", "frosted", "diffuse", "transparent"],
+      "textureGenerator": "frosted_glass",
+      "textureVariation": 0.72,
+      "soundSet": "glass"
     },
     {
       "id": 32,

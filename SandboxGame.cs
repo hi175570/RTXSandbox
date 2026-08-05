@@ -9,6 +9,7 @@ using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 using RTXSandbox.Configuration;
 using RTXSandbox.Gameplay;
+using RTXSandbox.Infrastructure;
 using RTXSandbox.ModAPI;
 using RTXSandbox.Modding;
 using RTXSandbox.Persistence;
@@ -23,7 +24,7 @@ namespace RTXSandbox;
 
 public sealed partial class SandboxGame : GameWindow
 {
-    private static readonly int[] QualityBounces = { 1, 2, 3, 4, 6, 8, 12 };
+    private static readonly int[] QualityBounces = { 1, 2, 3, 4, 6, 8, 12, 16, 20, 30, 40, 50 };
     private static readonly IReadOnlyDictionary<string, string> ChineseBlockWords =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -31,6 +32,7 @@ public sealed partial class SandboxGame : GameWindow
             ["amber"] = "琥珀", ["andesite"] = "安山岩", ["animated"] = "動畫", ["aqua"] = "水藍",
             ["bamboo"] = "竹", ["bark"] = "樹皮", ["basalt"] = "玄武岩", ["bedrock"] = "基岩",
             ["birch"] = "白樺", ["black"] = "黑色", ["blackstone"] = "黑石", ["block"] = "方塊",
+            ["brown"] = "棕色",
             ["blue"] = "藍色", ["board"] = "板", ["brass"] = "黃銅", ["brick"] = "磚塊",
             ["bricks"] = "石磚", ["bronze"] = "青銅", ["carbon"] = "碳纖維", ["casing"] = "外殼",
             ["charcoal"] = "炭灰色", ["checker"] = "棋盤", ["chiseled"] = "雕刻", ["chrome"] = "鉻",
@@ -40,23 +42,29 @@ public sealed partial class SandboxGame : GameWindow
             ["crystal"] = "水晶", ["cut"] = "切割", ["cyan"] = "青色", ["darkwood"] = "深色木",
             ["decorative"] = "雕花", ["diamond"] = "鑽石", ["diorite"] = "閃長岩", ["dirt"] = "泥土",
             ["display"] = "顯示", ["dry"] = "乾燥", ["emerald"] = "翡翠", ["energy"] = "能量",
+            ["etched"] = "蝕刻",
             ["fabric"] = "布料", ["floor"] = "地板", ["flower"] = "花叢", ["frosted"] = "磨砂",
             ["gem"] = "寶石", ["glass"] = "玻璃", ["glow"] = "發光石", ["gneiss"] = "片麻岩",
             ["gold"] = "金", ["granite"] = "花崗岩", ["grass"] = "草方塊", ["grate"] = "格柵",
             ["gravel"] = "礫石", ["gray"] = "灰色", ["green"] = "綠色", ["hazard"] = "警示",
             ["hemlock"] = "鐵杉", ["hologram"] = "全息", ["ice"] = "冰", ["industrial"] = "工業",
             ["insulated"] = "絕緣", ["iron"] = "鐵", ["lamp"] = "燈", ["lava"] = "岩漿",
+            ["lime"] = "萊姆色",
             ["leaves"] = "樹葉", ["led"] = " LED", ["light"] = "光", ["limestone"] = "石灰岩",
             ["log"] = "原木", ["machine"] = "機械", ["magenta"] = "洋紅", ["magic"] = "魔法",
-            ["maple"] = "楓木", ["marble"] = "大理石", ["metal"] = "金屬", ["mirror"] = "鏡面",
+            ["maple"] = "楓木", ["marble"] = "大理石", ["matte"] = "霧面", ["metal"] = "金屬",
+            ["mirror"] = "鏡面", ["mosaic"] = "馬賽克",
             ["moonlight"] = "月光", ["moss"] = "苔蘚", ["mossy"] = "覆苔", ["mud"] = "泥巴",
-            ["neon"] = "霓虹", ["oak"] = "橡木", ["obsidian"] = "黑曜石", ["ore"] = "礦石",
+            ["neon"] = "霓虹", ["oak"] = "橡木", ["obsidian"] = "黑曜石", ["orange"] = "橙色",
+            ["ore"] = "礦石",
             ["oxidized"] = "氧化", ["palm"] = "棕櫚木", ["panel"] = "面板", ["peat"] = "泥炭",
+            ["pink"] = "粉紅色",
             ["perfect"] = "完美", ["pillar"] = "柱", ["pipe"] = "管", ["planks"] = "木板",
             ["plasma"] = "等離子", ["plaster"] = "灰泥", ["plate"] = "板", ["polished"] = "拋光",
             ["prismatic"] = "稜彩", ["purple"] = "紫色", ["quantum"] = "量子", ["quartz"] = "石英",
             ["rack"] = "機櫃", ["rainbow"] = "彩虹", ["reactor"] = "反應爐", ["red"] = "紅色",
-            ["redwood"] = "紅杉木", ["rock"] = "岩石", ["rose"] = "玫瑰色", ["rusted"] = "鏽蝕",
+            ["redwood"] = "紅杉木", ["ribbed"] = "壓紋", ["rock"] = "岩石", ["rose"] = "玫瑰色",
+            ["rusted"] = "鏽蝕",
             ["sand"] = "沙", ["sandstone"] = "砂岩", ["sandy"] = "砂質", ["screen"] = "螢幕",
             ["server"] = "伺服器", ["silver"] = "銀", ["slate"] = "板岩", ["smoked"] = "煙燻",
             ["smooth"] = "平滑", ["snow"] = "雪", ["soil"] = "土壤", ["solar"] = "太陽",
@@ -65,6 +73,7 @@ public sealed partial class SandboxGame : GameWindow
             ["tiles"] = "磁磚", ["titanium"] = "鈦", ["travertine"] = "洞石", ["uranium"] = "鈾",
             ["vent"] = "通風口", ["volcanic"] = "火山", ["volumetric"] = "體積", ["wall"] = "牆",
             ["warm"] = "暖白", ["warning"] = "警告", ["water"] = "水", ["white"] = "白色",
+            ["acrylic"] = "壓克力",
             ["wood"] = "木材", ["workbench"] = "工作台", ["yellow"] = "黃色",
         };
 
@@ -136,6 +145,7 @@ public sealed partial class SandboxGame : GameWindow
     private string? _modDeleteSource;
     private bool _modDeletePopupRequested;
     private double _autosaveTimer;
+    private WorldSaveService.IncrementalSaveOperation? _autosaveOperation;
     private string _paletteSearch = string.Empty;
     private string _paletteCategory = "All";
     private readonly HashSet<string> _favoriteBlocks = new(StringComparer.OrdinalIgnoreCase);
@@ -145,6 +155,11 @@ public sealed partial class SandboxGame : GameWindow
     private bool _gpuSmokeUnderwater;
     private bool _gpuSmokeIme;
     private bool _gpuSmokePause;
+    private bool _gpuSmokeStreaming;
+    private int _gpuSmokeStreamingStage;
+    private double _gpuSmokeMaximumStreamingFrameMilliseconds;
+    private double _gpuSmokeStreamingFrameMillisecondsTotal;
+    private int _gpuSmokeStreamingFrameCount;
     private string _gpuSmokeShortcut = string.Empty;
     private bool _gpuSmokeShortcutTriggered;
     private int _pauseMenuButtonCountThisFrame;
@@ -201,6 +216,9 @@ public sealed partial class SandboxGame : GameWindow
         _gpuSmokeUnderwater = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_UNDERWATER") == "1";
         _gpuSmokeIme = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_IME") == "1";
         _gpuSmokePause = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_PAUSE_MENU") == "1";
+        _gpuSmokeStreaming = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_STREAMING") == "1";
+        _streamingBenchmark = Environment.GetEnvironmentVariable("RTX_SANDBOX_STREAM_BENCHMARK") == "1";
+        if (_streamingBenchmark) ConfigureStreamingBenchmarkQuality();
         _gpuSmokeShortcut = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_SHORTCUT") ?? string.Empty;
         if (_gpuSmoke && Enum.TryParse(
                 Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEFERRED_DEBUG"),
@@ -238,13 +256,31 @@ public sealed partial class SandboxGame : GameWindow
                 throw new InvalidOperationException("GPU mod smoke loaded no block from RTX Sandbox Example Mod.");
             Console.WriteLine("Content pack and external ModAPI registration verified.");
         }
-        _worldSaves = new WorldSaveService(
-            _blocks,
-            preferredSeed: _settings.WorldSeed,
-            worldName: _settings.WorldName);
+        if (_streamingBenchmark) PrepareStreamingBenchmarkStorage();
+        _worldSaves = _streamingBenchmark
+            ? CreateStreamingBenchmarkSaveService(_blocks)
+            : new WorldSaveService(
+                _blocks,
+                preferredSeed: _settings.WorldSeed,
+                worldName: _settings.WorldName);
         _modHost.RegisterService(_worldSaves);
         bool loadedSave = _worldSaves.TryLoad(_world, out SavedWorldState savedState, out string? loadError);
-        if (!loadedSave && loadError is null)
+        bool benchmarkBaselineCreated = false;
+        if (_streamingBenchmark && !loadedSave)
+        {
+            BuildStreamingBenchmarkBaseline(_world);
+            NumericsVector3 benchmarkStart = StreamingBenchmarkStartPosition(_world);
+            _worldSaves.Save(_world, benchmarkStart, 12f);
+            savedState = new SavedWorldState(
+                benchmarkStart,
+                12f,
+                StreamingBenchmarkSeed,
+                generationSettings: _world.GenerationSettings);
+            loadedSave = true;
+            loadError = null;
+            benchmarkBaselineCreated = true;
+        }
+        else if (!loadedSave && loadError is null)
         {
             int randomSeed = Random.Shared.Next(int.MinValue, int.MaxValue);
             _settings.WorldSeed = randomSeed;
@@ -253,16 +289,18 @@ public sealed partial class SandboxGame : GameWindow
         _saveStatus = loadedSave
             ? $"Loaded {Path.GetFileName(_worldSaves.LastLoadSource)}{(_worldSaves.RecoveredLastLoad ? " (recovered)" : string.Empty)}"
             : loadError is null ? "New generated world" : $"Load failed: {loadError}";
+        _world.WarmUpChunkGeneration();
         int spawnX = VoxelWorld.Width / 2;
         int spawnZ = VoxelWorld.Depth / 2 + 8;
         float spawnY = _world.FindTopVoxelY(spawnX, spawnZ) + 1.001f;
         NumericsVector3 spawnPosition = loadedSave
             ? savedState.PlayerPosition
             : new NumericsVector3(spawnX + 0.5f, spawnY, spawnZ + 0.5f);
+        if (_streamingBenchmark) spawnPosition = StreamingBenchmarkStartPosition(_world);
         _player = new PlayerController(_world, spawnPosition);
-        StreamWorldAroundPlayer();
-        _player.FlightMode = _settings.StartInFlightMode;
-        _player.NoClip = _settings.StartWithNoClip;
+        if (!_streamingBenchmark) StreamWorldAroundPlayer();
+        _player.FlightMode = _streamingBenchmark || _settings.StartInFlightMode;
+        _player.NoClip = _streamingBenchmark || _settings.StartWithNoClip;
         _buildTools = new BuildToolSystem(_world, _blocks, _toolRegistry, _player.WouldIntersectBlock);
         if (_blocks.TryGet(_settings.SelectedBlockKey, out BlockDefinition? rememberedBlock) && rememberedBlock!.IsPlaceable)
             _buildTools.SelectedBlockId = rememberedBlock.Id;
@@ -327,22 +365,25 @@ public sealed partial class SandboxGame : GameWindow
         {
             SetUpUnderwaterSmokeScene();
         }
-        else if (_gpuSmoke)
+        else if (_gpuSmoke && !_streamingBenchmark)
         {
             // GPU smoke uses a deterministic showcase and never saves it. Persisted user
             // terrain/Physics Grids can otherwise make strict per-pixel evidence depend
             // on unrelated save history. Streaming is re-queued so the test still covers
             // asynchronous generation and renderer invalidation.
-            _world.Regenerate(new WorldGenerationSettings
-            {
-                Preset = WorldPreset.Showcase,
-                Seed = 1337,
-                FlatSurfaceHeight = 4,
-                SurfaceBlockKey = "rtxsandbox:white_concrete",
-                UndergroundBlockKey = "rtxsandbox:stone",
-                GenerateLakes = false,
-                GenerateVegetation = false,
-            });
+            WorldGenerationSettings smokeGeneration = _gpuSmokeStreaming
+                ? WorldGenerationSettings.Natural(1337)
+                : new WorldGenerationSettings
+                {
+                    Preset = WorldPreset.Showcase,
+                    Seed = 1337,
+                    FlatSurfaceHeight = 4,
+                    SurfaceBlockKey = "rtxsandbox:white_concrete",
+                    UndergroundBlockKey = "rtxsandbox:stone",
+                    GenerateLakes = false,
+                    GenerateVegetation = false,
+                };
+            _world.Regenerate(smokeGeneration);
             _player.Teleport(new NumericsVector3(VoxelWorld.Width / 2f + 0.5f, 6.001f,
                 VoxelWorld.Depth / 2f + 8.5f));
             _streamedPlayerChunk = null;
@@ -419,35 +460,63 @@ public sealed partial class SandboxGame : GameWindow
         _worldNameDraft = _settings.WorldName;
         RefreshWorldList();
         bool forceMainMenu = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_MAIN_MENU") == "1";
-        _mainMenuVisible = forceMainMenu ||
-                           (!_gpuSmoke && !_settingsVisible && !_inventoryVisible && !_worldCreationVisible);
-        SetMouseCaptured(!AnyInterfaceVisible());
+        _mainMenuVisible = !_streamingBenchmark && (forceMainMenu ||
+                           (!_gpuSmoke && !_settingsVisible && !_inventoryVisible && !_worldCreationVisible));
+        if (_streamingBenchmark)
+        {
+            _settingsVisible = false;
+            _inventoryVisible = false;
+            _worldCreationVisible = false;
+            _modsVisible = false;
+            _pauseMenuVisible = false;
+        }
+        SetMouseCaptured(!AnyInterfaceVisible() && IsFocused);
         _loaded = true;
         _modHost.PublishWorldReady();
         UpdateSelection();
         UpdateTitle();
+        if (_streamingBenchmark) InitializeStreamingBenchmark(benchmarkBaselineCreated);
     }
 
     protected override void OnUpdateFrame(FrameEventArgs args)
     {
         base.OnUpdateFrame(args);
+        RecordStreamingBenchmarkUpdateStart();
         if (!_loaded)
         {
             return;
         }
+        if (_gpuSmokeStreamingStage == 1)
+        {
+            double frameMilliseconds = args.Time * 1000.0;
+            _gpuSmokeMaximumStreamingFrameMilliseconds = Math.Max(
+                _gpuSmokeMaximumStreamingFrameMilliseconds,
+                frameMilliseconds);
+            _gpuSmokeStreamingFrameMillisecondsTotal += frameMilliseconds;
+            _gpuSmokeStreamingFrameCount++;
+        }
 
-        HandleSystemAndRenderSettings();
-        _world.ProcessPendingChunkGeneration(maximumChunks: 1);
-        if (_ui.WantsKeyboardInput)
+        if (!_streamingBenchmark && (IsFocused || _gpuSmoke)) HandleSystemAndRenderSettings();
+        int submittedChunks = _world.ProcessPendingChunkGeneration(
+            FrameWorkBudget.Default.MaximumChunkCommitsPerFrame);
+        if (!_streamingBenchmark && _ui.WantsKeyboardInput)
         {
             ResetMining();
             return;
         }
-        if (!AnyInterfaceVisible())
+        if (_streamingBenchmark)
         {
-            HandleTimeControls();
-            SelectMaterialFromInputs();
-            HandleEditorShortcuts();
+            // Deterministic benchmark actions are driven by the benchmark controller,
+            // never by physical keys pressed in another foreground application.
+        }
+        else if (!AnyInterfaceVisible())
+        {
+            if (IsFocused)
+            {
+                HandleTimeControls();
+                SelectMaterialFromInputs();
+                HandleEditorShortcuts();
+            }
         }
         else
         {
@@ -457,7 +526,7 @@ public sealed partial class SandboxGame : GameWindow
 
         _clock.Update((float)args.Time);
         _modHost.Update((float)args.Time);
-        StreamWorldAroundPlayer();
+        if (!_streamingBenchmark) StreamWorldAroundPlayer();
         if (!_clock.Paused && _clock.CircularDistanceFrom(_lastAccumulatedTime) >= 0.012f)
         {
             _lastAccumulatedTime = _clock.TimeOfDayHours;
@@ -489,6 +558,7 @@ public sealed partial class SandboxGame : GameWindow
                        (KeyboardState.IsKeyDown(Keys.LeftControl) || KeyboardState.IsKeyDown(Keys.RightControl));
         _player.Update((float)args.Time, movement, _camera.Forward, sprint, jump, descend);
 
+        _physics.SetSimulationFocus(_player.Position);
         _physics.Update((float)args.Time);
         _player.ResolveExternalPenetration((float)args.Time);
 
@@ -506,11 +576,7 @@ public sealed partial class SandboxGame : GameWindow
             }
         }
 
-        _autosaveTimer += args.Time;
-        if (_autosaveTimer >= _settings.AutosaveMinutes * 60.0)
-        {
-            SaveWorld();
-        }
+        if (!_streamingBenchmark) UpdateAutosave(args.Time);
 
         bool viewChanged = NumericsVector3.DistanceSquared(oldPosition, _player.Position) > 0.0000001f ||
                            NumericsVector3.DistanceSquared(oldForward, _camera.Forward) > 0.0000001f;
@@ -608,6 +674,7 @@ public sealed partial class SandboxGame : GameWindow
         {
             ResetMining();
         }
+        RecordStreamingBenchmarkUpdateEnd(submittedChunks);
     }
 
     private void StreamWorldAroundPlayer()
@@ -623,6 +690,7 @@ public sealed partial class SandboxGame : GameWindow
     protected override void OnRenderFrame(FrameEventArgs args)
     {
         base.OnRenderFrame(args);
+        RecordStreamingBenchmarkRenderStart();
         if (!_loaded)
         {
             return;
@@ -659,13 +727,17 @@ public sealed partial class SandboxGame : GameWindow
                     _settings.PbrReflectionQuality,
                     _settings.ClassicLightingQuality,
                     _settings.HardwareRayTracingQuality,
+                    _settings.HardwareRayTracingReflectionBounces,
                     _settings.HardwareRayTracingRenderStyle),
                 _settings.Exposure);
         }
         if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") == "1")
         {
             if (!_hardwareSmokeEdited &&
-                (_world.PendingChunkGenerationCount == 0 || _gpuSmokeFrames >= 35))
+                _renderer.ActiveBackend is DxrHardwareRenderer readyDxr &&
+                _world.PendingChunkGenerationCount == 0 &&
+                readyDxr.StaticAccelerationStructureBuildCount >= 1 &&
+                readyDxr.PendingStaticGeometryBuildCount == 0)
             {
                 _hardwareSmokeEdited = true;
                 _settings.HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.WaxMode;
@@ -705,13 +777,17 @@ public sealed partial class SandboxGame : GameWindow
                     dxr.VisibleDxrChunkCount <= 0 || dxr.ViewCullingExpansion < 1.6f ||
                     dxr.TracedPhysicsGridCount <= 0 || dxr.TracedPhysicsGridTriangleCount <= 0 ||
                     dxr.TracedMicroVoxelTriangleCount <= 0 || dxr.DynamicTopologyBuildCount <= 0 ||
-                    dxr.LastPhysicsGridHitPixelCount <= 0 || dxr.LastTexturedHitPixelCount <= 0 ||
+                    (!_gpuSmokeStreaming && dxr.LastPhysicsGridHitPixelCount <= 0) ||
+                    dxr.LastTexturedHitPixelCount <= 0 ||
                     dxr.AccelerationStructureBuildCount < 3 ||
                     dxr.StaticAccelerationStructureBuildCount < 2 ||
                     dxr.DynamicAccelerationStructureBuildCount < 1 || dxr.TlasUpdateCount < 1 ||
                     dxr.LastHardwareQuality < 2 ||
                     !dxr.GlobalRayGeometryRetained;
-                if (evidenceIncomplete && _gpuSmokeFrames + 1 >= 60)
+                // Static CPU geometry now builds off-thread. Validate two distinct AS
+                // generations instead of racing the edit into the initial build.
+                int evidenceDeadlineFrames = _gpuSmokeStreaming ? 300 : 180;
+                if (evidenceIncomplete && _gpuSmokeFrames + 1 >= evidenceDeadlineFrames)
                     throw new InvalidOperationException(
                         $"DXR smoke evidence incomplete: triangles={dxr.TracedTriangleCount}, hits={dxr.LastHitPixelCount}, " +
                         $"shadow={dxr.LastShadowRayPixelCount}, occluded={dxr.LastShadowOccludedPixelCount}, reflection={dxr.LastReflectionRayPixelCount}, wax={dxr.LastWaxReflectionPixelCount}, transparent={dxr.LastTransparentHitPixelCount}, emissiveLights={dxr.EmissiveLightCount}, " +
@@ -794,6 +870,39 @@ public sealed partial class SandboxGame : GameWindow
         {
             ValidateUnderwaterSmokeFrame();
         }
+        bool rasterMeshesReady = _renderer.ActiveBackend is not RasterVoxelRenderer streamingRaster ||
+                                 streamingRaster.PendingVisibleMeshRebuildCount == 0;
+        if (_gpuSmokeStreaming && _gpuSmokeFrames + 1 >= 3 &&
+            _world.PendingChunkGenerationCount == 0 && rasterMeshesReady)
+        {
+            if (_gpuSmokeStreamingStage == 0)
+            {
+                _gpuSmokeStreamingStage = 1;
+                _gpuSmokeMaximumStreamingFrameMilliseconds = 0.0;
+                _gpuSmokeStreamingFrameMillisecondsTotal = 0.0;
+                _gpuSmokeStreamingFrameCount = 0;
+                _player.Teleport(_player.Position + new NumericsVector3(ChunkCoordinate.Size * 8, 0f, 0f));
+                _streamedPlayerChunk = null;
+                StreamWorldAroundPlayer();
+                Console.WriteLine("Streaming smoke entered a completely new 7x7 Natural Chunk window.");
+            }
+            else if (_gpuSmokeStreamingStage == 1)
+            {
+                _gpuSmokeStreamingStage = 2;
+                int playerX = (int)MathF.Floor(_player.Position.X);
+                int playerZ = (int)MathF.Floor(_player.Position.Z);
+                float surfaceY = _world.FindTopVoxelY(playerX, playerZ) + 1.001f;
+                _player.Teleport(new NumericsVector3(_player.Position.X, surfaceY, _player.Position.Z));
+                _renderer.ResetAccumulation();
+                double averageFrameMilliseconds = _gpuSmokeStreamingFrameCount == 0
+                    ? 0.0
+                    : _gpuSmokeStreamingFrameMillisecondsTotal / _gpuSmokeStreamingFrameCount;
+                Console.WriteLine($"Streaming smoke completed; maximum observed frame delta " +
+                                  $"{_gpuSmokeMaximumStreamingFrameMilliseconds:0.00} ms, " +
+                                  $"average {averageFrameMilliseconds:0.00} ms over " +
+                                  $"{_gpuSmokeStreamingFrameCount} frames.");
+            }
+        }
         if (_gpuSmoke && _gpuSmokeFrames + 1 >= 3 &&
             _world.PendingChunkGenerationCount == 0 &&
             _renderer.ActiveBackend is RasterVoxelRenderer deferredReady &&
@@ -806,6 +915,7 @@ public sealed partial class SandboxGame : GameWindow
         if (_gpuSmoke && _gpuSmokeFrames + 1 >= 3 &&
             _world.PendingChunkGenerationCount == 0 &&
             _renderer.ActiveBackend is RasterVoxelRenderer raster &&
+            raster.PendingVisibleMeshRebuildCount == 0 &&
             (_renderer.Kind == RenderBackendKind.Classic || _renderer.Kind == RenderBackendKind.PbrForward))
         {
             if (raster.VisibleChunkCount <= 0 || raster.CulledChunkCount <= 0)
@@ -815,11 +925,11 @@ public sealed partial class SandboxGame : GameWindow
                               $"{raster.CulledChunkCount} culled chunks.");
         }
         SwapBuffers();
+        RecordStreamingBenchmarkRenderEnd(args.Time * 1000.0);
         if (_gpuSmoke && ++_gpuSmokeFrames >= 3 &&
             _world.PendingChunkGenerationCount == 0 &&
+            (!_gpuSmokeStreaming || _gpuSmokeStreamingStage >= 2) &&
             (_renderer.ActiveBackend is not RasterVoxelRenderer closingRaster ||
-             (closingRaster.Kind != RenderBackendKind.DeferredLighting &&
-              closingRaster.Kind != RenderBackendKind.HybridPbrRaster) ||
              closingRaster.PendingVisibleMeshRebuildCount == 0) &&
             (Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") != "1" ||
              _hardwareSmokeValidated))
@@ -1000,7 +1110,7 @@ public sealed partial class SandboxGame : GameWindow
         base.OnFocusedChanged(e);
         if (!_loaded) return;
         _ui.HandleWindowFocusChanged(e.IsFocused, GetNativeWindowHandle());
-        if (!e.IsFocused && !_gpuSmoke && !_mainMenuVisible)
+        if (!e.IsFocused && !_gpuSmoke && !_streamingBenchmark && !_mainMenuVisible)
         {
             _pauseMenuVisible = true;
             SetMouseCaptured(false);
@@ -1017,7 +1127,7 @@ public sealed partial class SandboxGame : GameWindow
     {
         if (_loaded)
         {
-            if (!_gpuSmoke)
+            if (!_gpuSmoke && !_streamingBenchmark)
             {
                 SaveWorld();
                 SaveCurrentSettings();
@@ -1033,6 +1143,9 @@ public sealed partial class SandboxGame : GameWindow
     private static NativeWindowSettings CreateNativeWindowSettings(GameSettings settings) => new()
     {
         ClientSize = new Vector2i(settings.WindowWidth, settings.WindowHeight),
+        // Smoke/benchmark windows and normal launches must not interrupt another
+        // foreground application. Clicking the window still focuses it normally.
+        StartFocused = false,
         Title = "RTX Sandbox — loading…",
         API = ContextAPI.OpenGL,
         APIVersion = new Version(4, 3),
@@ -1992,10 +2105,11 @@ public sealed partial class SandboxGame : GameWindow
                 open = false;
             }
 
-            BlockDefinition[] visibleBlocks = palette
-                .Where(BlockMatchesPaletteFilter)
-                .Where(block => !_favoritesOnly || _favoriteBlocks.Contains(block.Key))
-                .ToArray();
+            BlockDefinition[] visibleBlocks = CreativePaletteOrdering.Order(
+                palette
+                    .Where(BlockMatchesPaletteFilter)
+                    .Where(block => !_favoritesOnly || _favoriteBlocks.Contains(block.Key)),
+                useSimpleGroups: _paletteCategory == "All");
             ImGui.BeginChild("StandalonePalette", new NumericsVector2(0f, -6f), ImGuiChildFlags.Borders);
             int columns = Math.Max(1, (int)(ImGui.GetContentRegionAvail().X / 112f));
             for (int index = 0; index < visibleBlocks.Length; index++)
@@ -2204,10 +2318,11 @@ public sealed partial class SandboxGame : GameWindow
                     ImGui.SameLine();
                     ImGui.Checkbox("Favorites", ref _favoritesOnly);
 
-                    BlockDefinition[] visibleBlocks = palette
-                        .Where(BlockMatchesPaletteFilter)
-                        .Where(block => !_favoritesOnly || _favoriteBlocks.Contains(block.Key))
-                        .ToArray();
+                    BlockDefinition[] visibleBlocks = CreativePaletteOrdering.Order(
+                        palette
+                            .Where(BlockMatchesPaletteFilter)
+                            .Where(block => !_favoritesOnly || _favoriteBlocks.Contains(block.Key)),
+                        useSimpleGroups: _paletteCategory == "All");
                     ImGui.TextDisabled($"Showing {visibleBlocks.Length} of {palette.Count} materials | procedural {_renderer.MaterialTextureResolution} x {_renderer.MaterialTextureResolution} PBR textures");
                     ImGui.BeginChild("BlockPaletteScroll", new NumericsVector2(0f, -4f), ImGuiChildFlags.Borders);
                     int columns = Math.Max(1, (int)(ImGui.GetContentRegionAvail().X / 112f));
@@ -3877,8 +3992,31 @@ public sealed partial class SandboxGame : GameWindow
 
     public bool SaveWorld()
     {
+        if (_streamingBenchmark)
+        {
+            _saveStatus = "Benchmark baseline is read-only.";
+            return true;
+        }
         try
         {
+            WorldSaveService.IncrementalSaveOperation? pendingAutosave = _autosaveOperation;
+            // Clear ownership first so a failed background write cannot permanently
+            // poison every later explicit save attempt.
+            _autosaveOperation = null;
+            if (pendingAutosave?.WriteTask is Task pendingWrite)
+            {
+                try
+                {
+                    pendingWrite.GetAwaiter().GetResult();
+                    pendingAutosave.ThrowIfFailed();
+                }
+                catch (Exception autosaveError)
+                {
+                    Console.Error.WriteLine($"Pending autosave failed before explicit save: {autosaveError.Message}");
+                }
+            }
+            // A partially captured autosave is only an immutable scratch snapshot; an
+            // explicit save supersedes it and never writes that older state afterward.
             _worldSaves.Save(
                 _world,
                 _player.Position,
@@ -3900,6 +4038,63 @@ public sealed partial class SandboxGame : GameWindow
             _autosaveTimer = 0.0;
             Console.Error.WriteLine(_saveStatus);
             return false;
+        }
+    }
+
+    private void UpdateAutosave(double elapsedSeconds)
+    {
+        if (_autosaveOperation is not null)
+        {
+            try
+            {
+                if (!_autosaveOperation.SnapshotComplete)
+                {
+                    _autosaveOperation.CaptureNextChunks(
+                        FrameWorkBudget.Default.MaximumSaveSnapshotsPerFrame);
+                    return;
+                }
+                if (_autosaveOperation.WriteTask is null)
+                {
+                    _autosaveOperation.StartBackgroundWrite();
+                    return;
+                }
+                if (!_autosaveOperation.IsCompleted) return;
+
+                _autosaveOperation.ThrowIfFailed();
+                _saveStatus = $"Autosaved at {DateTime.Now:HH:mm:ss}";
+                _autosaveOperation = null;
+                RefreshWorldList();
+            }
+            catch (Exception exception)
+            {
+                _saveStatus = $"Autosave failed: {exception.Message}";
+                Console.Error.WriteLine(_saveStatus);
+                _autosaveOperation = null;
+            }
+            return;
+        }
+
+        _autosaveTimer += elapsedSeconds;
+        if (_autosaveTimer < _settings.AutosaveMinutes * 60.0) return;
+        _autosaveTimer = 0.0;
+        try
+        {
+            _autosaveOperation = _worldSaves.BeginIncrementalSave(
+                _world,
+                _player.Position,
+                _clock.TimeOfDayHours,
+                _inventory,
+                _survival.Health,
+                _survival.Oxygen,
+                _survival.Hunger,
+                _progression.SnapshotCompletedIds(),
+                _progression.SawNight);
+            _saveStatus = "Autosave snapshot queued";
+        }
+        catch (Exception exception)
+        {
+            _saveStatus = $"Autosave could not start: {exception.Message}";
+            Console.Error.WriteLine(_saveStatus);
         }
     }
 

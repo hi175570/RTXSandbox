@@ -1,6 +1,17 @@
 using RTXSandbox;
 using RTXSandbox.Modding;
 
+bool streamingBenchmark = args.Contains("--world-stream-benchmark", StringComparer.OrdinalIgnoreCase);
+if (streamingBenchmark)
+{
+    string? rendererArgument = args.FirstOrDefault(argument =>
+        argument.StartsWith("--benchmark-renderer=", StringComparison.OrdinalIgnoreCase));
+    string renderer = rendererArgument?.Split('=', 2)[1] ?? "Classic";
+    Environment.SetEnvironmentVariable("RTX_SANDBOX_STREAM_BENCHMARK", "1");
+    Environment.SetEnvironmentVariable("RTX_SANDBOX_RENDERER", renderer);
+    Environment.SetEnvironmentVariable("RTX_SANDBOX_DISABLE_BEPINEX", "1");
+}
+
 string? smokeRenderer = args.Contains("--gpu-smoke-hardware", StringComparer.OrdinalIgnoreCase)
     ? "HardwareRayTracing"
     : args.Contains("--gpu-smoke-hybrid", StringComparer.OrdinalIgnoreCase)

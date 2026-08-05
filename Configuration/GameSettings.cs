@@ -9,7 +9,7 @@ using RTXSandbox.Infrastructure;
 
 public sealed class GameSettings
 {
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 6;
 
     public int Version { get; set; } = CurrentVersion;
     public int WindowWidth { get; set; } = 960;
@@ -40,6 +40,7 @@ public sealed class GameSettings
     public int PbrReflectionQuality { get; set; } = 2;
     public int ClassicLightingQuality { get; set; } = 1;
     public int HardwareRayTracingQuality { get; set; } = 2;
+    public int HardwareRayTracingReflectionBounces { get; set; } = 3;
     public HardwareRayTracingRenderStyle HardwareRayTracingRenderStyle { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool HardwareRayTracingWaxMode { get; set; }
@@ -180,7 +181,7 @@ public sealed class GameSettings
         FpsLimit = Math.Clamp(FpsLimit, 30, 360);
         RenderScale = Math.Clamp(RenderScale, 0.35f, 1f);
         if (!RenderBackendCatalog.IsImplemented(Renderer)) Renderer = RenderBackendKind.SoftwareRayTracing;
-        PathBounces = Math.Clamp(PathBounces, 1, 12);
+        PathBounces = Math.Clamp(PathBounces, 1, 50);
         PathSamplesPerFrame = Math.Clamp(PathSamplesPerFrame, 1, 8);
         PathMaxAccumulatedSamples = Math.Clamp(PathMaxAccumulatedSamples, 64, 16384);
         DeferredSpecularQuality = Math.Clamp(DeferredSpecularQuality, 0, 3);
@@ -200,6 +201,10 @@ public sealed class GameSettings
         PbrReflectionQuality = Math.Clamp(PbrReflectionQuality, 0, 3);
         ClassicLightingQuality = Math.Clamp(ClassicLightingQuality, 0, 2);
         HardwareRayTracingQuality = Math.Clamp(HardwareRayTracingQuality, 0, 3);
+        // DXR TraceRay pipelines may declare at most 31 nested calls. Reserving two
+        // levels for the primary ray and the deepest shadow ray leaves 29 real
+        // reflection layers in this recursive implementation.
+        HardwareRayTracingReflectionBounces = Math.Clamp(HardwareRayTracingReflectionBounces, 1, 29);
         if (HardwareRayTracingWaxMode && HardwareRayTracingRenderStyle == HardwareRayTracingRenderStyle.Default)
             HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.WaxMode;
         HardwareRayTracingWaxMode = false;

@@ -24,6 +24,7 @@ uniform ivec3 uSelectedCell;
 uniform int uSelectedGrid;
 uniform int uDynamicBoxCount;
 uniform ivec3 uWorldOrigin;
+uniform ivec2 uVoxelTextureOffset;
 
 const ivec3 WORLD_SIZE = ivec3(64, 576, 64);
 const float PI = 3.14159265359;
@@ -154,6 +155,15 @@ ivec3 textureCell(ivec3 worldCell)
     return worldCell - uWorldOrigin;
 }
 
+ivec3 voxelTextureCell(ivec3 worldCell)
+{
+    ivec3 logical = textureCell(worldCell);
+    return ivec3(
+        (logical.x + uVoxelTextureOffset.x) % WORLD_SIZE.x,
+        logical.y,
+        (logical.z + uVoxelTextureOffset.y) % WORLD_SIZE.z);
+}
+
 float firstBoundary(float origin, float direction, int cell)
 {
     if (direction > 0.000001) return (float(cell + 1) - origin) / direction;
@@ -261,14 +271,14 @@ Hit traceVoxelWorld(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool i
         }
 
         float cellExitDistance = min(nextBoundary.x, min(nextBoundary.y, nextBoundary.z));
-        uint material = texelFetch(uVoxels, textureCell(cell), 0).r;
+        uint material = texelFetch(uVoxels, voxelTextureCell(cell), 0).r;
         if (material != 0u && !(ignoreTransmissive && materialIsTransmissive(material)))
         {
             float materialDistance = distance;
             vec3 materialNormal = normal;
             ivec3 cellAbove = cell + ivec3(0, 1, 0);
             bool fluidAbove = materialIsFluid(material) && insideWorld(cellAbove) &&
-                materialIsFluid(texelFetch(uVoxels, textureCell(cellAbove), 0).r);
+                materialIsFluid(texelFetch(uVoxels, voxelTextureCell(cellAbove), 0).r);
             bool intersectsMaterial = !materialIsFluid(material) ||
                 intersectMicroBox(
                     rayOrigin,
@@ -524,7 +534,7 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     vec3 throughput = vec3(1.0);
     ivec3 originCell = ivec3(floor(rayOrigin));
     uint originMaterial = insideWorld(originCell)
-        ? texelFetch(uVoxels, textureCell(originCell), 0).r
+        ? texelFetch(uVoxels, voxelTextureCell(originCell), 0).r
         : 0u;
     bool travellingThroughTransmissive = materialIsTransmissive(originMaterial);
     if (travellingThroughTransmissive)
@@ -540,7 +550,7 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     float daylight;
     celestialLight(primaryLightDirection, primaryLightColor, primaryLightIntensity, daylight);
 
-    for (int bounce = 0; bounce < 12; ++bounce)
+    for (int bounce = 0; bounce < 50; ++bounce)
     {
         if (bounce >= uMaxBounces) break;
         bool wasTravellingThroughMedium = travellingThroughTransmissive;
@@ -585,6 +595,8 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
             radiance += throughput * mediumEmission;
             float ior = materialIsFluid(hit.material) ? 1.333 : materialIndexOfRefraction(hit.material);
             vec3 opticalNormal = hit.normal;
+            if (!materialIsFluid(hit.material))
+                applySurfaceDetail(hit.material, hit, mediumAlbedo, mediumRoughness, opticalNormal);
             if (materialIsFluid(hit.material))
             {
                 float phase = uTimeOfDay * 3.2;

@@ -73,7 +73,10 @@ void main()
             normal = normalize(normal - tangent * gradient.x * 1.65 - bitangent * gradient.y * 1.65);
         }
     }
-    if (uHasSelection != 0 && vGrid == uSelectedGrid && all(equal(vCell, uSelectedCell)))
+    ivec3 fragmentCell = vGrid == 0
+        ? ivec3(floor(vWorldPosition - normalize(vNormal) * 0.002))
+        : vCell;
+    if (uHasSelection != 0 && vGrid == uSelectedGrid && all(equal(fragmentCell, uSelectedCell)))
     {
         vec2 edgeDistance = abs(vUv - vec2(0.5));
         if (max(edgeDistance.x, edgeDistance.y) > 0.455)

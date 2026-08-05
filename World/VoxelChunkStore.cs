@@ -6,6 +6,27 @@ internal sealed record VoxelChunkSnapshot(
     ChunkCoordinate Coordinate,
     IReadOnlyList<StoredVoxel> Voxels,
     IReadOnlyList<StoredMicroVoxel> MicroVoxels);
+internal sealed record ChunkMeshingSnapshot(
+    ChunkCoordinate Coordinate,
+    int MinimumY,
+    int MaximumYExclusive,
+    ushort[] Blocks,
+    IReadOnlyList<StoredMicroVoxel> MicroVoxels)
+{
+    private const int Border = 1;
+    private const int WidthWithBorder = ChunkCoordinate.Size + Border * 2;
+
+    public ushort GetBlock(int worldX, int y, int worldZ)
+    {
+        int localX = worldX - Coordinate.MinimumX + Border;
+        int localZ = worldZ - Coordinate.MinimumZ + Border;
+        if ((uint)localX >= WidthWithBorder || (uint)localZ >= WidthWithBorder ||
+            y < MinimumY || y >= MaximumYExclusive)
+            return 0;
+        int localY = y - MinimumY;
+        return Blocks[localX + WidthWithBorder * (localY + (MaximumYExclusive - MinimumY) * localZ)];
+    }
+}
 
 /// <summary>
 /// Owns regular and precision voxel data by horizontal chunk. X/Z are unbounded;
@@ -168,6 +189,43 @@ internal sealed class VoxelChunkStore
         if (!chunk.IsEmpty) _chunks.Add(snapshot.Coordinate, chunk);
     }
 
+    public OwnedChunk ExtractChunk(ChunkCoordinate coordinate)
+    {
+        _chunks.Remove(coordinate, out VoxelChunk? chunk);
+        return new OwnedChunk(_minimumY, _height, chunk);
+    }
+
+    public void AdoptChunk(OwnedChunk source, ChunkCoordinate coordinate)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (source._minimumY != _minimumY || source._height != _height)
+            throw new InvalidOperationException("Cannot adopt a Chunk with different vertical bounds.");
+        if (_chunks.ContainsKey(coordinate))
+            throw new InvalidOperationException($"Chunk {coordinate} is already loaded.");
+        if (source.Take() is VoxelChunk chunk) _chunks.Add(coordinate, chunk);
+    }
+
+    internal sealed class OwnedChunk
+    {
+        internal readonly int _minimumY;
+        internal readonly int _height;
+        private VoxelChunk? _chunk;
+
+        internal OwnedChunk(int minimumY, int height, VoxelChunk? chunk)
+        {
+            _minimumY = minimumY;
+            _height = height;
+            _chunk = chunk;
+        }
+
+        internal VoxelChunk? Take()
+        {
+            VoxelChunk? chunk = _chunk;
+            _chunk = null;
+            return chunk;
+        }
+    }
+
     public bool TryGetVerticalBounds(ChunkCoordinate coordinate, out int minimumY, out int maximumYExclusive)
     {
         if (_chunks.TryGetValue(coordinate, out VoxelChunk? chunk))
@@ -209,7 +267,7 @@ internal sealed class VoxelChunkStore
     private static int LinearIndex(int x, int y, int z, int width, int height) =>
         x + width * (y + height * z);
 
-    private sealed class VoxelChunk
+    internal sealed class VoxelChunk
     {
         private readonly ushort[] _blocks;
         private readonly int[] _occupiedCellsByLayer;

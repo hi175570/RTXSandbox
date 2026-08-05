@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -94,6 +95,8 @@ public sealed class WorldSaveService
     }
     public string LastLoadSource { get; private set; } = "none";
     public bool RecoveredLastLoad { get; private set; }
+    public double LastLoadMilliseconds { get; private set; }
+    public double LastSaveMilliseconds { get; private set; }
 
     public WorldSaveService(
         BlockRegistry blocks,
@@ -280,91 +283,106 @@ public sealed class WorldSaveService
         IReadOnlyList<string>? completedObjectives = null,
         bool sawNight = false)
     {
-        if (!_singleFileMode)
+        long saveStart = Stopwatch.GetTimestamp();
+        try
         {
-            SaveChunkDirectory(
-                world, playerPosition, timeOfDay, inventory, health, oxygen, hunger,
-                completedObjectives, sawNight);
-            return;
+            if (!_singleFileMode)
+            {
+                SaveChunkDirectory(
+                    world, playerPosition, timeOfDay, inventory, health, oxygen, hunger,
+                    completedObjectives, sawNight);
+                return;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(SavePath) ?? SaveDirectory);
+            WriteChunk(
+                TemporaryPath,
+                world,
+                playerPosition,
+                timeOfDay,
+                inventory,
+                health,
+                oxygen,
+                hunger,
+                completedObjectives,
+                sawNight);
+
+            if (File.Exists(SavePath))
+            {
+                File.Copy(SavePath, BackupPath, overwrite: true);
+            }
+            File.Move(TemporaryPath, SavePath, overwrite: true);
         }
-
-        Directory.CreateDirectory(Path.GetDirectoryName(SavePath) ?? SaveDirectory);
-        WriteChunk(
-            TemporaryPath,
-            world,
-            playerPosition,
-            timeOfDay,
-            inventory,
-            health,
-            oxygen,
-            hunger,
-            completedObjectives,
-            sawNight);
-
-        if (File.Exists(SavePath))
+        finally
         {
-            File.Copy(SavePath, BackupPath, overwrite: true);
+            LastSaveMilliseconds = (Stopwatch.GetTimestamp() - saveStart) * 1000.0 / Stopwatch.Frequency;
         }
-        File.Move(TemporaryPath, SavePath, overwrite: true);
     }
 
     public bool TryLoad(VoxelWorld world, out SavedWorldState state, out string? error)
     {
-        state = default;
-        error = null;
-        LastLoadSource = "none";
-        RecoveredLastLoad = false;
-
-        string? directoryError = null;
-        if (!_singleFileMode)
+        long loadStart = Stopwatch.GetTimestamp();
+        try
         {
-            if (TryLoadChunkDirectory(world, out state, out directoryError)) return true;
+            state = default;
             error = null;
-        }
+            LastLoadSource = "none";
+            RecoveredLastLoad = false;
 
-        var candidates = new List<(string Path, bool Recovery)>();
-        if (_singleFileMode)
-        {
-            if (File.Exists(TemporaryPath)) candidates.Add((TemporaryPath, true));
-            if (File.Exists(SavePath)) candidates.Add((SavePath, false));
-            if (File.Exists(BackupPath)) candidates.Add((BackupPath, true));
-        }
-        if (!_singleFileMode && _legacyRegionPath is not null)
-        {
-            if (File.Exists(_legacyRegionPath + ".tmp")) candidates.Add((_legacyRegionPath + ".tmp", true));
-            if (File.Exists(_legacyRegionPath)) candidates.Add((_legacyRegionPath, true));
-            if (File.Exists(_legacyRegionPath + ".bak")) candidates.Add((_legacyRegionPath + ".bak", true));
-        }
-        if (!_singleFileMode && _legacySavePath is not null && File.Exists(_legacySavePath))
-        {
-            candidates.Add((_legacySavePath, true));
-        }
+            string? directoryError = null;
+            if (!_singleFileMode)
+            {
+                if (TryLoadChunkDirectory(world, out state, out directoryError)) return true;
+                error = null;
+            }
 
-        if (candidates.Count == 0)
-        {
-            error = directoryError;
+            var candidates = new List<(string Path, bool Recovery)>();
+            if (_singleFileMode)
+            {
+                if (File.Exists(TemporaryPath)) candidates.Add((TemporaryPath, true));
+                if (File.Exists(SavePath)) candidates.Add((SavePath, false));
+                if (File.Exists(BackupPath)) candidates.Add((BackupPath, true));
+            }
+            if (!_singleFileMode && _legacyRegionPath is not null)
+            {
+                if (File.Exists(_legacyRegionPath + ".tmp")) candidates.Add((_legacyRegionPath + ".tmp", true));
+                if (File.Exists(_legacyRegionPath)) candidates.Add((_legacyRegionPath, true));
+                if (File.Exists(_legacyRegionPath + ".bak")) candidates.Add((_legacyRegionPath + ".bak", true));
+            }
+            if (!_singleFileMode && _legacySavePath is not null && File.Exists(_legacySavePath))
+            {
+                candidates.Add((_legacySavePath, true));
+            }
+
+            if (candidates.Count == 0)
+            {
+                error = directoryError;
+                return false;
+            }
+
+            var failures = new List<string>();
+            if (!string.IsNullOrWhiteSpace(directoryError)) failures.Add(directoryError);
+            foreach ((string path, bool recovery) in candidates)
+            {
+                try
+                {
+                    state = ReadChunk(path, world);
+                    LastLoadSource = path;
+                    RecoveredLastLoad = recovery;
+                    return true;
+                }
+                catch (Exception exception)
+                {
+                    failures.Add($"{Path.GetFileName(path)}: {exception.Message}");
+                }
+            }
+            error = string.Join(" | ", failures);
             return false;
         }
-
-        var failures = new List<string>();
-        if (!string.IsNullOrWhiteSpace(directoryError)) failures.Add(directoryError);
-        foreach ((string path, bool recovery) in candidates)
+        finally
         {
-            try
-            {
-                state = ReadChunk(path, world);
-                LastLoadSource = path;
-                RecoveredLastLoad = recovery;
-                return true;
-            }
-            catch (Exception exception)
-            {
-                failures.Add($"{Path.GetFileName(path)}: {exception.Message}");
-            }
+            LastLoadMilliseconds = (Stopwatch.GetTimestamp() - loadStart) * 1000.0 / Stopwatch.Frequency;
         }
-
-        error = string.Join(" | ", failures);
-        return false;
     }
 
     private void SaveChunkDirectory(
@@ -378,6 +396,99 @@ public sealed class WorldSaveService
         IReadOnlyList<string>? completedObjectives,
         bool sawNight)
     {
+        CapturedWorldSave capture = CaptureWorldSave(
+            world,
+            playerPosition,
+            timeOfDay,
+            inventory,
+            health,
+            oxygen,
+            hunger,
+            completedObjectives,
+            sawNight);
+        WriteCapturedChunkDirectory(capture);
+    }
+
+    public IncrementalSaveOperation BeginIncrementalSave(
+        VoxelWorld world,
+        Vector3 playerPosition,
+        float timeOfDay,
+        IInventory? inventory = null,
+        float health = 20f,
+        float oxygen = 10f,
+        float hunger = 20f,
+        IReadOnlyList<string>? completedObjectives = null,
+        bool sawNight = false)
+    {
+        if (_singleFileMode)
+            throw new InvalidOperationException("Incremental background save requires directory world storage.");
+        return new IncrementalSaveOperation(
+            this,
+            world,
+            playerPosition,
+            timeOfDay,
+            inventory,
+            health,
+            oxygen,
+            hunger,
+            completedObjectives,
+            sawNight);
+    }
+
+    private CapturedWorldSave CaptureWorldSave(
+        VoxelWorld world,
+        Vector3 playerPosition,
+        float timeOfDay,
+        IInventory? inventory,
+        float health,
+        float oxygen,
+        float hunger,
+        IReadOnlyList<string>? completedObjectives,
+        bool sawNight)
+    {
+        VoxelChunkSnapshot[] chunks = world.SnapshotGeneratedChunks()
+            .OrderBy(chunk => chunk.Z)
+            .ThenBy(chunk => chunk.X)
+            .Select(world.SnapshotChunk)
+            .ToArray();
+        return CreateCapturedWorldSave(
+            world,
+            chunks,
+            playerPosition,
+            timeOfDay,
+            inventory,
+            health,
+            oxygen,
+            hunger,
+            completedObjectives,
+            sawNight);
+    }
+
+    private CapturedWorldSave CreateCapturedWorldSave(
+        VoxelWorld world,
+        IReadOnlyList<VoxelChunkSnapshot> chunks,
+        Vector3 playerPosition,
+        float timeOfDay,
+        IInventory? inventory,
+        float health,
+        float oxygen,
+        float hunger,
+        IReadOnlyList<string>? completedObjectives,
+        bool sawNight) =>
+        new(
+            world.Seed,
+            world.GenerationSettings.Clone(),
+            chunks,
+            CapturePhysicsGrids(world.PhysicsGrids.Grids),
+            CreatePlayerMetadata(
+                playerPosition, inventory, health, oxygen, hunger, completedObjectives, sawNight),
+            playerPosition,
+            timeOfDay,
+            _blocks.Definitions.Select(definition => definition.Key).ToArray(),
+            BuildBlockKeyTable());
+
+    private void WriteCapturedChunkDirectory(CapturedWorldSave capture)
+    {
         if (LevelPath is null) throw new InvalidOperationException("Directory save has no level manifest path.");
         string generationId = $"g_{DateTime.UtcNow:yyyyMMddHHmmssfff}_{Guid.NewGuid():N}";
         string relativeGenerationDirectory = $"regions/{generationId}";
@@ -385,25 +496,21 @@ public sealed class WorldSaveService
         Directory.CreateDirectory(generationDirectory);
 
         var regionFiles = new List<string>();
-        foreach (IGrouping<RegionCoordinate, ChunkCoordinate> region in world.SnapshotGeneratedChunks()
-                     .OrderBy(chunk => chunk.Z)
-                     .ThenBy(chunk => chunk.X)
-                     .GroupBy(RegionCoordinate.FromChunk))
+        foreach (IGrouping<RegionCoordinate, VoxelChunkSnapshot> region in capture.Chunks
+                     .GroupBy(chunk => RegionCoordinate.FromChunk(chunk.Coordinate)))
         {
             string relativePath = $"{relativeGenerationDirectory}/{region.Key.X}_{region.Key.Z}.region";
             WriteRegion(
                 ResolveWorldRelativePath(relativePath),
                 region.Key,
-                region.Select(world.SnapshotChunk).ToArray());
+                region.ToArray());
             regionFiles.Add(relativePath);
         }
 
         string physicsFile = $"{relativeGenerationDirectory}/physics.bin";
-        WritePhysicsFile(ResolveWorldRelativePath(physicsFile), world.PhysicsGrids.Grids);
+        WritePhysicsFile(ResolveWorldRelativePath(physicsFile), capture.PhysicsGrids);
         string playerFile = $"{relativeGenerationDirectory}/player.json";
-        WritePlayerMetadata(
-            ResolveWorldRelativePath(playerFile), playerPosition, inventory, health, oxygen, hunger,
-            completedObjectives, sawNight);
+        WritePlayerMetadata(ResolveWorldRelativePath(playerFile), capture.Player);
 
         string displayName = TryReadWorldMetadata(LevelPath)?.Name ?? WorldName;
         var metadata = new WorldLevelMetadata
@@ -413,7 +520,7 @@ public sealed class WorldSaveService
             // name. Autosave must not undo a rename.
             Name = string.IsNullOrWhiteSpace(displayName) ? WorldName : displayName,
             SaveGeneration = generationId,
-            Seed = world.Seed,
+            Seed = capture.Seed,
             LastSavedUtc = DateTimeOffset.UtcNow,
             Width = VoxelWorld.Width,
             Height = VoxelWorld.Height,
@@ -422,14 +529,14 @@ public sealed class WorldSaveService
             RegionSizeChunks = RegionCoordinate.SizeInChunks,
             MinimumY = VoxelWorld.MinimumY,
             MaximumY = VoxelWorld.MaximumY,
-            TimeOfDay = timeOfDay,
-            PlayerPosition = new[] { playerPosition.X, playerPosition.Y, playerPosition.Z },
-            RequiredBlockKeys = _blocks.Definitions.Select(definition => definition.Key).ToArray(),
-            BlockKeysById = BuildBlockKeyTable(),
+            TimeOfDay = capture.TimeOfDay,
+            PlayerPosition = new[] { capture.PlayerPosition.X, capture.PlayerPosition.Y, capture.PlayerPosition.Z },
+            RequiredBlockKeys = capture.RequiredBlockKeys,
+            BlockKeysById = capture.BlockKeysById,
             Regions = regionFiles.ToArray(),
             PhysicsFile = physicsFile,
             PlayerFile = playerFile,
-            Generation = world.GenerationSettings.Clone(),
+            Generation = capture.Generation.Clone(),
         };
         // After recovery, preserve the known-good backup instead of replacing it with the
         // manifest that pointed at the corrupt generation.
@@ -485,21 +592,31 @@ public sealed class WorldSaveService
         });
     }
 
-    private void WritePhysicsFile(string path, IReadOnlyList<PhysicsGrid> grids)
+    private static IReadOnlyList<SavedPhysicsGrid> CapturePhysicsGrids(IReadOnlyList<PhysicsGrid> grids) =>
+        grids.Select(grid => new SavedPhysicsGrid(
+            grid.Position,
+            grid.Orientation,
+            grid.LinearVelocity,
+            grid.AngularVelocity,
+            grid.IsSleeping,
+            grid.FractureOnImpact,
+            grid.Elements.ToArray())).ToArray();
+
+    private void WritePhysicsFile(string path, IReadOnlyList<SavedPhysicsGrid> grids)
     {
         WriteNewBinaryFile(path, writer =>
         {
             writer.Write(PhysicsMagic);
             writer.Write(PhysicsVersion);
             writer.Write(grids.Count);
-            foreach (PhysicsGrid grid in grids)
+            foreach (SavedPhysicsGrid grid in grids)
             {
                 WriteVector3(writer, grid.Position);
                 writer.Write(grid.Orientation.X); writer.Write(grid.Orientation.Y);
                 writer.Write(grid.Orientation.Z); writer.Write(grid.Orientation.W);
                 WriteVector3(writer, grid.LinearVelocity);
                 WriteVector3(writer, grid.AngularVelocity);
-                writer.Write(grid.IsSleeping);
+                writer.Write(grid.Sleeping);
                 writer.Write(grid.FractureOnImpact);
                 writer.Write(grid.Elements.Count);
                 foreach (PhysicsGridElement element in grid.Elements)
@@ -1403,8 +1520,7 @@ public sealed class WorldSaveService
             generation);
     }
 
-    private void WritePlayerMetadata(
-        string path,
+    private static PlayerMetadata CreatePlayerMetadata(
         Vector3 playerPosition,
         IInventory? inventory,
         float health,
@@ -1413,7 +1529,7 @@ public sealed class WorldSaveService
         IReadOnlyList<string>? completedObjectives,
         bool sawNight)
     {
-        var metadata = new PlayerMetadata
+        return new PlayerMetadata
         {
             FormatVersion = 1,
             Position = new[] { playerPosition.X, playerPosition.Y, playerPosition.Z },
@@ -1441,8 +1557,10 @@ public sealed class WorldSaveService
                     .Where(item => !string.IsNullOrWhiteSpace(item.ItemKey) && item.Count > 0)
                     .ToArray(),
         };
-        WriteJsonAtomically(path, metadata, keepBackup: false);
     }
+
+    private void WritePlayerMetadata(string path, PlayerMetadata metadata) =>
+        WriteJsonAtomically(path, metadata, keepBackup: false);
 
     private static int ReadSeed(string levelPath, int fallback)
     {
@@ -1488,6 +1606,122 @@ public sealed class WorldSaveService
         options.Converters.Add(new JsonStringEnumConverter());
         return options;
     }
+
+    public sealed class IncrementalSaveOperation
+    {
+        private readonly WorldSaveService _owner;
+        private readonly VoxelWorld _world;
+        private readonly ChunkCoordinate[] _coordinates;
+        private readonly List<VoxelChunkSnapshot> _chunks;
+        private readonly Vector3 _playerPosition;
+        private readonly float _timeOfDay;
+        private readonly IInventory? _inventory;
+        private readonly float _health;
+        private readonly float _oxygen;
+        private readonly float _hunger;
+        private readonly IReadOnlyList<string>? _completedObjectives;
+        private readonly bool _sawNight;
+        private int _nextChunk;
+
+        public Task? WriteTask { get; private set; }
+        public bool SnapshotComplete => _nextChunk >= _coordinates.Length;
+        public bool IsCompleted => WriteTask?.IsCompleted == true;
+        public int TotalChunkCount => _coordinates.Length;
+        public int CapturedChunkCount => _nextChunk;
+        public double SnapshotTotalMilliseconds { get; private set; }
+        public double MaximumSnapshotStepMilliseconds { get; private set; }
+        public double WriteMilliseconds { get; private set; }
+
+        internal IncrementalSaveOperation(
+            WorldSaveService owner,
+            VoxelWorld world,
+            Vector3 playerPosition,
+            float timeOfDay,
+            IInventory? inventory,
+            float health,
+            float oxygen,
+            float hunger,
+            IReadOnlyList<string>? completedObjectives,
+            bool sawNight)
+        {
+            _owner = owner;
+            _world = world;
+            _coordinates = world.SnapshotGeneratedChunks()
+                .OrderBy(chunk => chunk.Z)
+                .ThenBy(chunk => chunk.X)
+                .ToArray();
+            _chunks = new List<VoxelChunkSnapshot>(_coordinates.Length);
+            _playerPosition = playerPosition;
+            _timeOfDay = timeOfDay;
+            _inventory = inventory;
+            _health = health;
+            _oxygen = oxygen;
+            _hunger = hunger;
+            _completedObjectives = completedObjectives?.ToArray();
+            _sawNight = sawNight;
+        }
+
+        public int CaptureNextChunks(int maximumChunks)
+        {
+            if (WriteTask is not null)
+                throw new InvalidOperationException("The save snapshot is already being written.");
+            int captured = 0;
+            long started = Stopwatch.GetTimestamp();
+            while (captured < Math.Max(0, maximumChunks) && _nextChunk < _coordinates.Length)
+            {
+                _chunks.Add(_world.SnapshotChunk(_coordinates[_nextChunk++]));
+                captured++;
+            }
+            double elapsed = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+            SnapshotTotalMilliseconds += elapsed;
+            MaximumSnapshotStepMilliseconds = Math.Max(MaximumSnapshotStepMilliseconds, elapsed);
+            return captured;
+        }
+
+        public void StartBackgroundWrite()
+        {
+            if (!SnapshotComplete)
+                throw new InvalidOperationException("All Chunk snapshots must be captured before writing.");
+            if (WriteTask is not null) return;
+            CapturedWorldSave capture = _owner.CreateCapturedWorldSave(
+                _world,
+                _chunks,
+                _playerPosition,
+                _timeOfDay,
+                _inventory,
+                _health,
+                _oxygen,
+                _hunger,
+                _completedObjectives,
+                _sawNight);
+            WriteTask = Task.Run(() =>
+            {
+                long started = Stopwatch.GetTimestamp();
+                try
+                {
+                    _owner.WriteCapturedChunkDirectory(capture);
+                }
+                finally
+                {
+                    WriteMilliseconds = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+                    _owner.LastSaveMilliseconds = WriteMilliseconds;
+                }
+            });
+        }
+
+        public void ThrowIfFailed() => WriteTask?.GetAwaiter().GetResult();
+    }
+
+    private sealed record CapturedWorldSave(
+        int Seed,
+        WorldGenerationSettings Generation,
+        IReadOnlyList<VoxelChunkSnapshot> Chunks,
+        IReadOnlyList<SavedPhysicsGrid> PhysicsGrids,
+        PlayerMetadata Player,
+        Vector3 PlayerPosition,
+        float TimeOfDay,
+        string[] RequiredBlockKeys,
+        string[] BlockKeysById);
 
     private sealed class WorldLevelMetadata
     {

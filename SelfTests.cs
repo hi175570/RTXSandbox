@@ -67,6 +67,7 @@ public static class SelfTests
         Run("16-bit block ids persist above 255", TestHighBlockIdPersistence, failures);
         Run("legacy byte worlds migrate to 16-bit voxels", TestLegacyByteWorldMigration, failures);
         Run("procedural material atlas is deterministic and detailed", TestProceduralMaterialAtlas, failures);
+        Run("creative palette groups glass and uses stable color order", TestCreativePaletteOrdering, failures);
         Run("creative hotbar stores namespaced block keys", TestCreativeHotbar, failures);
         Run("mixed precision grids stay sparse and exact", TestMicroVoxelGridPromotion, failures);
         Run("micro voxels raycast at exact surfaces", TestMicroVoxelRaycast, failures);
@@ -86,7 +87,7 @@ public static class SelfTests
         Run("physics engine uses bounded collision substeps", TestPhysicsGridSubsteps, failures);
         Run("physics engine accumulates an exact fixed timestep", TestPhysicsFixedTimestep, failures);
         Run("physics backend survives world reload", TestPhysicsWorldReload, failures);
-        Run("player edits outrank streamed collision rebuilds", TestUrgentPhysicsChunkRebuild, failures);
+        Run("colliders rebuild only for shape changes and prioritize edits", TestUrgentPhysicsChunkRebuild, failures);
         Run("physics disposal is idempotent", TestPhysicsDisposal, failures);
         Run("sleeping physics grids do not invalidate rendering", TestSleepingGridInvalidation, failures);
         Run("physics grid center of mass uses volume and density", TestPhysicsGridCenterOfMass, failures);
@@ -368,6 +369,7 @@ public static class SelfTests
                 DeferredDebugView = DeferredDebugView.Normal,
                 PbrReflectionQuality = 3,
                 ClassicLightingQuality = 2,
+                HardwareRayTracingReflectionBounces = 5,
                 HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.Reference,
                 FpsLimit = 144,
             };
@@ -395,6 +397,7 @@ public static class SelfTests
                    latest.DeferredShadowQuality == 3 && latest.DeferredAmbientOcclusionQuality == 1 &&
                    latest.DeferredDebugView == DeferredDebugView.Normal &&
                    latest.ClassicLightingQuality == 2 &&
+                   latest.HardwareRayTracingReflectionBounces == 5 &&
                    latest.HardwareRayTracingRenderStyle == HardwareRayTracingRenderStyle.Reference &&
                    latest.Version == GameSettings.CurrentVersion,
                 "settings did not round-trip through the current schema");
@@ -1394,6 +1397,54 @@ public static class SelfTests
         }
         Assert(dirtColors.Count >= 12, $"natural dirt texture has only {dirtColors.Count} distinct colors");
 
+        Assert(blocks.TryGet("rtxsandbox:grass", out BlockDefinition? grass), "grass block is missing");
+        Vector3 sideBottom = Vector3.Zero;
+        Vector3 sideTop = Vector3.Zero;
+        for (int y = 0; y < ProceduralMaterialAtlas.TileSize; y++)
+        for (int x = 0; x < ProceduralMaterialAtlas.TileSize; x++)
+        {
+            Vector3 color = first.ReadColor(grass!.Id, Rendering.MaterialFace.Side, x, y);
+            if (y < ProceduralMaterialAtlas.TileSize / 4) sideBottom += color;
+            if (y >= ProceduralMaterialAtlas.TileSize * 3 / 4) sideTop += color;
+        }
+        Assert(sideTop.Y > sideBottom.Y + 4f,
+            "grass side texture is vertically inverted: the green cap is not on the top edge");
+
+        string[] surfaceGlassKeys =
+        {
+            "rtxsandbox:frosted_glass",
+            "rtxsandbox:matte_glass",
+            "rtxsandbox:mosaic_glass",
+            "rtxsandbox:acrylic_glass",
+            "rtxsandbox:ribbed_glass",
+            "rtxsandbox:etched_glass",
+        };
+        foreach (string key in surfaceGlassKeys)
+            Assert(blocks.TryGet(key, out BlockDefinition? glass) && glass!.IsTransparent &&
+                   glass.Transmission > 0f && !string.Equals(glass.TextureGenerator, "auto", StringComparison.OrdinalIgnoreCase),
+                $"surface glass '{key}' is missing explicit optical material data");
+        blocks.TryGet("rtxsandbox:mosaic_glass", out BlockDefinition? mosaicGlass);
+        var mosaicColors = new HashSet<string>();
+        for (int y = 0; y < ProceduralMaterialAtlas.TileSize; y++)
+        for (int x = 0; x < ProceduralMaterialAtlas.TileSize; x++)
+        {
+            Vector3 color = first.ReadColor(mosaicGlass!.Id, Rendering.MaterialFace.Side, x, y);
+            mosaicColors.Add($"{color.X:0.00}:{color.Y:0.00}:{color.Z:0.00}");
+        }
+        Assert(mosaicColors.Count >= 12, $"mosaic glass has only {mosaicColors.Count} visible texture colors");
+        blocks.TryGet("rtxsandbox:frosted_glass", out BlockDefinition? frostedGlass);
+        float minimumFrostRoughness = 1f;
+        float maximumFrostRoughness = 0f;
+        for (int y = 0; y < ProceduralMaterialAtlas.TileSize; y++)
+        for (int x = 0; x < ProceduralMaterialAtlas.TileSize; x++)
+        {
+            float roughness = first.ReadRoughness(frostedGlass!.Id, Rendering.MaterialFace.Side, x, y);
+            minimumFrostRoughness = Math.Min(minimumFrostRoughness, roughness);
+            maximumFrostRoughness = Math.Max(maximumFrostRoughness, roughness);
+        }
+        Assert(maximumFrostRoughness - minimumFrostRoughness > 0.1f,
+            "frosted glass has no measurable roughness texture detail");
+
         Assert(blocks.TryGet("rtxsandbox:white_concrete", out BlockDefinition? concrete), "white concrete is missing");
         Vector3 reference = first.ReadColor(concrete!.Id, Rendering.MaterialFace.Top, 0, 0);
         for (int y = 0; y < ProceduralMaterialAtlas.TileSize; y++)
@@ -1418,6 +1469,38 @@ public static class SelfTests
         Assert(restored.SelectedBlock.Key == "rtxsandbox:granite", "hotbar key did not resolve after restore");
         restored.Cycle(1);
         Assert(restored.SelectedSlot == 4, "hotbar cycling did not select the next slot");
+    }
+
+    private static void TestCreativePaletteOrdering()
+    {
+        var blocks = new BlockRegistry();
+        BlockDefinition[] ordered = CreativePaletteOrdering.Order(blocks.PlaceableDefinitions(), useSimpleGroups: true);
+        int[] glassIndices = ordered
+            .Select((block, index) => (block, index))
+            .Where(entry => entry.block.Key.Contains("glass", StringComparison.OrdinalIgnoreCase) ||
+                            entry.block.Tags.Any(tag => tag.Equals("glass", StringComparison.OrdinalIgnoreCase)))
+            .Select(entry => entry.index)
+            .ToArray();
+        Assert(glassIndices.Length >= 15, "creative palette did not find the complete glass family");
+        Assert(glassIndices[^1] - glassIndices[0] + 1 == glassIndices.Length,
+            "glass materials are split by unrelated inventory entries");
+
+        string[] expectedGlassOrder =
+        {
+            "rtxsandbox:glass", "rtxsandbox:clear_glass", "rtxsandbox:red_glass",
+            "rtxsandbox:yellow_glass", "rtxsandbox:green_glass", "rtxsandbox:blue_glass",
+            "rtxsandbox:purple_glass", "rtxsandbox:smoked_glass", "rtxsandbox:diamond_glass",
+            "rtxsandbox:prismatic_glass", "rtxsandbox:frosted_glass", "rtxsandbox:matte_glass",
+            "rtxsandbox:mosaic_glass", "rtxsandbox:acrylic_glass", "rtxsandbox:ribbed_glass",
+            "rtxsandbox:etched_glass",
+        };
+        string[] actualGlassOrder = glassIndices.Select(index => ordered[index].Key).ToArray();
+        Assert(expectedGlassOrder.SequenceEqual(actualGlassOrder),
+            $"glass inventory order is unstable: {string.Join(", ", actualGlassOrder)}");
+
+        BlockDefinition[] categoryOrder = CreativePaletteOrdering.Order(blocks.PlaceableDefinitions(), useSimpleGroups: false);
+        Assert(categoryOrder.Select(block => block.Id).SequenceEqual(categoryOrder.Select(block => block.Id).OrderBy(id => id)),
+            "selected-category ordering no longer preserves the registry order");
     }
 
     private static void TestHighBlockIdPersistence()
@@ -1893,8 +1976,10 @@ public static class SelfTests
             elements.Add(new PhysicsGridElement(x, y, z, new Vector3(x, y, z),
                 new Vector3(x + 1f, y + 1f, z + 1f), (ushort)VoxelMaterial.Stone));
         var grid = new PhysicsGrid(1, elements, Vector3.Zero);
-        Assert(grid.Elements.Count == 27 && grid.CollisionElements.Count == 26,
-            "fully enclosed cell was not removed from the collision shell");
+        Assert(grid.Elements.Count == 27 && grid.CollisionElements.Count == 1 &&
+               grid.CollisionElements[0].Minimum == Vector3.Zero &&
+               grid.CollisionElements[0].Maximum == new Vector3(3f),
+            "full-cell collision volume was not greedily merged without changing its bounds");
     }
 
     private static void TestPhysicsGridSubsteps()
@@ -1907,7 +1992,7 @@ public static class SelfTests
         grid.LinearVelocity = new Vector3(100f, 0f, 0f);
         var physics = new VoxelPhysicsSimulator(world, blocks);
         physics.Update(0.05f);
-        Assert(physics.SimulationSubstepsLastStep == 6 && physics.Status.Contains("BEPUphysics 2"),
+        Assert(physics.SimulationSubstepsLastStep == 2 && physics.Status.Contains("BEPUphysics 2"),
             "physics engine did not use the bounded collision-step budget");
     }
 
@@ -1930,7 +2015,7 @@ public static class SelfTests
             "two partial frames did not accumulate into one exact physics step");
 
         backend.Step(1f);
-        Assert(backend.CollisionStepsLastFrame == 6,
+        Assert(backend.CollisionStepsLastFrame == 2,
             "a stalled frame exceeded or failed to fill the catch-up budget");
     }
 
@@ -1943,6 +2028,7 @@ public static class SelfTests
             new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Brick) },
             new Vector3(4f, 4f, 4f));
         using var backend = new BepuPhysicsBackend(world);
+        WaitForColliderJobs(backend);
         backend.Step(1f / 120f);
         Assert(backend.DynamicBodyCount == 1 && backend.StaticChunkBodyCount == 1,
             "initial physics bodies were not registered");
@@ -1971,10 +2057,27 @@ public static class SelfTests
         world.Set(32, 0, 0, VoxelMaterial.Stone);
         using var backend = new BepuPhysicsBackend(world);
 
+        WaitForColliderJobs(backend);
+        int initialBuilds = backend.ColliderBuildCount;
         world.Set(32, 0, 0, VoxelMaterial.Glass);
         backend.Step(0f);
-        Assert(backend.IsStaticChunkRegistered(new ChunkCoordinate(2, 0)),
-            "the player-edited collision chunk waited behind the streaming rebuild backlog");
+        Assert(backend.ColliderBuildCount == initialBuilds && backend.PendingColliderBuildCount == 0,
+            "a material-only replacement rebuilt an identical static collider");
+
+        world.Set(32, 0, 0, VoxelMaterial.Air);
+        WaitForColliderJobs(backend);
+        Assert(!backend.IsStaticChunkRegistered(new ChunkCoordinate(2, 0)),
+            "the player-edited collision shape waited behind the streaming rebuild backlog");
+    }
+
+    private static void WaitForColliderJobs(BepuPhysicsBackend backend)
+    {
+        for (int attempt = 0; attempt < 2_000 && backend.PendingColliderBuildCount > 0; attempt++)
+        {
+            backend.Step(0f);
+            if (backend.PendingColliderBuildCount > 0) Thread.Sleep(1);
+        }
+        Assert(backend.PendingColliderBuildCount == 0, "background collider jobs did not drain");
     }
 
     private static void TestPhysicsDisposal()

@@ -131,7 +131,10 @@ public sealed class ProceduralMaterialAtlas
                     Vector3 earth = face == MaterialFace.Bottom
                         ? new Vector3(0.25f, 0.125f, 0.05f)
                         : new Vector3(0.32f, 0.18f, 0.075f);
-                    float mossLine = face == MaterialFace.Side ? SmoothStep(0.62f, 0.94f, 1f - v + (broad - 0.5f) * 0.28f) : 0f;
+                    // Atlas row zero maps to the bottom edge of side faces in every
+                    // renderer. Keep the grass transition at increasing V so grass is
+                    // only on the top of the block instead of growing upward from below.
+                    float mossLine = face == MaterialFace.Side ? SmoothStep(0.62f, 0.94f, v + (broad - 0.5f) * 0.28f) : 0f;
                     color = Vector3.Lerp(Vary(earth, broad, variation), Vary(definition.Albedo, fine, variation), mossLine);
                 }
                 else
@@ -261,6 +264,66 @@ public sealed class ProceduralMaterialAtlas
                 roughness = definition.Roughness;
                 break;
 
+            case "frosted_glass":
+                float frostCloud = OctaveNoise(seed ^ 0xd1b54a35u, x, y, 83);
+                float frostGrain = Noise(seed ^ 0x94d049bbu, x, y, 97);
+                color = Vector3.Lerp(
+                    Vary(definition.Albedo, frostCloud, variation * 0.22f),
+                    Vector3.One,
+                    0.04f + frostGrain * 0.1f);
+                height = 0.3f + frostCloud * 0.42f + (frostGrain - 0.5f) * 0.2f;
+                roughness = Math.Clamp(definition.Roughness + (frostGrain - 0.5f) * 0.2f, 0.45f, 1f);
+                break;
+
+            case "matte_glass":
+                float matteGrain = Noise(seed ^ 0x369dea0fu, x, y, 109);
+                color = Vary(definition.Albedo, matteGrain, variation * 0.12f);
+                height = 0.38f + matteGrain * 0.24f;
+                roughness = Math.Clamp(definition.Roughness + (matteGrain - 0.5f) * 0.12f, 0.72f, 1f);
+                break;
+
+            case "mosaic_glass":
+                int mosaicX = x / 4;
+                int mosaicY = y / 4;
+                bool mosaicJoint = x % 4 == 0 || y % 4 == 0;
+                Vector3 mosaicTint = ((mosaicX + mosaicY * 3) & 3) switch
+                {
+                    0 => definition.Albedo,
+                    1 => new Vector3(0.92f, 0.22f, 0.16f),
+                    2 => new Vector3(0.16f, 0.72f, 0.34f),
+                    _ => new Vector3(0.72f, 0.3f, 0.92f),
+                };
+                color = mosaicJoint
+                    ? new Vector3(0.055f, 0.065f, 0.075f)
+                    : Vary(mosaicTint, broad, variation * 0.3f);
+                height = mosaicJoint ? 0.18f : 0.58f + (broad - 0.5f) * 0.12f;
+                roughness = mosaicJoint ? 0.82f : definition.Roughness + (fine - 0.5f) * 0.1f;
+                break;
+
+            case "acrylic_glass":
+                float acrylicBand = MathF.Sin((u * 0.74f + v * 0.21f + broad * 0.04f) * MathF.PI * 18f);
+                bool acrylicScratch = Noise(seed ^ 0x7f4a7c15u, x / 3, y, 127) > 0.93f;
+                color = Vary(definition.Albedo, broad, variation * 0.12f) * (acrylicScratch ? 0.88f : 1f);
+                height = 0.5f + acrylicBand * 0.025f + (acrylicScratch ? 0.09f : 0f);
+                roughness = Math.Clamp(definition.Roughness + (acrylicScratch ? 0.16f : 0f), 0.03f, 0.32f);
+                break;
+
+            case "ribbed_glass":
+                float rib = MathF.Sin(u * MathF.PI * 8f) * 0.5f + 0.5f;
+                color = Vary(definition.Albedo, rib * 0.7f + broad * 0.3f, variation * 0.25f);
+                height = 0.22f + rib * 0.62f;
+                roughness = Math.Clamp(definition.Roughness + (1f - rib) * 0.12f, 0.16f, 0.62f);
+                break;
+
+            case "etched_glass":
+                float etchedWave = MathF.Sin((u + v) * MathF.PI * 8f) *
+                                    MathF.Sin((u - v) * MathF.PI * 8f);
+                float etchedMask = SmoothStep(0.28f, 0.72f, MathF.Abs(etchedWave));
+                color = Vector3.Lerp(definition.Albedo * 0.82f, definition.Albedo * 1.08f, etchedMask);
+                height = 0.35f + etchedMask * 0.3f + (fine - 0.5f) * 0.08f;
+                roughness = Math.Clamp(definition.Roughness + (1f - etchedMask) * 0.22f, 0.36f, 0.92f);
+                break;
+
             default:
                 color = Vary(definition.Albedo, broad, variation);
                 break;
@@ -311,6 +374,9 @@ public sealed class ProceduralMaterialAtlas
     {
         "solid" => 0f,
         "glass" => 0.025f,
+        "frosted_glass" or "matte_glass" => 0.65f,
+        "mosaic_glass" or "ribbed_glass" or "etched_glass" => 0.42f,
+        "acrylic_glass" => 0.16f,
         "grid" or "circuit" or "tiles" or "panels" => 0.055f,
         "brick" => 0.09f,
         "sand" => 0.12f,

@@ -109,8 +109,19 @@ void main()
         vec2 screenUv = gl_FragCoord.xy / max(uScreenSize, vec2(1.0));
         float distortion = vFluid != 0 ? 0.018 : 0.006;
         distortion *= 0.35 + float(max(uWaterQuality, uTransparencyQuality)) * 0.22;
-        vec3 refracted = texture(uSceneColor,
-            clamp(screenUv + normal.xz * distortion, vec2(0.002), vec2(0.998))).rgb;
+        vec2 refractedUv = clamp(screenUv + normal.xz * distortion, vec2(0.002), vec2(0.998));
+        vec3 refracted = texture(uSceneColor, refractedUv).rgb;
+        float blurRadius = materialDetail.r * materialDetail.r *
+            (0.0015 + float(max(uTransparencyQuality, 1)) * 0.0012);
+        if (vFluid == 0 && blurRadius > 0.0005)
+        {
+            vec3 blurred = refracted;
+            blurred += texture(uSceneColor, clamp(refractedUv + vec2( blurRadius, 0.0), vec2(0.002), vec2(0.998))).rgb;
+            blurred += texture(uSceneColor, clamp(refractedUv + vec2(-blurRadius, 0.0), vec2(0.002), vec2(0.998))).rgb;
+            blurred += texture(uSceneColor, clamp(refractedUv + vec2(0.0,  blurRadius), vec2(0.002), vec2(0.998))).rgb;
+            blurred += texture(uSceneColor, clamp(refractedUv + vec2(0.0, -blurRadius), vec2(0.002), vec2(0.998))).rgb;
+            refracted = mix(refracted, blurred * 0.2, clamp(materialDetail.r, 0.0, 0.92));
+        }
         vec3 reflected = sky(reflect(-viewDirection, normal), daylight);
         float fresnel = 0.035 + 0.965 * pow(1.0 - max(dot(normal, viewDirection), 0.0), 5.0);
         if (vFluid != 0)
@@ -152,7 +163,10 @@ void main()
         color *= faceLight;
     }
 
-    if (uHasSelection != 0 && vGrid == uSelectedGrid && all(equal(vCell, uSelectedCell)))
+    ivec3 fragmentCell = vGrid == 0
+        ? ivec3(floor(vWorldPosition - normalize(vNormal) * 0.002))
+        : vCell;
+    if (uHasSelection != 0 && vGrid == uSelectedGrid && all(equal(fragmentCell, uSelectedCell)))
     {
         // Mesh UVs are face-local, so the outline stays attached to a rotated Grid.
         // World-space fract(position) made the frame remain axis-aligned while its body moved.

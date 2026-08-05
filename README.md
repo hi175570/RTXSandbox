@@ -1,10 +1,29 @@
 # RTX Sandbox
 
+## 目前狀態（2026-08-06）
+
+RTX Sandbox 是 Windows／.NET 6 的體素 Renderer Sandbox，目前可在遊戲內切換六條實際存在的渲染管線：
+
+- Classic Raster
+- PBR Forward
+- Deferred GBuffer Lighting
+- Hybrid PBR Raster
+- OpenGL Compute Path Tracing
+- Direct3D 12 Hardware DXR
+
+Hardware DXR 會建立真正的 D3D12 Ray Tracing Pipeline、BLAS、TLAS、Shader Table 並執行 `DispatchRays`。目前支援材質貼圖與法線細節、方向光陰影、透明／折射、發光方塊局部光、多重鏡面反射，以及 Physics Grid、Micro Voxel 和串流世界幾何。初始化失敗時會顯示原因並安全回退，不會把 Compute Path Tracing 冒充為 Hardware RT。
+
+Compute Path Tracing 可設定 1–50 次反彈。Hardware DXR 預設 3 次、最高 29 個完整反射層；D3D12 遞迴 Pipeline 的 API 硬上限是 31，需保留主射線與最深層陰影射線。到達設定上限後不再發出下一條反射射線。
+
+材質庫包含透明和彩色玻璃、煙燻／鑽石／稜鏡玻璃，以及具程序色彩、高度、粗糙度與法線細節的磨砂、霧面、馬賽克、壓克力、壓紋和蝕刻玻璃。Raster 使用粗糙度控制折射模糊；Compute PT 與 Hardware DXR 會讓表面細節實際改變透明射線。Hardware DXR 的發光方塊會發射真正的可見性射線，不透明牆會阻擋其局部光，透明表面仍可透光。
+
+目前尚未包含穩定的相機暗箱／小孔成像、完整多重反彈 GI、焦散或降噪器；這些不列為已完成功能。
+
 ## 0.13 Engine Architecture
 
-- 新增可在遊戲內即時切換的渲染後端：`Compute Path Tracing`、`PBR Forward`、`Classic`。選擇會寫入 `settings.json`。
+- 可在遊戲內即時切換 `Classic`、`PBR Forward`、`Deferred`、`Hybrid PBR Raster`、`Compute Path Tracing` 與 `Hardware DXR`；選擇會寫入 `settings.json`。
 - `settings.json` 使用版本化驗證、落盤後原子替換與 `.bak` 恢復；主檔損壞時會載入上一份有效設定。
-- `Hardware Ray Tracing` 與 `Deferred Lighting` 會顯示在設定頁但鎖定為「規劃中」；目前沒有用名稱或假選項冒充 DXR／GBuffer 實作。
+- `Hardware Ray Tracing` 已使用 Direct3D 12 DXR，`Deferred Lighting` 已使用 GBuffer、陰影、SSAO／SSR、HDR／Bloom 與透明 forward pass；兩者均為可執行後端。
 - `RenderBackendHost` 讓遊戲迴圈與模組依賴渲染介面；切換失敗會保留上一個可用後端。
 - PBR／Classic 都使用真正的 voxel mesh、16×16 程序材質 atlas、micro-voxel 幾何與選取框，不是空白模式。
 - Mod API 已拆出 `Blocks`、`World`、`Rendering`、`Physics` contracts，並新增 `IRenderBackendService` 與 `IVoxelPhysicsService`。
@@ -12,12 +31,15 @@
 - 結構物理是固定世界規則，已移除失效的 Off／Simple／Full 設定與 Mod 假切換；Mod API 改為回報 BEPU backend、Grid 和 substep 狀態。
 - 詳細的現況邊界、依賴方向與下一階段拆分原則見 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-驗證三個圖形模式：
+驗證圖形模式：
 
 ```powershell
 dotnet run -c Release -- --gpu-smoke
 dotnet run -c Release -- --gpu-smoke-pbr
 dotnet run -c Release -- --gpu-smoke-classic
+dotnet run -c Release -- --gpu-smoke-deferred
+dotnet run -c Release -- --gpu-smoke-hybrid
+dotnet run -c Release -- --gpu-smoke-hardware
 dotnet run -c Release -- --gpu-smoke-menu
 dotnet run -c Release -- --gpu-smoke-world-creator
 ```
@@ -70,10 +92,11 @@ Creative voxel building
 
 ## 目前已完成
 
-- OpenGL 4.3 compute-shader 路徑追蹤器，支援 1–12 次反射／折射、累積取樣、動態解析度與曝光。
+- OpenGL 4.3 compute-shader 路徑追蹤器，支援 1–50 次反射／折射、累積取樣、動態解析度與曝光。
+- Direct3D 12 DXR 後端，支援硬體 BLAS／TLAS、Ray Generation／Miss／Closest Hit、Shader Table、陰影射線、多重反射、透明折射與發光方塊遮蔽。
 - 可調時間循環：暫停、快轉、倒轉、日出、正午、日落、午夜。
 - 第一人稱、碰撞飛行、noclip 自由相機；水為非實體、可游泳、可直接被其他材質取代。
-- 196 個基礎體素定義（194 種可建造材質，另含空氣與不可破壞基岩），以 Nature、Wood、Building、Metal、Technology、Optical、Lighting、Special 分類管理。
+- 201 個基礎體素定義，以 Nature、Wood、Building、Metal、Technology、Optical、Lighting、Special 分類管理。
 - Creative Library 使用等角 3D 方塊預覽，支援分類、名稱／key／tag 搜尋、收藏與最近使用；材質 tooltip 可查看 metallic、roughness、transmission、IOR 與 emission。
 - 五種可建立場景：Flat、Natural、Pure Nature、Void、Showcase；世界 preset、biome、seed 與選項會隨存檔保存。
 - 草原、森林、竹林、沙漠、雪地、山地、沼澤及 Auto 生態；Natural 不產生人工建築，Pure Nature 另有宏觀生態過渡、河帶與洞穴。
@@ -84,10 +107,10 @@ Creative voxel building
 - 六面結構物理：失去支撐的連通結構會整體脫離成可連續平移、旋轉、碰撞與休眠的局部 Grid；斜角接觸不傳遞支撐。
 - 網格歸屬工具：左鍵選目標 Grid，右鍵把目前方塊轉入目標；只接受座標對齊且六面相鄰的完整方塊。
 - 基本的失去支撐斷裂永遠屬於世界規則，不再是舊式落沙開關；撞擊二次斷裂要等 BEPU 接觸事件正式接入後才會重新提供設定。
-- 世界 Chunk 會註冊為 BEPU 靜態碰撞體，斷裂 Grid 會轉成動態 compound body；BEPU 負責接觸流形、摩擦、零回彈、CCD、旋轉、堆疊和休眠，並以固定 120 Hz、最多六步追幀。F3 可查看實際步數。
+- 世界 Chunk 會註冊為 BEPU 靜態碰撞體，斷裂 Grid 會轉成動態 compound body；BEPU 負責接觸流形、摩擦、零回彈、CCD、旋轉、堆疊和休眠，並以固定 120 Hz、最多兩步追幀。F3 可查看實際步數。
 - PBR Forward 與 Classic 使用 16×16 Chunk GPU mesh；一般方塊修改只重建所屬與必要的面鄰接 Chunk，移動 Grid 使用獨立動態 mesh。
 - 常規與精密體素資料由稀疏 Chunk 實際持有；空 Chunk 會自動釋放，舊版線性資料只在存檔與 compute GPU 上傳邊界產生。
-- 目錄世界以每個 16×16 Chunk 的獨立稀疏檔保存；Chunk、Physics、Player 全部寫完後才原子切換 `level.json`，損壞時以 `.bak` 恢復上一個完整世代，空世界不寫空 Chunk。
+- 目錄世界以 Region 檔保存，每個 Region 合併 32×32 個 16×16 Chunk；Chunk、Physics、Player 全部寫完後才原子切換 `level.json`，損壞時以 `.bak` 恢復上一個完整世代，空世界不寫空 Region。
 - 方塊 ID 依 namespaced key 重映射；舊版第 1–7 版單區域存檔可讀取，下一次保存會遷移成新的分 Chunk 世代格式。
 - 主選單具備多世界瀏覽與載入；同名建立會拒絕而非靜默覆寫，切換前若目前世界保存失敗也會取消切換。
 - BepInEx 6 CoreCLR、HarmonyX、設定介面與依賴檢查已內置。
@@ -124,7 +147,7 @@ Creative voxel building
 
 ## 編譯與 Visual Studio
 
-需求：Windows、64 位元 .NET 6 SDK、OpenGL 4.3 以上 GPU。NVIDIA RTX 顯示卡適合較高反射次數，但目前後端不綁 NVIDIA SDK。
+需求：Windows、64 位元 .NET 6 SDK、OpenGL 4.3 以上 GPU。Hardware Ray Tracing 另需支援 DXR Tier 1.0 以上的 D3D12 顯示卡與驅動；不使用 NVIDIA 專屬 SDK。
 
 直接用 Visual Studio 2022 開啟 `RTXSandbox.sln`，將 `RTXSandbox` 設為啟動專案並選擇 x64／Release 即可。Solution 目前只包含本體與 Mod API；不附帶或預載任何示範 Mod。
 
@@ -150,6 +173,8 @@ Gameplay/PlayerController      -> 第一人稱、碰撞飛行、noclip、水中�
 World/VoxelWorld               -> 體素資料、生成、碰撞查詢與修改事件
 World/BlockRegistry            -> 4,096 槽 16-bit 材質表與 last-writer-wins 覆蓋
 Rendering/RayTracingRenderer   -> compute path tracer 與 GPU 資源
+Rendering/Backends/RasterVoxelRenderer -> Classic、Forward、Deferred、Hybrid raster
+Rendering/Backends/DxrHardwareRenderer -> D3D12 DXR、BLAS／TLAS、Shader Table 與 Trace Rays
 Persistence/WorldSaveService   -> 分 Chunk 世代提交、完整備份恢復與舊存檔遷移
 RTXSandbox.ModAPI              -> 穩定的公開 Mod 合約
 Modding/ModHost                -> BepInEx 與服務／事件橋接

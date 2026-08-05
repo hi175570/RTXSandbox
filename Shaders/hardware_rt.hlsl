@@ -73,6 +73,7 @@ cbuffer CameraConstants : register(b0)
     float4 CameraUp;
     float4 SunDirection;
     float4 RenderOptions;
+    float4 TraceOptions;
 };
 
 [shader("raygeneration")]
@@ -106,7 +107,7 @@ void RayGen()
     // Alpha stores a diagnostic bit mask consumed by the strict DXR smoke test.
     // bit 0: primary hit, bit 1: shadow ray, bit 2: occluded, bit 3: reflection ray,
     // bit 4: Physics Grid hit, bit 5: shared material atlas sampled,
-    // bit 6: wax mode reflection ray.
+    // bit 6: wax mode reached its third reflected ray.
     // The OpenGL display pass uses RGB only.
     Output[pixel] = float4(payload.colorAndDistance.rgb, payload.diagnosticFlags / 255.0);
 }
@@ -130,17 +131,47 @@ void Miss(inout Payload payload)
 [shader("anyhit")]
 void AnyHit(inout Payload payload, Attributes attributes)
 {
-    // Primary/reflection/refraction rays still accept the nearest surface normally.
-    // Only the accept-first shadow ray needs material-aware traversal: transparent
+    // The accept-first shadow ray needs material-aware traversal: transparent
     // water/glass must not become an opaque black shadow caster.
-    if ((RayFlags() & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) == 0)
+    if ((RayFlags() & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) != 0)
+    {
+        uint first = PrimitiveIndex() * 3;
+        WorldVertex shadowVertex = LoadVertex(first);
+        bool emissiveVisibilityRay = (RayFlags() & RAY_FLAG_CULL_BACK_FACING_TRIANGLES) == 0;
+        bool targetEmitterSurface = emissiveVisibilityRay &&
+            dot(shadowVertex.emission, shadowVertex.emission) > 0.000001;
+        if (RayTCurrent() < 0.09 || shadowVertex.transmission > 0.001 || targetEmitterSurface)
+            IgnoreHit();
+        else
+            AcceptHitAndEndSearch();
         return;
+    }
 
+    // At the configured reflection limit a mirror must not turn into its white
+    // base material. Treat only reflective opaque candidates as absent and let
+    // this same DXR ray continue to real geometry or the sky behind the mirror.
+    uint maximumReflectionBounces = (uint)round(TraceOptions.x);
+    if (payload.depth < maximumReflectionBounces)
+        return;
     uint first = PrimitiveIndex() * 3;
-    if (RayTCurrent() < 0.09 || LoadVertex(first).transmission > 0.001)
+    WorldVertex vertex0 = LoadVertex(first);
+    if (vertex0.transmission > 0.001)
+        return;
+    float2 barycentrics = attributes.barycentrics;
+    float3 bary = float3(1.0 - barycentrics.x - barycentrics.y,
+                         barycentrics.x, barycentrics.y);
+    WorldVertex vertex1 = LoadVertex(first + 1);
+    WorldVertex vertex2 = LoadVertex(first + 2);
+    float2 uv = vertex0.uv * bary.x + vertex1.uv * bary.y + vertex2.uv * bary.z;
+    float roughness = MaterialDetailAtlas.Load(
+        int3(MaterialAtlasTexel(vertex0.materialId, vertex0.materialFace, uv), 0)).r;
+    uint quality = (uint)round(RenderOptions.x);
+    uint renderStyle = (uint)round(RenderOptions.y);
+    bool reflective = quality >= 2 &&
+        (renderStyle == 1 || renderStyle == 2 || vertex0.metallic > 0.15 ||
+         roughness < (quality >= 3 ? 0.72 : 0.45));
+    if (reflective)
         IgnoreHit();
-    else
-        AcceptHitAndEndSearch();
 }
 
 [shader("closesthit")]
@@ -212,6 +243,7 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         normal = normalize(normal - tangent * heightGradient.x * 1.65 - bitangent * heightGradient.y * 1.65);
     }
     uint quality = (uint)round(RenderOptions.x);
+    uint maximumReflectionBounces = (uint)round(TraceOptions.x);
 
     if (payload.depth == 0 && transmission > 0.001)
     {
@@ -219,7 +251,9 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         float3 hitPosition = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
         float3 facingNormal = dot(WorldRayDirection(), normal) < 0.0 ? normal : -normal;
         bool fluid = (materialFlags & 1) != 0;
-        float eta = fluid ? (1.0 / 1.333) : (1.0 / 1.52);
+        float encodedIor = float((materialFlags >> 8) & 0xffu) / 100.0;
+        float materialIor = encodedIor >= 1.0 ? encodedIor : 1.52;
+        float eta = fluid ? (1.0 / 1.333) : (1.0 / materialIor);
         float3 refractedDirection = refract(WorldRayDirection(), facingNormal, eta);
         if (dot(refractedDirection, refractedDirection) < 0.001)
             refractedDirection = reflect(WorldRayDirection(), facingNormal);
@@ -263,7 +297,7 @@ void ClosestHit(inout Payload payload, Attributes attributes)
 
     // This is a real secondary DXR shadow ray. Occlusion leaves visible at zero;
     // only the dedicated shadow miss record changes it to one.
-    if (payload.depth == 0 && quality >= 1 && direct > 0.0)
+    if (quality >= 1 && direct > 0.0)
     {
         payload.diagnosticFlags |= 2;
         ShadowPayload shadowPayload;
@@ -299,6 +333,28 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         float attenuation = pow(saturate(1.0 - distanceToLight / light.radius), 2.0) /
             (1.0 + distanceToLight * distanceToLight * 0.08);
         float lightDiffuse = max(dot(normal, lightDirection), 0.0);
+        if (lightDiffuse <= 0.0) continue;
+
+        // A glowing block is a real DXR light only when the segment from this
+        // surface to the emitter is unobstructed. The local visibility ray omits
+        // back-face culling as a marker for AnyHit to ignore the target emitter's
+        // own front face while opaque walls still terminate the ray.
+        ShadowPayload emissiveShadowPayload;
+        emissiveShadowPayload.visible = 0;
+        RayDesc emissiveShadowRay;
+        emissiveShadowRay.Origin = hitPosition + normal * 0.045;
+        emissiveShadowRay.Direction = lightDirection;
+        emissiveShadowRay.TMin = 0.025;
+        emissiveShadowRay.TMax = max(distanceToLight - 0.02, 0.026);
+        payload.diagnosticFlags |= 2;
+        TraceRay(Scene,
+            RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            0xff, 0, 0, 1, emissiveShadowRay, emissiveShadowPayload);
+        if (emissiveShadowPayload.visible == 0)
+        {
+            payload.diagnosticFlags |= 4;
+            continue;
+        }
         localColor += albedo * light.color * light.intensity * attenuation * lightDiffuse * 3.2;
     }
 
@@ -321,10 +377,13 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         reflectivity = metallic > 0.15 ? saturate(reflectivity * 2.4) : min(reflectivity * 2.4, 0.30);
     bool reflectionAllowed = quality >= 2 &&
         (waxMode || referenceMode || metallic > 0.15 || roughness < (quality >= 3 ? 0.72 : 0.45));
-    if (payload.depth == 0 && reflectionAllowed && reflectivity > 0.015)
+    // At the requested limit, keep this hit's actual DXR direct lighting/shadows
+    // but emit no extra reflection ray. This avoids both a black terminal layer
+    // and a non-recursive "fake world" beyond the configured reflection count.
+    if (payload.depth < maximumReflectionBounces && reflectionAllowed && reflectivity > 0.015)
     {
         payload.diagnosticFlags |= 8;
-        if (waxMode)
+        if (waxMode && payload.depth >= 2)
             payload.diagnosticFlags |= 64;
         RayDesc reflectionRay;
         reflectionRay.Origin = WorldRayOrigin() + WorldRayDirection() * RayTCurrent() + normal * 0.025;
@@ -334,9 +393,10 @@ void ClosestHit(inout Payload payload, Attributes attributes)
 
         Payload reflectionPayload;
         reflectionPayload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
-        reflectionPayload.depth = 1;
+        reflectionPayload.depth = payload.depth + 1;
         reflectionPayload.diagnosticFlags = 0;
         TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, reflectionRay, reflectionPayload);
+        payload.diagnosticFlags |= reflectionPayload.diagnosticFlags;
 
         float viewFresnel = pow(1.0 - saturate(dot(-WorldRayDirection(), normal)), 5.0);
         float reflectionWeight = saturate(reflectivity + viewFresnel * (1.0 - reflectivity));
@@ -349,7 +409,9 @@ void ClosestHit(inout Payload payload, Attributes attributes)
             // Dielectric blocks are opaque: retain nearly all diffuse/albedo lighting
             // and layer only a bounded reflected highlight over it. This avoids the
             // previous glass-like look caused by replacing the surface with the scene.
-            float solidReflectionWeight = min(reflectionWeight, waxMode ? 0.28 : 0.16);
+            float solidReflectionWeight = min(
+                waxMode ? reflectionWeight * 1.7 : reflectionWeight,
+                waxMode ? 0.48 : 0.16);
             localColor = localColor * (1.0 - solidReflectionWeight * 0.35) +
                 reflectionPayload.colorAndDistance.rgb * solidReflectionWeight;
         }

@@ -45,4 +45,5 @@ public readonly record struct RenderQualitySettings(
     int PbrReflectionQuality,
     int ClassicLightingQuality,
     int HardwareRayTracingQuality,
+    int HardwareRayTracingReflectionBounces,
     HardwareRayTracingRenderStyle HardwareRayTracingRenderStyle);
