@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0-android</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <SupportedOSPlatformVersion>26.0</SupportedOSPlatformVersion>
+    <ApplicationId>com.rtxsandbox.game</ApplicationId>
+    <ApplicationTitle>RTX Sandbox</ApplicationTitle>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>0.1.0-android-v1</ApplicationDisplayVersion>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <!-- The V1 APK must be independently installable with adb. Do not depend on
+         IDE fast-deployment files outside the package. -->
+    <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
+    <AndroidUseSharedRuntime>false</AndroidUseSharedRuntime>
+    <RuntimeIdentifiers Condition="'$(RuntimeIdentifier)' == ''">android-arm64;android-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <AndroidLinkMode>SdkOnly</AndroidLinkMode>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj" />
+    <PackageReference Include="BepuPhysics" Version="2.4.0" />
+    <PackageReference Include="ImGui.NET" Version="1.91.6.1" ExcludeAssets="native;build" />
+    <Compile Include="..\World\*.cs" Link="Shared\World\%(Filename)%(Extension)" />
+    <Compile Include="..\Gameplay\PlayerController.cs" Link="Shared\Gameplay\PlayerController.cs" />
+    <Compile Include="..\Gameplay\Camera.cs" Link="Shared\Gameplay\Camera.cs" />
+    <Compile Include="..\Gameplay\CreativeHotbar.cs" Link="Shared\Gameplay\CreativeHotbar.cs" />
+    <Compile Include="..\Gameplay\CreativePaletteOrdering.cs" Link="Shared\Gameplay\CreativePaletteOrdering.cs" />
+    <Compile Include="..\Gameplay\ItemRegistry.cs" Link="Shared\Gameplay\ItemRegistry.cs" />
+    <Compile Include="..\Gameplay\PlayerInventory.cs" Link="Shared\Gameplay\PlayerInventory.cs" />
+    <Compile Include="..\Gameplay\GameActions.cs" Link="Shared\Gameplay\GameActions.cs" />
+    <Compile Include="..\Gameplay\MicroBuildSystem.cs" Link="Shared\Gameplay\MicroBuildSystem.cs" />
+    <Compile Include="..\Gameplay\PlacementRules.cs" Link="Shared\Gameplay\PlacementRules.cs" />
+    <Compile Include="..\Gameplay\VoxelPoint.cs" Link="Shared\Gameplay\VoxelPoint.cs" />
+    <Compile Include="..\Gameplay\VoxelPhysicsSimulator.cs" Link="Shared\Gameplay\VoxelPhysicsSimulator.cs" />
+    <Compile Include="..\Gameplay\BepuPhysicsBackend.cs" Link="Shared\Gameplay\BepuPhysicsBackend.cs" />
+    <Compile Include="..\Configuration\UiLanguage.cs" Link="Shared\Configuration\UiLanguage.cs" />
+    <Compile Include="..\UI\UiText.cs" Link="Shared\UI\UiText.cs" />
+    <Compile Include="..\UI\SharedImGuiScreens.cs" Link="Shared\UI\SharedImGuiScreens.cs" />
+    <Compile Include="..\Infrastructure\RuntimePaths.cs" Link="Shared\Infrastructure\RuntimePaths.cs" />
+    <Compile Include="..\Infrastructure\FrameWorkBudget.cs" Link="Shared\Infrastructure\FrameWorkBudget.cs" />
+    <Compile Include="..\Infrastructure\Platform\PlatformServices.cs" Link="Shared\Infrastructure\PlatformServices.cs" />
+    <Compile Include="..\Persistence\WorldSaveService.cs" Link="Shared\Persistence\WorldSaveService.cs" />
+    <AndroidAsset Include="..\Content\Base\**\*.json">
+      <Link>Content\Base\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </AndroidAsset>
+  </ItemGroup>
+</Project>

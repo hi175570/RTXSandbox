@@ -15,6 +15,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
     private readonly ShaderProgram _compute;
     private readonly ShaderProgram _display;
     private readonly int _voxelTexture;
+    private readonly int _fluidLevelTexture;
     private readonly int _microCellTexture;
     private readonly int _microBoxBuffer;
     private readonly int _dynamicBoxBuffer;
@@ -76,6 +77,8 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
 
         _vertexArray = GL.GenVertexArray();
         _voxelTexture = CreateVoxelTexture(world.CreateRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ));
+        _fluidLevelTexture = CreateFluidLevelTexture(
+            world.CreateFluidRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ, VoxelWorld.Width, VoxelWorld.Depth));
         _microCellTexture = CreateMicroCellTexture();
         _microBoxBuffer = GL.GenBuffer();
         _dynamicBoxBuffer = GL.GenBuffer();
@@ -88,10 +91,12 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         UploadMicroVoxels();
         UploadDynamicGrids();
         _world.VoxelChanged += OnVoxelChanged;
+        _world.FluidLevelChanged += OnFluidLevelChanged;
         _world.WorldReloaded += UploadAllVoxels;
         _world.MicroVoxelsChanged += UploadMicroVoxels;
         _world.ChunkGenerated += OnChunkGenerated;
         _world.PhysicsGrids.Changed += OnPhysicsGridsChanged;
+        _world.AnalyticSpheres.Changed += OnAnalyticSpheresChanged;
         _blocks.DefinitionsChanged += UploadMaterialTextures;
         Resize(width, height, renderScale);
     }
@@ -168,6 +173,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             {
                 _windowDirty = true;
             }
+            _dynamicGridsDirty = true;
         }
         if (_windowDirty)
         {
@@ -186,7 +192,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         // set for every substep.
         if (_dynamicGridsDirty)
         {
-            UploadDynamicGrids();
+            UploadDynamicGrids(cameraPosition);
             _dynamicGridsDirty = false;
         }
         Vector3 forward = camera.Forward;
@@ -201,7 +207,15 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform3(_compute.Uniform("uCameraUp"), up.X, up.Y, up.Z);
         GL.Uniform1(_compute.Uniform("uTanHalfFov"), MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f));
         GL.Uniform1(_compute.Uniform("uTimeOfDay"), timeOfDay);
-        GL.Uniform1(_compute.Uniform("uMaxBounces"), Math.Clamp(quality.PathBounces, 1, 12));
+        GL.Uniform1(_compute.Uniform("uMaxBounces"), Math.Clamp(quality.PathBounces, 1, 50));
+        GL.Uniform1(_compute.Uniform("uRayDistance"), quality.PathRayDistance);
+        GL.Uniform1(_compute.Uniform("uDirectLightingStrength"), quality.PathDirectLightingStrength);
+        GL.Uniform1(_compute.Uniform("uEnvironmentIntensity"), quality.PathEnvironmentIntensity);
+        GL.Uniform1(_compute.Uniform("uEmissionIntensity"), quality.PathEmissionIntensity);
+        GL.Uniform1(_compute.Uniform("uReflectionStrength"), quality.PathReflectionStrength);
+        GL.Uniform1(_compute.Uniform("uRussianRouletteStart"), quality.PathRussianRouletteStart);
+        GL.Uniform1(_compute.Uniform("uSelectionInReflections"),
+            quality.SelectionOutlineReflections ? 1 : 0);
         GL.Uniform3(
             _compute.Uniform("uWorldOrigin"),
             _voxelOriginX,
@@ -247,6 +261,9 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.ActiveTexture(TextureUnit.Texture6);
         GL.BindTexture(TextureTarget.Texture3D, _microCellTexture);
         GL.Uniform1(_compute.Uniform("uMicroCells"), 6);
+        GL.ActiveTexture(TextureUnit.Texture7);
+        GL.BindTexture(TextureTarget.Texture3D, _fluidLevelTexture);
+        GL.Uniform1(_compute.Uniform("uFluidLevels"), 7);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, 1, _microBoxBuffer);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, 2, _dynamicBoxBuffer);
         GL.Uniform1(_compute.Uniform("uDynamicBoxCount"), _dynamicBoxCount);
@@ -290,6 +307,31 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             0,
             PixelFormat.RedInteger,
             PixelType.UnsignedShort,
+            data);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToBorder);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToBorder);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapR, (int)TextureWrapMode.ClampToBorder);
+        return texture;
+    }
+
+    private static int CreateFluidLevelTexture(byte[] data)
+    {
+        int texture = GL.GenTexture();
+        GL.ActiveTexture(TextureUnit.Texture7);
+        GL.BindTexture(TextureTarget.Texture3D, texture);
+        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+        GL.TexImage3D(
+            TextureTarget.Texture3D,
+            0,
+            PixelInternalFormat.R8ui,
+            VoxelWorld.Width,
+            VoxelWorld.Height,
+            VoxelWorld.Depth,
+            0,
+            PixelFormat.RedInteger,
+            PixelType.UnsignedByte,
             data);
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
@@ -400,20 +442,65 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         ResetAccumulation();
     }
 
-    private void UploadDynamicGrids()
+    private void UploadDynamicGrids(Vector3? cameraPosition = null)
     {
         long uploadStarted = Stopwatch.GetTimestamp();
         var data = new List<float>();
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
-        foreach (PhysicsGridElement element in grid.Elements)
         {
-            Vector3 center = grid.LocalToWorld(element.Center);
-            Vector3 half = element.HalfExtents;
-            Quaternion rotation = grid.Orientation;
-            data.Add(center.X); data.Add(center.Y); data.Add(center.Z); data.Add(element.MaterialId);
-            data.Add(half.X); data.Add(half.Y); data.Add(half.Z); data.Add(grid.Id);
-            data.Add(rotation.X); data.Add(rotation.Y); data.Add(rotation.Z); data.Add(rotation.W);
-            data.Add(element.CellX); data.Add(element.CellY); data.Add(element.CellZ); data.Add(0f);
+            if (cameraPosition.HasValue &&
+                Vector3.DistanceSquared(grid.Position, cameraPosition.Value) >
+                MathF.Pow(140f + grid.BoundingRadius, 2f))
+                continue;
+
+            IReadOnlyList<PhysicsGridElement> elements = grid.Elements;
+            if (elements.Count == 0) continue;
+            Vector3 boundsMinimum = new(float.PositiveInfinity);
+            Vector3 boundsMaximum = new(float.NegativeInfinity);
+            foreach (PhysicsGridElement element in elements)
+            {
+                for (int corner = 0; corner < 8; corner++)
+                {
+                    Vector3 local = new(
+                        (corner & 1) == 0 ? element.Minimum.X : element.Maximum.X,
+                        (corner & 2) == 0 ? element.Minimum.Y : element.Maximum.Y,
+                        (corner & 4) == 0 ? element.Minimum.Z : element.Maximum.Z);
+                    Vector3 world = grid.LocalToWorld(local);
+                    boundsMinimum = Vector3.Min(boundsMinimum, world);
+                    boundsMaximum = Vector3.Max(boundsMaximum, world);
+                }
+            }
+            Vector3 boundsCenter = (boundsMinimum + boundsMaximum) * 0.5f;
+            Vector3 boundsHalf = Vector3.Max(
+                (boundsMaximum - boundsMinimum) * 0.5f,
+                new Vector3(0.001f));
+            // Negative material/grid fields identify a group header. The shader tests
+            // this AABB once and skips every following element when the ray misses it.
+            data.Add(boundsCenter.X); data.Add(boundsCenter.Y); data.Add(boundsCenter.Z); data.Add(-1f);
+            data.Add(boundsHalf.X); data.Add(boundsHalf.Y); data.Add(boundsHalf.Z); data.Add(-elements.Count);
+            data.Add(0f); data.Add(0f); data.Add(0f); data.Add(1f);
+            data.Add(0f); data.Add(0f); data.Add(0f); data.Add(0f);
+
+            foreach (PhysicsGridElement element in elements)
+            {
+                Vector3 center = grid.LocalToWorld(element.Center);
+                Vector3 half = element.HalfExtents;
+                Quaternion rotation = grid.Orientation;
+                data.Add(center.X); data.Add(center.Y); data.Add(center.Z); data.Add(element.MaterialId);
+                data.Add(half.X); data.Add(half.Y); data.Add(half.Z); data.Add(grid.Id);
+                data.Add(rotation.X); data.Add(rotation.Y); data.Add(rotation.Z); data.Add(rotation.W);
+                data.Add(element.CellX); data.Add(element.CellY); data.Add(element.CellZ); data.Add(0f);
+            }
+        }
+        foreach (AnalyticSphere sphere in _world.AnalyticSpheres.Spheres)
+        {
+            if (cameraPosition.HasValue &&
+                Vector3.DistanceSquared(sphere.Center, cameraPosition.Value) > MathF.Pow(140f + sphere.Radius, 2f))
+                continue;
+            data.Add(sphere.Center.X); data.Add(sphere.Center.Y); data.Add(sphere.Center.Z); data.Add(sphere.MaterialId);
+            data.Add(sphere.Radius); data.Add(sphere.Radius); data.Add(sphere.Radius); data.Add(-2f);
+            data.Add(0f); data.Add(0f); data.Add(0f); data.Add(1f);
+            data.Add(-1f); data.Add(-1f); data.Add(-1f); data.Add(sphere.Id);
         }
         _dynamicBoxCount = data.Count / 16;
         float[] upload = data.Count == 0 ? new float[16] : data.ToArray();
@@ -429,6 +516,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
     }
 
     private void OnPhysicsGridsChanged() => _dynamicGridsDirty = true;
+    private void OnAnalyticSpheresChanged() => _dynamicGridsDirty = true;
 
     private void OnVoxelChanged(int x, int y, int z, VoxelMaterial material)
     {
@@ -444,10 +532,15 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         ResetAccumulation();
     }
 
+    private void OnFluidLevelChanged(int x, int y, int z) =>
+        OnVoxelChanged(x, y, z, VoxelMaterial.Water);
+
     private void UploadAllVoxels()
     {
         long uploadStarted = Stopwatch.GetTimestamp();
         ushort[] snapshot = _world.CreateRenderWindowSnapshot(_voxelOriginX, _voxelOriginZ);
+        byte[] fluidLevels = _world.CreateFluidRenderWindowSnapshot(
+            _voxelOriginX, _voxelOriginZ, VoxelWorld.Width, VoxelWorld.Depth);
         _voxelTextureOffsetX = 0;
         _voxelTextureOffsetZ = 0;
         GL.ActiveTexture(TextureUnit.Texture0);
@@ -465,7 +558,14 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             PixelFormat.RedInteger,
             PixelType.UnsignedShort,
             snapshot);
-        RecordVoxelUpload(ElapsedMilliseconds(uploadStarted), (long)snapshot.Length * sizeof(ushort));
+        GL.ActiveTexture(TextureUnit.Texture7);
+        GL.BindTexture(TextureTarget.Texture3D, _fluidLevelTexture);
+        GL.TexSubImage3D(
+            TextureTarget.Texture3D, 0, 0, 0, 0,
+            VoxelWorld.Width, VoxelWorld.Height, VoxelWorld.Depth,
+            PixelFormat.RedInteger, PixelType.UnsignedByte, fluidLevels);
+        RecordVoxelUpload(ElapsedMilliseconds(uploadStarted),
+            (long)snapshot.Length * sizeof(ushort) + fluidLevels.Length);
         ResetAccumulation();
     }
 
@@ -487,6 +587,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             int textureX = PositiveModulo(logicalX + _voxelTextureOffsetX, VoxelWorld.Width);
             int textureZ = PositiveModulo(logicalZ + _voxelTextureOffsetZ, VoxelWorld.Depth);
             ushort[] snapshot = _world.CreateRenderChunkSnapshot(chunk);
+            byte[] fluidLevels = _world.CreateFluidRenderChunkSnapshot(chunk);
             long uploadStarted = Stopwatch.GetTimestamp();
             GL.TexSubImage3D(
                 TextureTarget.Texture3D, 0,
@@ -494,7 +595,18 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
                 ChunkCoordinate.Size, VoxelWorld.Height, ChunkCoordinate.Size,
                 PixelFormat.RedInteger, PixelType.UnsignedShort,
                 snapshot);
-            RecordVoxelUpload(ElapsedMilliseconds(uploadStarted), (long)snapshot.Length * sizeof(ushort));
+            GL.ActiveTexture(TextureUnit.Texture7);
+            GL.BindTexture(TextureTarget.Texture3D, _fluidLevelTexture);
+            GL.TexSubImage3D(
+                TextureTarget.Texture3D, 0,
+                textureX, 0, textureZ,
+                ChunkCoordinate.Size, VoxelWorld.Height, ChunkCoordinate.Size,
+                PixelFormat.RedInteger, PixelType.UnsignedByte,
+                fluidLevels);
+            GL.ActiveTexture(TextureUnit.Texture0);
+            GL.BindTexture(TextureTarget.Texture3D, _voxelTexture);
+            RecordVoxelUpload(ElapsedMilliseconds(uploadStarted),
+                (long)snapshot.Length * sizeof(ushort) + fluidLevels.Length);
             uploaded = true;
             // A large generation burst must not drain every dirty texture slab in one
             // render call. Remaining uploads stay queued for later frames.
@@ -657,12 +769,15 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         }
         _disposed = true;
         _world.VoxelChanged -= OnVoxelChanged;
+        _world.FluidLevelChanged -= OnFluidLevelChanged;
         _world.WorldReloaded -= UploadAllVoxels;
         _world.MicroVoxelsChanged -= UploadMicroVoxels;
         _world.ChunkGenerated -= OnChunkGenerated;
         _world.PhysicsGrids.Changed -= OnPhysicsGridsChanged;
+        _world.AnalyticSpheres.Changed -= OnAnalyticSpheresChanged;
         _blocks.DefinitionsChanged -= UploadMaterialTextures;
         GL.DeleteTexture(_voxelTexture);
+        GL.DeleteTexture(_fluidLevelTexture);
         GL.DeleteTexture(_microCellTexture);
         GL.DeleteBuffer(_microBoxBuffer);
         GL.DeleteBuffer(_dynamicBoxBuffer);

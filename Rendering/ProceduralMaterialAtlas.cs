@@ -265,8 +265,13 @@ public sealed class ProceduralMaterialAtlas
                 break;
 
             case "frosted_glass":
-                float frostCloud = OctaveNoise(seed ^ 0xd1b54a35u, x, y, 83);
-                float frostGrain = Noise(seed ^ 0x94d049bbu, x, y, 97);
+                // Frosted glass has visible medium-sized grains. Quantizing the
+                // noise coordinates keeps it distinct from the much finer matte
+                // finish while remaining finer than the 4x4 mosaic cells.
+                int frostX = x / 2;
+                int frostY = y / 2;
+                float frostCloud = OctaveNoise(seed ^ 0xd1b54a35u, frostX, frostY, 83);
+                float frostGrain = Noise(seed ^ 0x94d049bbu, frostX, frostY, 97);
                 color = Vector3.Lerp(
                     Vary(definition.Albedo, frostCloud, variation * 0.22f),
                     Vector3.One,
@@ -276,10 +281,13 @@ public sealed class ProceduralMaterialAtlas
                 break;
 
             case "matte_glass":
+                // Matte glass uses per-texel grain: its surface is cloudy, but the
+                // individual structure is finer than frosted and mosaic glass.
                 float matteGrain = Noise(seed ^ 0x369dea0fu, x, y, 109);
-                color = Vary(definition.Albedo, matteGrain, variation * 0.12f);
-                height = 0.38f + matteGrain * 0.24f;
-                roughness = Math.Clamp(definition.Roughness + (matteGrain - 0.5f) * 0.12f, 0.72f, 1f);
+                float matteCloud = OctaveNoise(seed ^ 0x7f4a7c15u, x, y, 131);
+                color = Vary(definition.Albedo, matteCloud * 0.35f + matteGrain * 0.65f, variation * 0.08f);
+                height = 0.44f + (matteGrain - 0.5f) * 0.12f;
+                roughness = Math.Clamp(definition.Roughness + (matteGrain - 0.5f) * 0.07f, 0.78f, 1f);
                 break;
 
             case "mosaic_glass":
@@ -288,10 +296,10 @@ public sealed class ProceduralMaterialAtlas
                 bool mosaicJoint = x % 4 == 0 || y % 4 == 0;
                 Vector3 mosaicTint = ((mosaicX + mosaicY * 3) & 3) switch
                 {
-                    0 => definition.Albedo,
-                    1 => new Vector3(0.92f, 0.22f, 0.16f),
-                    2 => new Vector3(0.16f, 0.72f, 0.34f),
-                    _ => new Vector3(0.72f, 0.3f, 0.92f),
+                    0 => definition.Albedo * 0.78f,
+                    1 => new Vector3(0.72f, 0.105f, 0.065f),
+                    2 => new Vector3(0.07f, 0.54f, 0.19f),
+                    _ => new Vector3(0.52f, 0.13f, 0.73f),
                 };
                 color = mosaicJoint
                     ? new Vector3(0.055f, 0.065f, 0.075f)
@@ -374,7 +382,8 @@ public sealed class ProceduralMaterialAtlas
     {
         "solid" => 0f,
         "glass" => 0.025f,
-        "frosted_glass" or "matte_glass" => 0.65f,
+        "frosted_glass" => 0.65f,
+        "matte_glass" => 0.38f,
         "mosaic_glass" or "ribbed_glass" or "etched_glass" => 0.42f,
         "acrylic_glass" => 0.16f,
         "grid" or "circuit" or "tiles" or "panels" => 0.055f,

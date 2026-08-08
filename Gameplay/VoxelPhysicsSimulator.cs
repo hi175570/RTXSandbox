@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Diagnostics;
 using RTXSandbox.ModAPI;
 using RTXSandbox.World;
 
@@ -24,6 +25,9 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     private readonly HashSet<VoxelPoint> _queued = new();
     private bool _suppressWorldEvents;
     private float _analysisAccumulator;
+    private const int MaximumAnalysisSeedsPerUpdate = 2;
+    private const int MaximumAnalyzedCells = 65_536;
+    private const double MaximumAnalysisMillisecondsPerFrame = 1.0;
     private Vector3? _lastRemovedSupportCenter;
     private BepuPhysicsBackend? _rigidBodyBackend;
     private Vector3 _simulationFocus;
@@ -85,13 +89,13 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         deltaSeconds = Math.Clamp(deltaSeconds, 0f, 0.05f);
         ChangesLastStep = 0;
         _analysisAccumulator += deltaSeconds;
-        if (_analysisAccumulator >= 0.035f)
+        if (_analysisAccumulator >= 0.05f)
         {
             _analysisAccumulator = 0f;
-            AnalyzeDirtyComponents(maximumSeeds: 6);
+            AnalyzeDirtyComponents(maximumSeeds: MaximumAnalysisSeedsPerUpdate);
         }
 
-        if (_world.PhysicsGrids.Count > 0 || _rigidBodyBackend is not null)
+        if (_world.PhysicsGrids.Count > 0 || _world.AnalyticSpheres.Count > 0 || _rigidBodyBackend is not null)
         {
             _rigidBodyBackend ??= new BepuPhysicsBackend(_world, _simulationFocus);
             _rigidBodyBackend.SetSimulationFocus(_simulationFocus);
@@ -110,7 +114,7 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     public int AnalyzeNow()
     {
         ChangesLastStep = 0;
-        AnalyzeDirtyComponents(int.MaxValue);
+        AnalyzeDirtyComponents(int.MaxValue, enforceTimeLimit: false);
         return ChangesLastStep;
     }
 
@@ -120,12 +124,33 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         _rigidBodyBackend?.SetSimulationFocus(position);
     }
 
+    public void PushAnalyticSpheresFromPlayer(Vector3 playerPosition, Vector3 playerVelocity)
+    {
+        if (_world.AnalyticSpheres.Count == 0) return;
+        _rigidBodyBackend ??= new BepuPhysicsBackend(_world, _simulationFocus);
+        _rigidBodyBackend.QueuePlayerPush(playerPosition, playerVelocity);
+    }
+
     public void ResetPerformanceCounters() => _rigidBodyBackend?.ResetPerformanceCounters();
 
     public bool TryRemoveGridCell(ulong gridId, int localX, int localY, int localZ)
     {
         PhysicsGrid? grid = _world.PhysicsGrids.Get(gridId);
         if (grid is null || !grid.TryRemoveCell(localX, localY, localZ)) return false;
+        if (grid.Elements.Count == 0)
+        {
+            _world.PhysicsGrids.Remove(grid);
+            return true;
+        }
+        SplitDisconnectedGrid(grid);
+        _world.PhysicsGrids.NotifyChanged();
+        return true;
+    }
+
+    public bool TryRemoveGridElement(PhysicsGridRayHit hit)
+    {
+        PhysicsGrid? grid = _world.PhysicsGrids.Get(hit.GridId);
+        if (grid is null || !grid.TryRemoveElementAtHit(hit)) return false;
         if (grid.Elements.Count == 0)
         {
             _world.PhysicsGrids.Remove(grid);
@@ -159,6 +184,33 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         Vector3 localNormal = Vector3.Transform(hit.Normal, Quaternion.Inverse(grid.Orientation));
         VoxelPoint face = CardinalDirection(localNormal);
         return !grid.ContainsCell(hit.CellX + face.X, hit.CellY + face.Y, hit.CellZ + face.Z);
+    }
+
+    public bool TryPlaceMicroOnGrid(PhysicsGridRayHit hit, ushort materialId, int divisor)
+    {
+        PhysicsGrid? grid = _world.PhysicsGrids.Get(hit.GridId);
+        if (grid is null || !PlacementRules.IsFarEnough(hit.Distance) ||
+            divisor is < 2 or > MicroVoxelContainer.MaximumResolution ||
+            materialId == 0 || !_blocks.Get(materialId).IsPlaceable) return false;
+
+        Vector3 localNormal = Vector3.Normalize(Vector3.Transform(
+            hit.Normal, Quaternion.Inverse(grid.Orientation)));
+        Vector3 localPoint = grid.WorldToLocal(hit.Position) + localNormal * 0.0025f;
+        float scale = 1f / divisor;
+        Vector3 minimum = new(
+            MathF.Floor(localPoint.X * divisor) * scale,
+            MathF.Floor(localPoint.Y * divisor) * scale,
+            MathF.Floor(localPoint.Z * divisor) * scale);
+        int cellX = (int)MathF.Floor(minimum.X + 0.000001f);
+        int cellY = (int)MathF.Floor(minimum.Y + 0.000001f);
+        int cellZ = (int)MathF.Floor(minimum.Z + 0.000001f);
+        bool added = grid.TryAddBox(
+            cellX, cellY, cellZ,
+            minimum,
+            minimum + new Vector3(scale),
+            materialId);
+        if (added) _world.PhysicsGrids.NotifyChanged();
+        return added;
     }
 
     public bool SelectGrid(ulong gridId)
@@ -313,12 +365,15 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         if (_queued.Add(point)) _dirty.Enqueue(point);
     }
 
-    private void AnalyzeDirtyComponents(int maximumSeeds)
+    private void AnalyzeDirtyComponents(int maximumSeeds, bool enforceTimeLimit = true)
     {
+        long started = Stopwatch.GetTimestamp();
         var analyzed = new HashSet<VoxelPoint>();
         int seeds = 0;
         while (seeds < maximumSeeds && _dirty.TryDequeue(out VoxelPoint seed))
         {
+            double elapsedMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+            if (enforceTimeLimit && elapsedMs >= MaximumAnalysisMillisecondsPerFrame) break;
             _queued.Remove(seed);
             if (!IsStructuralAt(seed.X, seed.Y, seed.Z) || analyzed.Contains(seed)) continue;
             seeds++;
@@ -329,7 +384,6 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
 
     private List<VoxelPoint> FloodComponent(VoxelPoint seed, HashSet<VoxelPoint> analyzed, out bool anchored)
     {
-        const int maximumAnalyzedCells = 1_000_000;
         var component = new List<VoxelPoint>();
         var queue = new Queue<VoxelPoint>();
         queue.Enqueue(seed);
@@ -344,7 +398,7 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
                 anchored = true;
                 break;
             }
-            if (component.Count >= maximumAnalyzedCells)
+            if (component.Count >= MaximumAnalyzedCells)
             {
                 anchored = true;
                 break;

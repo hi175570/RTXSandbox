@@ -8,7 +8,10 @@ public sealed class PlayerController
     public const float Radius = 0.32f;
     public const float Height = 1.8f;
     public const float EyeHeight = 1.62f;
+    public const float CrouchedHeight = 1.5f;
+    public const float CrouchedEyeHeight = 1.27f;
     private const float ExternalDepenetrationSpeed = 2.4f;
+    private const float WaterJumpSpeed = 6.2f;
 
     private readonly VoxelWorld _world;
     private readonly List<VoxelAabb> _collisionBoxes = new(24);
@@ -24,9 +27,11 @@ public sealed class PlayerController
     public float VerticalVelocity => _verticalVelocity;
     public bool FlightMode { get; set; }
     public bool NoClip { get; set; }
+    public bool IsCrouching { get; private set; }
     public float LastExternalPushDistance { get; private set; }
 
-    public Vector3 EyePosition => Position + Vector3.UnitY * EyeHeight;
+    public Vector3 EyePosition => Position + Vector3.UnitY *
+        (IsCrouching ? CrouchedEyeHeight : EyeHeight);
 
     public PlayerController(VoxelWorld world, Vector3 spawnPosition)
     {
@@ -40,7 +45,8 @@ public sealed class PlayerController
         Vector3 forward,
         bool sprint,
         bool jump,
-        bool descend = false)
+        bool descend = false,
+        bool crouch = false)
     {
         deltaTime = Math.Clamp(deltaTime, 0f, 0.05f);
         LandedThisFrame = false;
@@ -68,10 +74,11 @@ public sealed class PlayerController
 
         if (FlightMode || NoClip)
         {
-            Vector3 flyForward = Vector3.Normalize(forward);
-            Vector3 flyRight = Vector3.Cross(flyForward, Vector3.UnitY);
-            if (flyRight.LengthSquared() < 0.001f) flyRight = Vector3.UnitX;
-            else flyRight = Vector3.Normalize(flyRight);
+            IsCrouching = false;
+            // Flight translation uses stable world axes. Looking up, down or to
+            // either side must not rotate W/A/S/D movement.
+            Vector3 flyForward = -Vector3.UnitZ;
+            Vector3 flyRight = Vector3.UnitX;
             float verticalInput = (jump ? 1f : 0f) - (descend ? 1f : 0f);
             Vector3 flyMotion = flyForward * moveInput.Y + flyRight * moveInput.X + Vector3.UnitY * verticalInput;
             if (flyMotion.LengthSquared() > 1f) flyMotion = Vector3.Normalize(flyMotion);
@@ -94,12 +101,29 @@ public sealed class PlayerController
             return;
         }
 
-        IsInWater = IsFluidAt(Position + Vector3.UnitY * 0.25f) ||
+        // The lowest finite-water layer is only 1/16 of a full cell. Sample close
+        // to the feet so even that layer can provide the same deliberate jump-out
+        // action as deep water; visual depth must not weaken the control response.
+        IsInWater = IsFluidAt(Position + Vector3.UnitY * 0.02f) ||
                     IsFluidAt(Position + Vector3.UnitY * 1.1f);
         IsHeadUnderwater = IsFluidAt(EyePosition);
-        float speed = IsInWater ? 3.4f : sprint ? 8.5f : 5.2f;
-        bool blockedX = MoveAxis(0, desired.X * speed * deltaTime);
-        bool blockedZ = MoveAxis(2, desired.Z * speed * deltaTime);
+        if (IsInWater)
+        {
+            IsCrouching = false;
+        }
+        else if (crouch)
+        {
+            IsCrouching = true;
+        }
+        else if (IsCrouching && CanStand())
+        {
+            IsCrouching = false;
+        }
+
+        float speed = IsInWater ? 3.4f : IsCrouching ? 2.1f : sprint ? 8.5f : 5.2f;
+        bool protectEdge = IsCrouching && IsGrounded && !jump;
+        bool blockedX = MoveHorizontalAxis(0, desired.X * speed * deltaTime, protectEdge);
+        bool blockedZ = MoveHorizontalAxis(2, desired.Z * speed * deltaTime, protectEdge);
 
         // Shore assistance is input-driven: colliding with a wall must never raise
         // the player unless they are actively holding the jump/swim-up control.
@@ -118,9 +142,19 @@ public sealed class PlayerController
 
         if (IsInWater)
         {
-            float targetVerticalSpeed = jump ? 6.2f : descend ? -3.2f : 0f;
-            float response = 1f - MathF.Exp(-8f * deltaTime);
-            _verticalVelocity += (targetVerticalSpeed - _verticalVelocity) * response;
+            if (jump)
+            {
+                // Jumping is an explicit escape action, not buoyancy. Apply the
+                // complete impulse immediately so a thin layer and a deep column
+                // launch the player with exactly the same upward speed.
+                _verticalVelocity = MathF.Max(_verticalVelocity, WaterJumpSpeed);
+            }
+            else
+            {
+                float targetVerticalSpeed = descend ? -3.2f : 0f;
+                float response = 1f - MathF.Exp(-8f * deltaTime);
+                _verticalVelocity += (targetVerticalSpeed - _verticalVelocity) * response;
+            }
             IsGrounded = false;
             MoveAxis(1, _verticalVelocity * deltaTime);
             return;
@@ -231,6 +265,29 @@ public sealed class PlayerController
     private bool IsStaticSafe(Vector3 position) =>
         !_world.IntersectsStaticSolid(BoundsMin(position), BoundsMax(position));
 
+    private bool CanStand()
+    {
+        Vector3 maximum = new(Position.X + Radius, Position.Y + Height, Position.Z + Radius);
+        return !_world.IntersectsSolid(BoundsMin(Position), maximum);
+    }
+
+    private bool MoveHorizontalAxis(int axis, float amount, bool protectEdge)
+    {
+        Vector3 before = Position;
+        bool blocked = MoveAxis(axis, amount);
+        if (!protectEdge || HasFootSupport(Position)) return blocked;
+
+        Position = before;
+        return true;
+    }
+
+    private bool HasFootSupport(Vector3 position)
+    {
+        var minimum = new Vector3(position.X - Radius, position.Y - 0.08f, position.Z - Radius);
+        var maximum = new Vector3(position.X + Radius, position.Y - 0.001f, position.Z + Radius);
+        return _world.IntersectsSolid(minimum, maximum);
+    }
+
     private bool MoveAxis(int axis, float amount, bool includeDynamicGrids = true)
     {
         if (MathF.Abs(amount) < 0.000001f)
@@ -279,7 +336,7 @@ public sealed class PlayerController
                 {
                     if (amount > 0f)
                     {
-                        candidate.Y = MathF.Min(candidate.Y, box.Minimum.Y - Height);
+                        candidate.Y = MathF.Min(candidate.Y, box.Minimum.Y - CurrentHeight);
                     }
                     else
                     {
@@ -321,8 +378,10 @@ public sealed class PlayerController
     private static Vector3 BoundsMin(Vector3 position) =>
         new(position.X - Radius, position.Y, position.Z - Radius);
 
-    private static Vector3 BoundsMax(Vector3 position) =>
-        new(position.X + Radius, position.Y + Height, position.Z + Radius);
+    private float CurrentHeight => IsCrouching ? CrouchedHeight : Height;
+
+    private Vector3 BoundsMax(Vector3 position) =>
+        new(position.X + Radius, position.Y + CurrentHeight, position.Z + Radius);
 
     private bool IsFluidAt(Vector3 point)
     {
@@ -330,6 +389,7 @@ public sealed class PlayerController
         int y = (int)MathF.Floor(point.Y);
         int z = (int)MathF.Floor(point.Z);
         return _world.IsFluid(x, y, z) &&
-               (point.Y - y < VoxelWorld.FluidSurfaceHeight || _world.IsFluid(x, y + 1, z));
+               (point.Y - y < VoxelWorld.GetFluidSurfaceHeight(_world.GetFluidLevel(x, y, z)) ||
+                _world.IsFluid(x, y + 1, z));
     }
 }

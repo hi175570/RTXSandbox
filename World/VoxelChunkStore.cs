@@ -1,16 +1,19 @@
 namespace RTXSandbox.World;
 
 internal readonly record struct StoredVoxel(int LocalX, int Y, int LocalZ, ushort MaterialId);
+internal readonly record struct StoredFluidLevel(int LocalX, int Y, int LocalZ, byte Level);
 internal readonly record struct StoredMicroVoxel(int LocalX, int Y, int LocalZ, MicroVoxelSnapshot Snapshot);
 internal sealed record VoxelChunkSnapshot(
     ChunkCoordinate Coordinate,
     IReadOnlyList<StoredVoxel> Voxels,
+    IReadOnlyList<StoredFluidLevel> FluidLevels,
     IReadOnlyList<StoredMicroVoxel> MicroVoxels);
 internal sealed record ChunkMeshingSnapshot(
     ChunkCoordinate Coordinate,
     int MinimumY,
     int MaximumYExclusive,
     ushort[] Blocks,
+    byte[] FluidLevels,
     IReadOnlyList<StoredMicroVoxel> MicroVoxels)
 {
     private const int Border = 1;
@@ -25,6 +28,17 @@ internal sealed record ChunkMeshingSnapshot(
             return 0;
         int localY = y - MinimumY;
         return Blocks[localX + WidthWithBorder * (localY + (MaximumYExclusive - MinimumY) * localZ)];
+    }
+
+    public byte GetFluidLevel(int worldX, int y, int worldZ)
+    {
+        int localX = worldX - Coordinate.MinimumX + Border;
+        int localZ = worldZ - Coordinate.MinimumZ + Border;
+        if ((uint)localX >= WidthWithBorder || (uint)localZ >= WidthWithBorder ||
+            y < MinimumY || y >= MaximumYExclusive)
+            return 0;
+        int localY = y - MinimumY;
+        return FluidLevels[localX + WidthWithBorder * (localY + (MaximumYExclusive - MinimumY) * localZ)];
     }
 }
 
@@ -53,6 +67,8 @@ internal sealed class VoxelChunkStore
         .OrderBy(coordinate => coordinate.Z)
         .ThenBy(coordinate => coordinate.X)
         .ToArray();
+
+    public bool Contains(ChunkCoordinate coordinate) => _chunks.ContainsKey(coordinate);
 
     public ushort GetBlock(int x, int y, int z)
     {
@@ -164,10 +180,13 @@ internal sealed class VoxelChunkStore
     public VoxelChunkSnapshot SnapshotChunk(ChunkCoordinate coordinate)
     {
         if (!_chunks.TryGetValue(coordinate, out VoxelChunk? chunk))
-            return new VoxelChunkSnapshot(coordinate, Array.Empty<StoredVoxel>(), Array.Empty<StoredMicroVoxel>());
+            return new VoxelChunkSnapshot(
+                coordinate, Array.Empty<StoredVoxel>(), Array.Empty<StoredFluidLevel>(),
+                Array.Empty<StoredMicroVoxel>());
         return new VoxelChunkSnapshot(
             coordinate,
             chunk.EnumerateBlocks().ToArray(),
+            Array.Empty<StoredFluidLevel>(),
             chunk.EnumerateMicroVoxels()
                 .Select(entry => new StoredMicroVoxel(entry.LocalX, entry.Y, entry.LocalZ, entry.Container.Snapshot()))
                 .ToArray());

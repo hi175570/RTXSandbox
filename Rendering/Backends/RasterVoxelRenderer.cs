@@ -11,6 +11,31 @@ using OpenTkVector3 = OpenTK.Mathematics.Vector3;
 
 namespace RTXSandbox.Rendering.Backends;
 
+public readonly record struct DeferredBufferDiagnostics(
+    int ActivePixelCount,
+    int InvalidGBufferPixelCount,
+    int InvalidHdrPixelCount,
+    float MinimumNormalLength,
+    float MaximumNormalLength,
+    float MinimumRoughness,
+    float MaximumRoughness);
+
+public readonly record struct ForwardBufferDiagnostics(
+    int ActivePixelCount,
+    int InvalidSurfacePixelCount,
+    int InvalidHdrPixelCount,
+    float MinimumNormalLength,
+    float MaximumNormalLength,
+    float MinimumRoughness,
+    float MaximumRoughness);
+
+public readonly record struct DeferredShadowCoverageDiagnostics(
+    int ActivePixelCount,
+    int ShadowedPixelCount,
+    int DeepShadowPixelCount,
+    float MinimumVisibility,
+    float MaximumVisibility);
+
 /// <summary>
 /// Shared real-time voxel raster backend. PBR Forward and Classic are separate modes,
 /// but deliberately share chunk-mesh and atlas infrastructure.
@@ -22,7 +47,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private const double RepeatedMeshEditCoalesceMilliseconds = 200.0;
     private const int FloatsPerVertex = 20;
     private const float CullingFrustumScale = 1.6f;
-    private const int DirectionalShadowMapSize = 2048;
+    private const int DefaultDirectionalShadowMapSize = 2048;
     // The retained light direction may move by less than one quarter of a shadow
     // texel before the maps are refreshed. This avoids redrawing a 2048² world
     // shadow map every frame without reducing its spatial resolution.
@@ -34,10 +59,12 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private readonly bool _deferred;
     private readonly bool _hybrid;
     private readonly ShaderProgram _shader;
+    private readonly ShaderProgram _analyticSphereShader;
     private readonly ShaderProgram? _deferredGeometry;
     private readonly ShaderProgram? _deferredLighting;
     private readonly ShaderProgram? _deferredDepth;
     private readonly ShaderProgram? _deferredPost;
+    private readonly ShaderProgram? _forwardPost;
     private readonly Dictionary<ChunkCoordinate, MeshBuffer> _chunkMeshes = new();
     private readonly Dictionary<ulong, PhysicsGridMesh> _physicsGridMeshes = new();
     private readonly HashSet<ChunkCoordinate> _dirtyChunks = new();
@@ -69,11 +96,26 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private int _gDepth;
     private int _hdrBuffer;
     private int _hdrColor;
+    private int _sceneColorCopy;
+    private int _forwardBuffer;
+    private int _forwardColor;
+    private int _forwardSurface;
+    private int _forwardDepth;
+    private readonly int[] _forwardHistoryBuffers = new int[2];
+    private readonly int[] _forwardHistoryTextures = new int[2];
+    private int _forwardHistoryIndex;
+    private bool _forwardHistoryValid;
+    private readonly GpuPassTimer? _forwardShadowGpuTimer;
+    private readonly GpuPassTimer? _forwardMainGpuTimer;
+    private readonly GpuPassTimer? _forwardTransparencyGpuTimer;
+    private readonly GpuPassTimer? _forwardPostGpuTimer;
     private int _directionalShadowBuffer;
     private int _directionalShadowDepth;
     private int _dynamicDirectionalShadowBuffer;
     private int _dynamicDirectionalShadowDepth;
+    private int _directionalShadowMapSize = DefaultDirectionalShadowMapSize;
     private int _fullscreenVertexArray;
+    private int _analyticSphereVertexArray;
     private Matrix4 _previousView = Matrix4.Identity;
     private Matrix4 _previousProjection = Matrix4.Identity;
     private bool _hasPreviousMatrices;
@@ -83,6 +125,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private bool _hasDynamicDirectionalShadowMap;
     private Vector3 _lastDirectionalShadowDirection;
     private Vector3 _lastDirectionalShadowCenter;
+    private float _lastDirectionalShadowDistance = -1f;
     private Matrix4 _cachedLightView = Matrix4.Identity;
     private Matrix4 _cachedLightProjection = Matrix4.Identity;
     private bool _deferredLightsDirty = true;
@@ -106,12 +149,14 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     public int DeferredPointLightCount => _deferredPointLights.Count;
     public int DeferredSpotLightCount { get; private set; }
     public int DeferredFeatureMask { get; private set; }
+    public int ForwardFeatureMask { get; private set; }
     public int VisibleChunkCount => _visibleChunkMeshes.Count;
     public int CulledChunkCount => _chunkMeshes.Count - _visibleChunkMeshes.Count;
     public int VisiblePhysicsGridCount => _visiblePhysicsGridIds.Count;
     public int ResidentChunkMeshCount => _chunkMeshes.Count;
     public int EvictedChunkMeshCount { get; private set; }
     public int ShadowCasterChunkCount { get; private set; }
+    public int DirectionalShadowMapResolution => _directionalShadowMapSize;
     public int DirectionalShadowDrawCount { get; private set; }
     public int DirectionalShadowMapUpdateCount { get; private set; }
     public int StaticShadowMapUpdateCount { get; private set; }
@@ -127,6 +172,29 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     public double MaximumChunkGpuUploadMilliseconds { get; private set; }
     public double DeferredShadowUpdateTotalMilliseconds { get; private set; }
     public double MaximumDeferredShadowUpdateMilliseconds { get; private set; }
+    public double DeferredGeometryCpuMilliseconds { get; private set; }
+    public double DeferredLightingCpuMilliseconds { get; private set; }
+    public double DeferredPostCpuMilliseconds { get; private set; }
+    public double DeferredTransparencyCpuMilliseconds { get; private set; }
+    public double ForwardShadowCpuMilliseconds { get; private set; }
+    public double ForwardMainCpuMilliseconds { get; private set; }
+    public double ForwardTransparencyCpuMilliseconds { get; private set; }
+    public double ForwardPostCpuMilliseconds { get; private set; }
+    public double ForwardShadowGpuMilliseconds => _forwardShadowGpuTimer?.LastMilliseconds ?? 0.0;
+    public double ForwardMainGpuMilliseconds => _forwardMainGpuTimer?.LastMilliseconds ?? 0.0;
+    public double ForwardTransparencyGpuMilliseconds => _forwardTransparencyGpuTimer?.LastMilliseconds ?? 0.0;
+    public double ForwardPostGpuMilliseconds => _forwardPostGpuTimer?.LastMilliseconds ?? 0.0;
+    public double MaximumForwardShadowGpuMilliseconds => _forwardShadowGpuTimer?.MaximumMilliseconds ?? 0.0;
+    public double MaximumForwardMainGpuMilliseconds => _forwardMainGpuTimer?.MaximumMilliseconds ?? 0.0;
+    public double MaximumForwardTransparencyGpuMilliseconds => _forwardTransparencyGpuTimer?.MaximumMilliseconds ?? 0.0;
+    public double MaximumForwardPostGpuMilliseconds => _forwardPostGpuTimer?.MaximumMilliseconds ?? 0.0;
+    public int DeferredVisibleTriangleCount =>
+        (_visibleChunkMeshes.Sum(mesh => mesh.VertexCount) +
+         _visiblePhysicsGridIds.Sum(id => _physicsGridMeshes.TryGetValue(id, out PhysicsGridMesh? mesh)
+             ? mesh.Buffer.VertexCount : 0)) / 3;
+    public long DeferredGBufferBytes => (long)_width * _height * (8 + 4 + 8 + 8 + 8 + 4);
+    public long DeferredHistoryBufferBytes => 0;
+    public long ForwardBufferBytes => (long)_width * _height * (8 + 8 + 4 + 8 + 8);
     // CPU mesh lists are released after their versioned GPU upload; only pending
     // background results retain CPU vertices.
     public long ResidentCpuMeshBytes => _chunkMeshBuildJobs.Values
@@ -139,12 +207,13 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     public int PendingVisibleMeshRebuildCount =>
         _dirtyChunks.Count(_visibleChunkCoordinates.Contains);
     public float ViewCullingExpansion => CullingFrustumScale;
+    private bool EnhancedForward => !_classic && !_deferred;
 
     public (float Minimum, float Maximum) ReadDirectionalShadowDepthRange(bool dynamicLayer)
     {
         int texture = dynamicLayer ? _dynamicDirectionalShadowDepth : _directionalShadowDepth;
         if (texture == 0) return (1f, 1f);
-        var depths = new float[DirectionalShadowMapSize * DirectionalShadowMapSize];
+        var depths = new float[_directionalShadowMapSize * _directionalShadowMapSize];
         GL.BindTexture(TextureTarget.Texture2D, texture);
         GL.GetTexImage(TextureTarget.Texture2D, 0, PixelFormat.DepthComponent, PixelType.Float, depths);
         float minimum = 1f;
@@ -155,6 +224,141 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             maximum = MathF.Max(maximum, depth);
         }
         return (minimum, maximum);
+    }
+
+    public DeferredBufferDiagnostics ReadDeferredBufferDiagnostics()
+    {
+        if (!_deferred || _gPosition == 0 || _hdrColor == 0) return default;
+        int pixelCount = checked(_width * _height);
+        float[] positions = ReadRgbaTexture(_gPosition, pixelCount);
+        float[] normals = ReadRgbaTexture(_gNormal, pixelCount);
+        float[] albedoRoughness = ReadRgbaTexture(_gAlbedo, pixelCount);
+        float[] motionGeometry = ReadRgbaTexture(_gMotion, pixelCount);
+        float[] hdr = ReadRgbaTexture(_hdrColor, pixelCount);
+        int active = 0;
+        int invalidGBuffer = 0;
+        int invalidHdr = 0;
+        float minimumNormal = float.MaxValue;
+        float maximumNormal = 0f;
+        float minimumRoughness = 1f;
+        float maximumRoughness = 0f;
+        for (int pixel = 0; pixel < pixelCount; pixel++)
+        {
+            int offset = pixel * 4;
+            bool hdrFinite = true;
+            for (int component = 0; component < 3; component++)
+                hdrFinite &= float.IsFinite(hdr[offset + component]);
+            if (!hdrFinite) invalidHdr++;
+            if (!(positions[offset + 3] > 0.5f)) continue;
+            active++;
+            bool finite = true;
+            for (int component = 0; component < 4; component++)
+            {
+                finite &= float.IsFinite(positions[offset + component]);
+                finite &= float.IsFinite(normals[offset + component]);
+                finite &= float.IsFinite(albedoRoughness[offset + component]);
+                finite &= float.IsFinite(motionGeometry[offset + component]);
+            }
+            if (!finite)
+            {
+                invalidGBuffer++;
+                continue;
+            }
+            var decodedNormal = new Vector3(
+                normals[offset] * 2f - 1f,
+                normals[offset + 1] * 2f - 1f,
+                normals[offset + 2] * 2f - 1f);
+            float normalLength = decodedNormal.Length();
+            minimumNormal = MathF.Min(minimumNormal, normalLength);
+            maximumNormal = MathF.Max(maximumNormal, normalLength);
+            minimumRoughness = MathF.Min(minimumRoughness, albedoRoughness[offset + 3]);
+            maximumRoughness = MathF.Max(maximumRoughness, albedoRoughness[offset + 3]);
+            if (normalLength is < 0.98f or > 1.02f ||
+                motionGeometry[offset + 2] is < 0f or > 1f ||
+                motionGeometry[offset + 3] is < 0f or > 1f)
+                invalidGBuffer++;
+        }
+        if (active == 0) minimumNormal = minimumRoughness = 0f;
+        return new DeferredBufferDiagnostics(active, invalidGBuffer, invalidHdr,
+            minimumNormal, maximumNormal, minimumRoughness, maximumRoughness);
+    }
+
+    public ForwardBufferDiagnostics ReadForwardBufferDiagnostics()
+    {
+        if (!EnhancedForward || _forwardColor == 0 || _forwardSurface == 0 || _forwardDepth == 0)
+            return default;
+        int pixelCount = checked(_width * _height);
+        float[] hdr = ReadRgbaTexture(_forwardColor, pixelCount);
+        float[] surface = ReadRgbaTexture(_forwardSurface, pixelCount);
+        var depth = new float[pixelCount];
+        GL.BindTexture(TextureTarget.Texture2D, _forwardDepth);
+        GL.GetTexImage(TextureTarget.Texture2D, 0, PixelFormat.DepthComponent, PixelType.Float, depth);
+        int active = 0;
+        int invalidSurface = 0;
+        int invalidHdr = 0;
+        float minimumNormal = float.MaxValue;
+        float maximumNormal = 0f;
+        float minimumRoughness = float.MaxValue;
+        float maximumRoughness = 0f;
+        for (int pixel = 0; pixel < pixelCount; pixel++)
+        {
+            int offset = pixel * 4;
+            if (!float.IsFinite(hdr[offset]) || !float.IsFinite(hdr[offset + 1]) ||
+                !float.IsFinite(hdr[offset + 2]) || hdr[offset] < 0f || hdr[offset + 1] < 0f || hdr[offset + 2] < 0f)
+                invalidHdr++;
+            if (depth[pixel] >= 0.99999f) continue;
+            active++;
+            var normal = new Vector3(
+                surface[offset] * 2f - 1f,
+                surface[offset + 1] * 2f - 1f,
+                surface[offset + 2] * 2f - 1f);
+            float normalLength = normal.Length();
+            float roughness = surface[offset + 3];
+            minimumNormal = MathF.Min(minimumNormal, normalLength);
+            maximumNormal = MathF.Max(maximumNormal, normalLength);
+            minimumRoughness = MathF.Min(minimumRoughness, roughness);
+            maximumRoughness = MathF.Max(maximumRoughness, roughness);
+            if (!float.IsFinite(normalLength) || normalLength is < 0.98f or > 1.02f ||
+                !float.IsFinite(roughness) || roughness is < 0.044f or > 1.001f)
+                invalidSurface++;
+        }
+        if (active == 0) minimumNormal = minimumRoughness = 0f;
+        return new ForwardBufferDiagnostics(active, invalidSurface, invalidHdr,
+            minimumNormal, maximumNormal, minimumRoughness, maximumRoughness);
+    }
+
+    public DeferredShadowCoverageDiagnostics ReadDeferredShadowCoverageDiagnostics()
+    {
+        if (!_deferred || _gPosition == 0 || _hdrColor == 0) return default;
+        int pixelCount = checked(_width * _height);
+        float[] position = ReadRgbaTexture(_gPosition, pixelCount);
+        float[] lighting = ReadRgbaTexture(_hdrColor, pixelCount);
+        int active = 0;
+        int shadowed = 0;
+        int deepShadow = 0;
+        float minimum = 1f;
+        float maximum = 0f;
+        for (int pixel = 0; pixel < pixelCount; pixel++)
+        {
+            int offset = pixel * 4;
+            if (position[offset + 3] < 0.5f) continue;
+            active++;
+            float visibility = Math.Clamp(lighting[offset], 0f, 1f);
+            minimum = MathF.Min(minimum, visibility);
+            maximum = MathF.Max(maximum, visibility);
+            if (visibility < 0.98f) shadowed++;
+            if (visibility < 0.5f) deepShadow++;
+        }
+        if (active == 0) minimum = maximum = 0f;
+        return new DeferredShadowCoverageDiagnostics(active, shadowed, deepShadow, minimum, maximum);
+    }
+
+    private static float[] ReadRgbaTexture(int texture, int pixelCount)
+    {
+        var values = new float[checked(pixelCount * 4)];
+        GL.BindTexture(TextureTarget.Texture2D, texture);
+        GL.GetTexImage(TextureTarget.Texture2D, 0, PixelFormat.Rgba, PixelType.Float, values);
+        return values;
     }
 
     public RasterVoxelRenderer(
@@ -176,6 +380,10 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _shader = new ShaderProgram(
             (ShaderType.VertexShader, File.ReadAllText(Path.Combine(shaderRoot, "voxel_raster.vert.glsl"))),
             (ShaderType.FragmentShader, File.ReadAllText(Path.Combine(shaderRoot, "voxel_raster.frag.glsl"))));
+        _analyticSphereShader = new ShaderProgram(
+            (ShaderType.VertexShader, File.ReadAllText(Path.Combine(shaderRoot, "analytic_sphere.vert.glsl"))),
+            (ShaderType.FragmentShader, File.ReadAllText(Path.Combine(shaderRoot, "analytic_sphere.frag.glsl"))));
+        _analyticSphereVertexArray = GL.GenVertexArray();
         if (_deferred)
         {
             _deferredGeometry = new ShaderProgram(
@@ -193,18 +401,34 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             _fullscreenVertexArray = GL.GenVertexArray();
             CreateDirectionalShadowMap();
         }
+        else if (EnhancedForward)
+        {
+            _deferredDepth = new ShaderProgram(
+                (ShaderType.VertexShader, File.ReadAllText(Path.Combine(shaderRoot, "voxel_raster.vert.glsl"))),
+                (ShaderType.FragmentShader, File.ReadAllText(Path.Combine(shaderRoot, "deferred_depth.frag.glsl"))));
+            _forwardPost = new ShaderProgram(
+                (ShaderType.VertexShader, File.ReadAllText(Path.Combine(shaderRoot, "deferred_lighting.vert.glsl"))),
+                (ShaderType.FragmentShader, File.ReadAllText(Path.Combine(shaderRoot, "forward_post.frag.glsl"))));
+            _fullscreenVertexArray = GL.GenVertexArray();
+            CreateDirectionalShadowMap();
+            _forwardShadowGpuTimer = new GpuPassTimer();
+            _forwardMainGpuTimer = new GpuPassTimer();
+            _forwardTransparencyGpuTimer = new GpuPassTimer();
+            _forwardPostGpuTimer = new GpuPassTimer();
+        }
 
         foreach (ChunkCoordinate chunk in _world.SnapshotLoadedChunks())
         {
             _chunkMeshes.Add(chunk, CreateMeshBuffer());
             MarkChunkDirty(chunk);
-            if (_deferred) _dirtyDeferredLightChunks.Add(chunk);
+            if (_deferred || EnhancedForward) _dirtyDeferredLightChunks.Add(chunk);
         }
         _materialAtlasTexture = GL.GenTexture();
         _materialDetailTexture = GL.GenTexture();
         UploadMaterialAtlas();
         Resize(width, height, 1f);
         _world.DetailedVoxelChanged += OnVoxelChanged;
+        _world.FluidLevelChanged += OnFluidLevelChanged;
         _world.WorldReloaded += OnWorldReloaded;
         _world.MicroVoxelCellChanged += OnMicroVoxelCellChanged;
         _world.MicroVoxelsReloaded += OnMicroVoxelsReloaded;
@@ -218,11 +442,13 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _width = Math.Max(1, width);
         _height = Math.Max(1, height);
         if (_deferred) ResizeGBuffer();
+        else if (EnhancedForward) ResizeForwardBuffers();
+        ResizeSceneColorCopy();
     }
 
     public void ResetAccumulation()
     {
-        // Real-time raster backends have no history buffer.
+        _forwardHistoryValid = false;
     }
 
     public void Render(
@@ -241,26 +467,44 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         if (_hybrid)
         {
             // Hybrid PBR Raster is the high-quality raster path: deferred opaque
-            // lighting plus forward water/glass. It shares the proven GBuffer
-            // infrastructure while maintaining its own selectable backend identity.
+            // lighting plus forward water/glass. It shares the proven GBuffer code,
+            // but its user-facing quality values are intentionally independent from
+            // Deferred so tuning one renderer never silently changes the other.
             quality = quality with
             {
-                DeferredRendererQuality = Math.Max(2, quality.DeferredRendererQuality),
-                DeferredGBufferQuality = Math.Max(2, quality.DeferredGBufferQuality),
-                DeferredLightingQuality = Math.Max(2, quality.DeferredLightingQuality),
-                DeferredShadowQuality = Math.Max(2, quality.DeferredShadowQuality),
-                DeferredReflectionQuality = Math.Max(2, quality.DeferredReflectionQuality),
-                DeferredWaterQuality = Math.Max(2, quality.DeferredWaterQuality),
-                DeferredTransparencyQuality = Math.Max(2, quality.DeferredTransparencyQuality),
-                DeferredPostProcessingQuality = Math.Max(2, quality.DeferredPostProcessingQuality),
+                DeferredRendererQuality = Math.Max(1, quality.HybridLightingQuality),
+                DeferredGBufferQuality = Math.Max(2, quality.HybridLightingQuality),
+                DeferredLightingQuality = quality.HybridLightingQuality,
+                DeferredSpecularQuality = quality.HybridSpecularQuality,
+                DeferredShadowQuality = quality.HybridShadowQuality,
+                DeferredShadowResolution = quality.HybridShadowResolution,
+                DeferredShadowDistance = 64f + quality.HybridShadowQuality * 30f,
+                DeferredShadowBias = 0.00035f,
+                DeferredShadowNormalBias = 0.025f,
+                DeferredShadowSlopeBias = 0.00125f,
+                DeferredShadowSoftness = 0.8f + quality.HybridShadowQuality * 0.2f,
+                DeferredReflectionQuality = quality.HybridReflectionQuality,
+                DeferredAmbientOcclusionQuality = quality.HybridAmbientOcclusionQuality,
+                DeferredWaterQuality = quality.HybridWaterQuality,
+                DeferredTransparencyQuality = quality.HybridTransparencyQuality,
+                DeferredFogQuality = quality.HybridFogQuality,
+                DeferredPostProcessingQuality = Math.Max(2, quality.HybridLightingQuality),
                 DeferredHdr = true,
-                DeferredBloom = true,
+                DeferredBloom = quality.HybridBloom,
+                DeferredToneMapping = 2,
+                DeferredDebugView = DeferredDebugView.FinalImage,
             };
         }
 
         if (_deferred)
         {
             RenderDeferred(cameraPosition, camera, selection, timeOfDay, quality, exposure);
+            CommitPhysicsGridTransforms();
+            return;
+        }
+        if (EnhancedForward)
+        {
+            RenderEnhancedForward(cameraPosition, camera, selection, timeOfDay, quality, exposure);
             CommitPhysicsGridTransforms();
             return;
         }
@@ -299,10 +543,21 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(_shader.Uniform("uSpecularQuality"), _classic ? 0 : quality.PbrSpecularQuality);
         GL.Uniform1(_shader.Uniform("uReflectionQuality"), _classic ? 0 : quality.PbrReflectionQuality);
         GL.Uniform1(_shader.Uniform("uClassicLightingQuality"), quality.ClassicLightingQuality);
+        GL.Uniform1(_shader.Uniform("uClassicSunlightStrength"), quality.ClassicSunlightStrength);
+        GL.Uniform1(_shader.Uniform("uClassicAmbientStrength"), quality.ClassicAmbientStrength);
+        GL.Uniform1(_shader.Uniform("uClassicColorSaturation"), quality.ClassicColorSaturation);
+        GL.Uniform1(_shader.Uniform("uClassicWaterWaveStrength"), quality.ClassicWaterWaveStrength);
+        GL.Uniform1(_shader.Uniform("uClassicFogDensity"), quality.ClassicFogDensity);
         GL.Uniform1(_shader.Uniform("uTransparentOnly"), -1);
         GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 0);
         GL.Uniform1(_shader.Uniform("uWaterQuality"), 0);
         GL.Uniform1(_shader.Uniform("uTransparencyQuality"), 0);
+        GL.Uniform1(_shader.Uniform("uForwardHdr"), 0);
+        GL.Uniform1(_shader.Uniform("uForwardPbr"), 0);
+        GL.Uniform1(_shader.Uniform("uForwardDebugView"), 0);
+        GL.Uniform1(_shader.Uniform("uForwardApproximateGi"), 0);
+        GL.Uniform1(_shader.Uniform("uForwardWaterEffects"), 0);
+        GL.Uniform1(_shader.Uniform("uForwardShadowQuality"), 0);
         GL.Uniform2(_shader.Uniform("uScreenSize"), (float)_width, (float)_height);
         if (selection.HasValue)
         {
@@ -326,6 +581,26 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindTexture(TextureTarget.Texture2D, 0);
         GL.Uniform1(_shader.Uniform("uSceneColor"), 2);
         DrawVisibleGeometry(_shader, includePreviousModel: false);
+
+        // The quad is only a conservative raster proxy. Every covered fragment
+        // solves the exact implicit sphere equation and writes the analytic depth.
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
+        GL.CopyTexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, 0, 0, _width, _height);
+        DrawAnalyticSpheres(cameraPosition, camera, timeOfDay, exposure, view, projection,
+            _sceneColorCopy, hasSceneColor: true);
+
+        // Forward and Classic render directly to the window. Preserve the opaque
+        // result before drawing glass so refraction samples the real scene instead
+        // of texture zero (which made distant glass appear gray/opaque).
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
+        GL.CopyTexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, 0, 0, _width, _height);
+        _shader.Use();
+        GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 2);
+        GL.Uniform1(_shader.Uniform("uWaterQuality"), _classic ? quality.ClassicWaterQuality : 2);
+        GL.Uniform1(_shader.Uniform("uTransparencyQuality"),
+            _classic ? quality.ClassicTransparencyQuality : 2);
         GL.Enable(EnableCap.Blend);
         GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
         GL.DepthMask(false);
@@ -334,6 +609,207 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.DepthMask(true);
         GL.BindVertexArray(0);
         CommitPhysicsGridTransforms();
+    }
+
+    private void RenderEnhancedForward(
+        Vector3 cameraPosition,
+        Camera camera,
+        VoxelHit? selection,
+        float timeOfDay,
+        RenderQualitySettings quality,
+        float exposure)
+    {
+        var eye = new OpenTkVector3(cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
+        Vector3 forward = camera.Forward;
+        var target = eye + new OpenTkVector3(forward.X, forward.Y, forward.Z);
+        Matrix4 view = Matrix4.LookAt(eye, target, OpenTkVector3.UnitY);
+        Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(
+            camera.FieldOfViewDegrees * MathF.PI / 180f,
+            _width / (float)Math.Max(_height, 1), 0.03f, 220f);
+        Matrix4 previousView = _hasPreviousMatrices ? _previousView : view;
+        Matrix4 previousProjection = _hasPreviousMatrices ? _previousProjection : projection;
+        Matrix4 viewProjection = view * projection;
+        Matrix4 previousViewProjection = previousView * previousProjection;
+        Matrix4 inverseViewProjection = Matrix4.Invert(viewProjection);
+
+        if (_deferredLightsDirty) RebuildDeferredLights();
+        Vector3 primaryLightDirection = PrimaryLightDirection(timeOfDay);
+        int shadowQuality = quality.ForwardShadows ? quality.ForwardShadowQuality : 0;
+        EnsureDirectionalShadowMapSize(quality.ForwardShadowResolution);
+        long shadowStarted = Stopwatch.GetTimestamp();
+        _forwardShadowGpuTimer!.Begin();
+        (Matrix4 lightView, Matrix4 lightProjection) = RenderDirectionalShadowMap(
+            primaryLightDirection, shadowQuality, quality.ForwardShadowDistance, cameraPosition);
+        _forwardShadowGpuTimer.End();
+        ForwardShadowCpuMilliseconds = ElapsedMilliseconds(shadowStarted);
+
+        long mainStarted = Stopwatch.GetTimestamp();
+        _forwardMainGpuTimer!.Begin();
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _forwardBuffer);
+        GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+        GL.Viewport(0, 0, _width, _height);
+        float daylight = Math.Clamp(MathF.Sin((timeOfDay - 6f) * MathF.PI / 12f) * 0.72f + 0.28f, 0.02f, 1f);
+        GL.ClearColor(0.008f + daylight * 0.06f, 0.014f + daylight * 0.15f, 0.035f + daylight * 0.34f, 1f);
+        GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+        GL.Enable(EnableCap.DepthTest);
+        GL.DepthFunc(DepthFunction.Lequal);
+        GL.DepthMask(true);
+        GL.Disable(EnableCap.CullFace);
+        GL.Disable(EnableCap.Blend);
+
+        _shader.Use();
+        GL.UniformMatrix4(_shader.Uniform("uView"), false, ref view);
+        GL.UniformMatrix4(_shader.Uniform("uProjection"), false, ref projection);
+        GL.Uniform3(_shader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
+        GL.Uniform1(_shader.Uniform("uTimeOfDay"), timeOfDay);
+        GL.Uniform1(_shader.Uniform("uExposure"), exposure);
+        GL.Uniform1(_shader.Uniform("uClassic"), 0);
+        GL.Uniform1(_shader.Uniform("uSpecularQuality"), quality.PbrSpecularQuality);
+        GL.Uniform1(_shader.Uniform("uReflectionQuality"), quality.PbrReflectionQuality);
+        GL.Uniform1(_shader.Uniform("uClassicLightingQuality"), 0);
+        GL.Uniform1(_shader.Uniform("uTransparentOnly"), -1);
+        GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 0);
+        GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.ForwardWaterQuality);
+        GL.Uniform1(_shader.Uniform("uTransparencyQuality"), quality.ForwardWaterQuality);
+        GL.Uniform2(_shader.Uniform("uScreenSize"), (float)_width, (float)_height);
+        GL.Uniform1(_shader.Uniform("uForwardHdr"), 1);
+        GL.Uniform1(_shader.Uniform("uForwardPbr"), quality.ForwardPbr ? 1 : 0);
+        GL.Uniform1(_shader.Uniform("uForwardDebugView"), (int)quality.ForwardDebugView);
+        GL.Uniform1(_shader.Uniform("uForwardApproximateGi"), quality.ForwardApproximateGi ? 1 : 0);
+        GL.Uniform1(_shader.Uniform("uForwardWaterEffects"), quality.ForwardWaterEffects ? 1 : 0);
+        GL.Uniform1(_shader.Uniform("uForwardShadowQuality"), shadowQuality);
+        GL.Uniform1(_shader.Uniform("uHasDirectionalShadowMap"),
+            shadowQuality > 0 && DirectionalShadowDrawCount > 0 ? 1 : 0);
+        GL.Uniform1(_shader.Uniform("uHasDynamicDirectionalShadowMap"),
+            shadowQuality > 0 && _physicsGridMeshes.Values.Any(mesh => mesh.Buffer.VertexCount > 0) ? 1 : 0);
+        GL.Uniform1(_shader.Uniform("uShadowBias"), quality.ForwardShadowBias);
+        GL.Uniform1(_shader.Uniform("uShadowNormalBias"), quality.ForwardShadowNormalBias);
+        GL.Uniform1(_shader.Uniform("uShadowSlopeBias"), quality.ForwardShadowSlopeBias);
+        GL.Uniform1(_shader.Uniform("uShadowSoftness"), quality.ForwardShadowSoftness);
+        GL.UniformMatrix4(_shader.Uniform("uLightView"), false, ref lightView);
+        GL.UniformMatrix4(_shader.Uniform("uLightProjection"), false, ref lightProjection);
+        GL.Uniform3(_shader.Uniform("uPrimaryLightDirection"),
+            primaryLightDirection.X, primaryLightDirection.Y, primaryLightDirection.Z);
+        int pointCount = quality.ForwardPbr ? _deferredPointLights.Count : 0;
+        GL.Uniform1(_shader.Uniform("uPointLightCount"), pointCount);
+        for (int index = 0; index < pointCount; index++)
+        {
+            DeferredPointLight light = _deferredPointLights[index];
+            GL.Uniform4(_shader.Uniform($"uPointPositionRadius[{index}]"),
+                light.Position.X, light.Position.Y, light.Position.Z, light.Radius);
+            GL.Uniform4(_shader.Uniform($"uPointColorIntensity[{index}]"),
+                light.Color.X, light.Color.Y, light.Color.Z, light.Intensity);
+        }
+        SetSelectionUniforms(_shader, selection);
+        BindGBufferTexture(_shader, "uMaterialAtlas", _materialAtlasTexture, TextureUnit.Texture0, 0);
+        BindGBufferTexture(_shader, "uMaterialDetailAtlas", _materialDetailTexture, TextureUnit.Texture1, 1);
+        BindGBufferTexture(_shader, "uSceneColor", _sceneColorCopy, TextureUnit.Texture2, 2);
+        BindGBufferTexture(_shader, "uDirectionalShadowMap", _directionalShadowDepth, TextureUnit.Texture3, 3);
+        BindGBufferTexture(_shader, "uDynamicDirectionalShadowMap",
+            _dynamicDirectionalShadowDepth, TextureUnit.Texture4, 4);
+        DrawVisibleGeometry(_shader, includePreviousModel: false);
+        ForwardMainCpuMilliseconds = ElapsedMilliseconds(mainStarted);
+
+        // The Forward HDR result remains the authoritative lit image. SceneColor is
+        // only a read-only snapshot for analytic spheres and sorted water/glass.
+        GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
+        GL.CopyTexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, 0, 0, _width, _height);
+        GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+        DrawAnalyticSpheres(cameraPosition, camera, timeOfDay, exposure, view, projection,
+            _sceneColorCopy, hasSceneColor: true);
+        GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
+        GL.CopyTexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, 0, 0, _width, _height);
+        GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
+        _forwardMainGpuTimer.End();
+
+        long transparencyStarted = Stopwatch.GetTimestamp();
+        _forwardTransparencyGpuTimer!.Begin();
+        if (quality.ForwardDebugView == ForwardDebugView.FinalImage)
+        {
+            _shader.Use();
+            GL.Uniform1(_shader.Uniform("uTransparentOnly"), 1);
+            GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 1);
+            GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.ForwardWaterEffects ? quality.ForwardWaterQuality : 0);
+            GL.Uniform1(_shader.Uniform("uTransparencyQuality"), quality.ForwardWaterEffects ? quality.ForwardWaterQuality : 0);
+            GL.Uniform1(_shader.Uniform("uForwardDebugView"), 0);
+            GL.Enable(EnableCap.Blend);
+            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+            GL.DepthMask(false);
+            DrawVisibleGeometry(_shader, includePreviousModel: false, transparentSortOrigin: cameraPosition);
+            GL.DepthMask(true);
+        }
+        _forwardTransparencyGpuTimer.End();
+        ForwardTransparencyCpuMilliseconds = ElapsedMilliseconds(transparencyStarted);
+
+        long postStarted = Stopwatch.GetTimestamp();
+        _forwardPostGpuTimer!.Begin();
+        int historyWriteIndex = _forwardHistoryIndex;
+        int historyReadIndex = 1 - historyWriteIndex;
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _forwardHistoryBuffers[historyWriteIndex]);
+        GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
+        GL.Viewport(0, 0, _width, _height);
+        GL.Disable(EnableCap.DepthTest);
+        GL.Disable(EnableCap.Blend);
+        ShaderProgram post = _forwardPost!;
+        post.Use();
+        BindGBufferTexture(post, "uHdrColor", _forwardColor, TextureUnit.Texture0, 0);
+        BindGBufferTexture(post, "uSurface", _forwardSurface, TextureUnit.Texture1, 1);
+        BindGBufferTexture(post, "uDepth", _forwardDepth, TextureUnit.Texture2, 2);
+        BindGBufferTexture(post, "uHistory", _forwardHistoryTextures[historyReadIndex], TextureUnit.Texture3, 3);
+        GL.Uniform2(post.Uniform("uTexelSize"), 1f / _width, 1f / _height);
+        GL.Uniform3(post.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
+        GL.Uniform1(post.Uniform("uTimeOfDay"), timeOfDay);
+        GL.Uniform1(post.Uniform("uExposure"), exposure);
+        GL.UniformMatrix4(post.Uniform("uInverseViewProjection"), false, ref inverseViewProjection);
+        GL.UniformMatrix4(post.Uniform("uViewProjection"), false, ref viewProjection);
+        GL.UniformMatrix4(post.Uniform("uPreviousViewProjection"), false, ref previousViewProjection);
+        GL.Uniform1(post.Uniform("uAoQuality"),
+            quality.ForwardAmbientOcclusion ? quality.ForwardAmbientOcclusionQuality : 0);
+        GL.Uniform1(post.Uniform("uReflectionQuality"),
+            quality.ForwardScreenSpaceReflections ? quality.PbrReflectionQuality : 0);
+        GL.Uniform1(post.Uniform("uVolumetricQuality"),
+            quality.ForwardVolumetric ? quality.ForwardVolumetricQuality : 0);
+        GL.Uniform1(post.Uniform("uPostQuality"), quality.ForwardPostProcessingQuality);
+        GL.Uniform1(post.Uniform("uBloomEnabled"), quality.ForwardBloom ? 1 : 0);
+        GL.Uniform1(post.Uniform("uToneMapping"), quality.ForwardToneMapping);
+        GL.Uniform1(post.Uniform("uTaaEnabled"), quality.ForwardTemporalAntiAliasing ? 1 : 0);
+        GL.Uniform1(post.Uniform("uHasHistory"),
+            quality.ForwardTemporalAntiAliasing && _forwardHistoryValid ? 1 : 0);
+        GL.Uniform1(post.Uniform("uDebugView"), (int)quality.ForwardDebugView);
+        GL.BindVertexArray(_fullscreenVertexArray);
+        GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+
+        GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _forwardHistoryBuffers[historyWriteIndex]);
+        GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer, 0);
+        GL.BlitFramebuffer(0, 0, _width, _height, 0, 0, _width, _height,
+            ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Nearest);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        _forwardPostGpuTimer.End();
+        ForwardPostCpuMilliseconds = ElapsedMilliseconds(postStarted);
+        _forwardHistoryIndex = historyReadIndex;
+        _forwardHistoryValid = quality.ForwardTemporalAntiAliasing &&
+            quality.ForwardDebugView == ForwardDebugView.FinalImage;
+        _previousView = view;
+        _previousProjection = projection;
+        _hasPreviousMatrices = true;
+
+        ForwardFeatureMask =
+            (quality.ForwardPbr ? 1 : 0) |
+            (shadowQuality > 0 ? 2 : 0) |
+            (pointCount > 0 ? 4 : 0) |
+            8 |
+            (quality.ForwardAmbientOcclusion && quality.ForwardAmbientOcclusionQuality > 0 ? 16 : 0) |
+            (quality.ForwardScreenSpaceReflections && quality.PbrReflectionQuality > 0 ? 32 : 0) |
+            (quality.ForwardWaterEffects && quality.ForwardWaterQuality > 0 ? 64 : 0) |
+            (quality.ForwardVolumetric && quality.ForwardVolumetricQuality > 0 ? 128 : 0) |
+            (quality.ForwardBloom ? 256 : 0) |
+            (quality.ForwardTemporalAntiAliasing ? 512 : 0) |
+            (quality.ForwardApproximateGi ? 1024 : 0) |
+            (quality.ForwardDebugView != ForwardDebugView.FinalImage ? 2048 : 0);
     }
 
     private void RenderDeferred(
@@ -356,9 +832,11 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         Matrix4 previousView = _hasPreviousMatrices ? _previousView : view;
         Matrix4 previousProjection = _hasPreviousMatrices ? _previousProjection : projection;
         Vector3 primaryLightDirection = PrimaryLightDirection(timeOfDay);
+        EnsureDirectionalShadowMapSize(quality.DeferredShadowResolution);
         (Matrix4 lightView, Matrix4 lightProjection) = RenderDirectionalShadowMap(
-            primaryLightDirection, quality.DeferredShadowQuality, cameraPosition);
+            primaryLightDirection, quality.DeferredShadowQuality, quality.DeferredShadowDistance, cameraPosition);
 
+        long geometryStarted = Stopwatch.GetTimestamp();
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, _gBuffer);
         GL.Viewport(0, 0, _width, _height);
         GL.ClearColor(0f, 0f, 0f, 0f);
@@ -395,9 +873,11 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindTexture(TextureTarget.Texture2D, _materialDetailTexture);
         GL.Uniform1(geometry.Uniform("uMaterialDetailAtlas"), 1);
         DrawVisibleGeometry(geometry, includePreviousModel: true);
+        DeferredGeometryCpuMilliseconds = ElapsedMilliseconds(geometryStarted);
         GL.DepthMask(true);
         GL.DepthFunc(DepthFunction.Lequal);
 
+        long lightingStarted = Stopwatch.GetTimestamp();
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, _hdrBuffer);
         GL.Viewport(0, 0, _width, _height);
         GL.Clear(ClearBufferMask.ColorBufferBit);
@@ -428,9 +908,15 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(lighting.Uniform("uTimeOfDay"), timeOfDay);
         GL.Uniform1(lighting.Uniform("uSpecularQuality"), quality.DeferredSpecularQuality);
         GL.Uniform1(lighting.Uniform("uReflectionQuality"), quality.DeferredReflectionQuality);
+        GL.Uniform1(lighting.Uniform("uSelectionInReflections"),
+            quality.SelectionOutlineReflections ? 1 : 0);
         GL.Uniform1(lighting.Uniform("uRendererQuality"), quality.DeferredRendererQuality);
         GL.Uniform1(lighting.Uniform("uLightingQuality"), quality.DeferredLightingQuality);
         GL.Uniform1(lighting.Uniform("uShadowQuality"), quality.DeferredShadowQuality);
+        GL.Uniform1(lighting.Uniform("uShadowBias"), quality.DeferredShadowBias);
+        GL.Uniform1(lighting.Uniform("uShadowNormalBias"), quality.DeferredShadowNormalBias);
+        GL.Uniform1(lighting.Uniform("uShadowSlopeBias"), quality.DeferredShadowSlopeBias);
+        GL.Uniform1(lighting.Uniform("uShadowSoftness"), quality.DeferredShadowSoftness);
         GL.Uniform1(lighting.Uniform("uAoQuality"), quality.DeferredAmbientOcclusionQuality);
         GL.Uniform1(lighting.Uniform("uDebugView"), (int)quality.DeferredDebugView);
         int pointCount = quality.DeferredLightingQuality > 0 ? _deferredPointLights.Count : 0;
@@ -450,9 +936,11 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform4(lighting.Uniform("uSpotColorIntensity[0]"), 0.78f, 0.88f, 1f, 0.42f);
         GL.BindVertexArray(_fullscreenVertexArray);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        DeferredLightingCpuMilliseconds = ElapsedMilliseconds(lightingStarted);
 
         // HDR post pass: optional fog, bloom, color grading, sharpening and selected
         // tone mapper. Debug views bypass artistic post processing.
+        long postStarted = Stopwatch.GetTimestamp();
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         ShaderProgram post = _deferredPost!;
         post.Use();
@@ -461,6 +949,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform2(post.Uniform("uTexelSize"), 1f / _width, 1f / _height);
         GL.Uniform3(post.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
         GL.Uniform1(post.Uniform("uExposure"), exposure);
+        GL.Uniform1(post.Uniform("uTimeOfDay"), timeOfDay);
         GL.Uniform1(post.Uniform("uHdrEnabled"), quality.DeferredHdr ? 1 : 0);
         GL.Uniform1(post.Uniform("uBloomEnabled"), quality.DeferredBloom ? 1 : 0);
         GL.Uniform1(post.Uniform("uPostQuality"), quality.DeferredPostProcessingQuality);
@@ -468,47 +957,63 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(post.Uniform("uToneMapping"), quality.DeferredToneMapping);
         GL.Uniform1(post.Uniform("uDebugView"), (int)quality.DeferredDebugView);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        DeferredPostCpuMilliseconds = ElapsedMilliseconds(postStarted);
 
-        GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _gBuffer);
-        GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer, 0);
-        GL.BlitFramebuffer(0, 0, _width, _height, 0, 0, _width, _height,
-            ClearBufferMask.DepthBufferBit, BlitFramebufferFilter.Nearest);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        if (quality.DeferredDebugView == DeferredDebugView.FinalImage)
+        {
+            long transparencyStarted = Stopwatch.GetTimestamp();
+            GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _gBuffer);
+            GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer, 0);
+            GL.BlitFramebuffer(0, 0, _width, _height, 0, 0, _width, _height,
+                ClearBufferMask.DepthBufferBit, BlitFramebufferFilter.Nearest);
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
 
-        // Transparent water/glass is intentionally a forward pass over the deferred
-        // opaque lighting result; this is the standard hybrid solution for GBuffer renderers.
-        GL.Enable(EnableCap.DepthTest);
-        GL.Enable(EnableCap.Blend);
-        GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-        GL.DepthMask(false);
-        _shader.Use();
-        GL.UniformMatrix4(_shader.Uniform("uView"), false, ref view);
-        GL.UniformMatrix4(_shader.Uniform("uProjection"), false, ref projection);
-        GL.Uniform3(_shader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
-        GL.Uniform1(_shader.Uniform("uTimeOfDay"), timeOfDay);
-        GL.Uniform1(_shader.Uniform("uExposure"), exposure);
-        GL.Uniform1(_shader.Uniform("uClassic"), 0);
-        GL.Uniform1(_shader.Uniform("uSpecularQuality"), quality.PbrSpecularQuality);
-        GL.Uniform1(_shader.Uniform("uReflectionQuality"), quality.PbrReflectionQuality);
-        GL.Uniform1(_shader.Uniform("uClassicLightingQuality"), quality.ClassicLightingQuality);
-        GL.Uniform1(_shader.Uniform("uTransparentOnly"), 1);
-        GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 1);
-        GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.DeferredWaterQuality);
-        GL.Uniform1(_shader.Uniform("uTransparencyQuality"), quality.DeferredTransparencyQuality);
-        GL.Uniform2(_shader.Uniform("uScreenSize"), (float)_width, (float)_height);
-        SetSelectionUniforms(_shader, selection);
-        GL.ActiveTexture(TextureUnit.Texture0);
-        GL.BindTexture(TextureTarget.Texture2D, _materialAtlasTexture);
-        GL.Uniform1(_shader.Uniform("uMaterialAtlas"), 0);
-        GL.ActiveTexture(TextureUnit.Texture1);
-        GL.BindTexture(TextureTarget.Texture2D, _materialDetailTexture);
-        GL.Uniform1(_shader.Uniform("uMaterialDetailAtlas"), 1);
-        GL.ActiveTexture(TextureUnit.Texture2);
-        GL.BindTexture(TextureTarget.Texture2D, _hdrColor);
-        GL.Uniform1(_shader.Uniform("uSceneColor"), 2);
-        DrawVisibleGeometry(_shader, includePreviousModel: false, transparentSortOrigin: cameraPosition);
-        GL.DepthMask(true);
-        GL.BindVertexArray(0);
+            GL.ActiveTexture(TextureUnit.Texture2);
+            GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
+            GL.CopyTexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, 0, 0, _width, _height);
+            DrawAnalyticSpheres(cameraPosition, camera, timeOfDay, exposure, view, projection,
+                _sceneColorCopy, hasSceneColor: true);
+
+            // Transparent water/glass is intentionally a forward pass over the deferred
+            // opaque lighting result; this is the standard hybrid solution for GBuffer renderers.
+            GL.Enable(EnableCap.DepthTest);
+            GL.Enable(EnableCap.Blend);
+            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+            GL.DepthMask(false);
+            _shader.Use();
+            GL.UniformMatrix4(_shader.Uniform("uView"), false, ref view);
+            GL.UniformMatrix4(_shader.Uniform("uProjection"), false, ref projection);
+            GL.Uniform3(_shader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
+            GL.Uniform1(_shader.Uniform("uTimeOfDay"), timeOfDay);
+            GL.Uniform1(_shader.Uniform("uExposure"), exposure);
+            GL.Uniform1(_shader.Uniform("uClassic"), 0);
+            GL.Uniform1(_shader.Uniform("uSpecularQuality"), quality.DeferredSpecularQuality);
+            GL.Uniform1(_shader.Uniform("uReflectionQuality"), quality.DeferredReflectionQuality);
+            GL.Uniform1(_shader.Uniform("uClassicLightingQuality"), quality.ClassicLightingQuality);
+            GL.Uniform1(_shader.Uniform("uTransparentOnly"), 1);
+            GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 1);
+            GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.DeferredWaterQuality);
+            GL.Uniform1(_shader.Uniform("uTransparencyQuality"), quality.DeferredTransparencyQuality);
+            GL.Uniform2(_shader.Uniform("uScreenSize"), (float)_width, (float)_height);
+            SetSelectionUniforms(_shader, selection);
+            GL.ActiveTexture(TextureUnit.Texture0);
+            GL.BindTexture(TextureTarget.Texture2D, _materialAtlasTexture);
+            GL.Uniform1(_shader.Uniform("uMaterialAtlas"), 0);
+            GL.ActiveTexture(TextureUnit.Texture1);
+            GL.BindTexture(TextureTarget.Texture2D, _materialDetailTexture);
+            GL.Uniform1(_shader.Uniform("uMaterialDetailAtlas"), 1);
+            GL.ActiveTexture(TextureUnit.Texture2);
+            GL.BindTexture(TextureTarget.Texture2D, _hdrColor);
+            GL.Uniform1(_shader.Uniform("uSceneColor"), 2);
+            DrawVisibleGeometry(_shader, includePreviousModel: false, transparentSortOrigin: cameraPosition);
+            DeferredTransparencyCpuMilliseconds = ElapsedMilliseconds(transparencyStarted);
+            GL.DepthMask(true);
+            GL.BindVertexArray(0);
+        }
+        else
+        {
+            DeferredTransparencyCpuMilliseconds = 0;
+        }
 
         _previousView = view;
         _previousProjection = projection;
@@ -524,6 +1029,58 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             (quality.DeferredDebugView != DeferredDebugView.FinalImage ? 1024 : 0);
     }
 
+    private void DrawAnalyticSpheres(
+        Vector3 cameraPosition,
+        Camera camera,
+        float timeOfDay,
+        float exposure,
+        Matrix4 view,
+        Matrix4 projection,
+        int sceneColor,
+        bool hasSceneColor)
+    {
+        if (_world.AnalyticSpheres.Count == 0) return;
+        Vector3 forward = Vector3.Normalize(camera.Forward);
+        Vector3 right = Vector3.Cross(forward, Vector3.UnitY);
+        if (right.LengthSquared() < 0.000001f) right = Vector3.UnitX;
+        else right = Vector3.Normalize(right);
+        Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
+
+        GL.Enable(EnableCap.DepthTest);
+        GL.DepthFunc(DepthFunction.Lequal);
+        GL.DepthMask(true);
+        GL.Disable(EnableCap.Blend);
+        GL.Disable(EnableCap.CullFace);
+        _analyticSphereShader.Use();
+        GL.UniformMatrix4(_analyticSphereShader.Uniform("uView"), false, ref view);
+        GL.UniformMatrix4(_analyticSphereShader.Uniform("uProjection"), false, ref projection);
+        GL.Uniform3(_analyticSphereShader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
+        GL.Uniform3(_analyticSphereShader.Uniform("uCameraRight"), right.X, right.Y, right.Z);
+        GL.Uniform3(_analyticSphereShader.Uniform("uCameraUp"), up.X, up.Y, up.Z);
+        GL.Uniform1(_analyticSphereShader.Uniform("uTimeOfDay"), timeOfDay);
+        GL.Uniform1(_analyticSphereShader.Uniform("uExposure"), exposure);
+        GL.Uniform1(_analyticSphereShader.Uniform("uClassic"), _classic ? 1 : 0);
+        GL.Uniform1(_analyticSphereShader.Uniform("uForwardHdr"), EnhancedForward ? 1 : 0);
+        GL.Uniform1(_analyticSphereShader.Uniform("uHasSceneColor"), hasSceneColor ? 1 : 0);
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.Texture2D, sceneColor);
+        GL.Uniform1(_analyticSphereShader.Uniform("uSceneColor"), 0);
+        GL.BindVertexArray(_analyticSphereVertexArray);
+        foreach (AnalyticSphere sphere in _world.AnalyticSpheres.Spheres)
+        {
+            if (Vector3.DistanceSquared(sphere.Center, cameraPosition) > MathF.Pow(220f + sphere.Radius, 2f))
+                continue;
+            BlockDefinition material = _blocks.Get(sphere.MaterialId);
+            GL.Uniform3(_analyticSphereShader.Uniform("uSphereCenter"), sphere.Center.X, sphere.Center.Y, sphere.Center.Z);
+            GL.Uniform1(_analyticSphereShader.Uniform("uSphereRadius"), sphere.Radius);
+            GL.Uniform3(_analyticSphereShader.Uniform("uAlbedo"), material.Albedo.X, material.Albedo.Y, material.Albedo.Z);
+            GL.Uniform1(_analyticSphereShader.Uniform("uRoughness"), material.Roughness);
+            GL.Uniform1(_analyticSphereShader.Uniform("uMetallic"), material.Metallic);
+            GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
+        }
+        GL.BindVertexArray(0);
+    }
+
     private static void BindGBufferTexture(ShaderProgram shader, string uniform, int texture, TextureUnit unit, int index)
     {
         GL.ActiveTexture(unit);
@@ -537,13 +1094,31 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         CreateDepthFramebuffer(out _dynamicDirectionalShadowBuffer, out _dynamicDirectionalShadowDepth);
     }
 
-    private static void CreateDepthFramebuffer(out int framebuffer, out int depthTexture)
+    private void EnsureDirectionalShadowMapSize(int requestedSize)
+    {
+        int size = requestedSize switch { <= 1536 => 1024, <= 3072 => 2048, _ => 4096 };
+        if (size == _directionalShadowMapSize) return;
+        if (_directionalShadowDepth != 0) GL.DeleteTexture(_directionalShadowDepth);
+        if (_dynamicDirectionalShadowDepth != 0) GL.DeleteTexture(_dynamicDirectionalShadowDepth);
+        if (_directionalShadowBuffer != 0) GL.DeleteFramebuffer(_directionalShadowBuffer);
+        if (_dynamicDirectionalShadowBuffer != 0) GL.DeleteFramebuffer(_dynamicDirectionalShadowBuffer);
+        _directionalShadowMapSize = size;
+        _directionalShadowBuffer = _directionalShadowDepth = 0;
+        _dynamicDirectionalShadowBuffer = _dynamicDirectionalShadowDepth = 0;
+        CreateDirectionalShadowMap();
+        _hasDirectionalShadowMap = false;
+        _hasDynamicDirectionalShadowMap = false;
+        _directionalShadowDirty = true;
+        _dynamicDirectionalShadowDirty = true;
+    }
+
+    private void CreateDepthFramebuffer(out int framebuffer, out int depthTexture)
     {
         framebuffer = GL.GenFramebuffer();
         depthTexture = GL.GenTexture();
         GL.BindTexture(TextureTarget.Texture2D, depthTexture);
         GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24,
-            DirectionalShadowMapSize, DirectionalShadowMapSize, 0,
+            _directionalShadowMapSize, _directionalShadowMapSize, 0,
             PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
@@ -556,16 +1131,18 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.DrawBuffer(DrawBufferMode.None);
         GL.ReadBuffer(ReadBufferMode.None);
         if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
-            throw new InvalidOperationException("Deferred directional shadow framebuffer is incomplete.");
+            throw new InvalidOperationException("Directional shadow framebuffer is incomplete.");
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
     private (Matrix4 View, Matrix4 Projection) RenderDirectionalShadowMap(
         Vector3 lightDirection,
         int shadowQuality,
+        float shadowDistance,
         Vector3 cameraPosition)
     {
         lightDirection = Vector3.Normalize(lightDirection);
+        shadowDistance = Math.Clamp(shadowDistance, 48f, 160f);
         if (shadowQuality <= 0)
         {
             DirectionalShadowDrawCount = 0;
@@ -575,7 +1152,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         bool lightChanged = !_hasDirectionalShadowMap ||
             Vector3.DistanceSquared(lightDirection, _lastDirectionalShadowDirection) >=
             ShadowDirectionUpdateThresholdSquared ||
-            Vector3.DistanceSquared(requestedCenter, _lastDirectionalShadowCenter) >= 64f;
+            Vector3.DistanceSquared(requestedCenter, _lastDirectionalShadowCenter) >= 64f ||
+            MathF.Abs(shadowDistance - _lastDirectionalShadowDistance) >= 0.5f;
         if (lightChanged)
         {
             var direction = new OpenTkVector3(lightDirection.X, lightDirection.Y, lightDirection.Z);
@@ -585,9 +1163,10 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                 ? OpenTkVector3.UnitZ
                 : OpenTkVector3.UnitY;
             _cachedLightView = Matrix4.LookAt(eye, center, up);
-            _cachedLightProjection = Matrix4.CreateOrthographic(100f, 100f, 1f, 224f);
+            _cachedLightProjection = Matrix4.CreateOrthographic(shadowDistance, shadowDistance, 1f, 224f);
             _lastDirectionalShadowDirection = lightDirection;
             _lastDirectionalShadowCenter = requestedCenter;
+            _lastDirectionalShadowDistance = shadowDistance;
             _directionalShadowDirty = true;
             _dynamicDirectionalShadowDirty = true;
         }
@@ -624,7 +1203,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private void RenderShadowLayer(int framebuffer, bool drawDynamic)
     {
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
-        GL.Viewport(0, 0, DirectionalShadowMapSize, DirectionalShadowMapSize);
+        GL.Viewport(0, 0, _directionalShadowMapSize, _directionalShadowMapSize);
         GL.Clear(ClearBufferMask.DepthBufferBit);
         GL.Enable(EnableCap.DepthTest);
         GL.DepthMask(true);
@@ -662,7 +1241,10 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _gAlbedo = CreateGBufferTexture(PixelInternalFormat.Rgba8, FramebufferAttachment.ColorAttachment1);
         _gNormal = CreateGBufferTexture(PixelInternalFormat.Rgba16f, FramebufferAttachment.ColorAttachment2);
         _gEmission = CreateGBufferTexture(PixelInternalFormat.Rgba16f, FramebufferAttachment.ColorAttachment3);
-        _gMotion = CreateGBufferTexture(PixelInternalFormat.Rg16f, FramebufferAttachment.ColorAttachment4);
+        // RG stores motion; BA stores the octahedral unperturbed geometric normal.
+        // Keeping both normals prevents AO and shadow bias from treating normal-map
+        // grain as actual occluding geometry.
+        _gMotion = CreateGBufferTexture(PixelInternalFormat.Rgba16f, FramebufferAttachment.ColorAttachment4);
         _gDepth = GL.GenRenderbuffer();
         GL.BindRenderbuffer(RenderbufferTarget.Renderbuffer, _gDepth);
         GL.RenderbufferStorage(RenderbufferTarget.Renderbuffer, RenderbufferStorage.DepthComponent24, _width, _height);
@@ -696,6 +1278,84 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
+    private void ResizeForwardBuffers()
+    {
+        DeleteForwardBuffers();
+        _forwardBuffer = GL.GenFramebuffer();
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _forwardBuffer);
+        _forwardColor = CreateForwardColorTexture(
+            PixelInternalFormat.Rgba16f, FramebufferAttachment.ColorAttachment0, linear: true);
+        _forwardSurface = CreateForwardColorTexture(
+            PixelInternalFormat.Rgba16f, FramebufferAttachment.ColorAttachment1, linear: false);
+        _forwardDepth = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture2D, _forwardDepth);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24,
+            _width, _height, 0, PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
+            TextureTarget.Texture2D, _forwardDepth, 0);
+        GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+        if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
+            throw new InvalidOperationException("Enhanced Forward HDR framebuffer is incomplete.");
+
+        for (int index = 0; index < 2; index++)
+        {
+            _forwardHistoryBuffers[index] = GL.GenFramebuffer();
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, _forwardHistoryBuffers[index]);
+            _forwardHistoryTextures[index] = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture2D, _forwardHistoryTextures[index]);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba16f,
+                _width, _height, 0, PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+                TextureTarget.Texture2D, _forwardHistoryTextures[index], 0);
+            GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
+            if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
+                throw new InvalidOperationException("Enhanced Forward temporal framebuffer is incomplete.");
+        }
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        _forwardHistoryIndex = 0;
+        _forwardHistoryValid = false;
+    }
+
+    private int CreateForwardColorTexture(
+        PixelInternalFormat format,
+        FramebufferAttachment attachment,
+        bool linear)
+    {
+        int texture = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture2D, texture);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, format,
+            _width, _height, 0, PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter,
+            (int)(linear ? TextureMinFilter.Linear : TextureMinFilter.Nearest));
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter,
+            (int)(linear ? TextureMagFilter.Linear : TextureMagFilter.Nearest));
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, attachment, TextureTarget.Texture2D, texture, 0);
+        return texture;
+    }
+
+    private void ResizeSceneColorCopy()
+    {
+        if (_sceneColorCopy != 0) GL.DeleteTexture(_sceneColorCopy);
+        _sceneColorCopy = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba16f,
+            _width, _height, 0, PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+    }
+
     private int CreateGBufferTexture(PixelInternalFormat format, FramebufferAttachment attachment)
     {
         int texture = GL.GenTexture();
@@ -721,6 +1381,23 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _gPosition = _gAlbedo = _gNormal = _gEmission = _gMotion = _gDepth = _gBuffer = _hdrColor = _hdrBuffer = 0;
     }
 
+    private void DeleteForwardBuffers()
+    {
+        if (_forwardColor != 0) GL.DeleteTexture(_forwardColor);
+        if (_forwardSurface != 0) GL.DeleteTexture(_forwardSurface);
+        if (_forwardDepth != 0) GL.DeleteTexture(_forwardDepth);
+        if (_forwardBuffer != 0) GL.DeleteFramebuffer(_forwardBuffer);
+        for (int index = 0; index < 2; index++)
+        {
+            if (_forwardHistoryTextures[index] != 0) GL.DeleteTexture(_forwardHistoryTextures[index]);
+            if (_forwardHistoryBuffers[index] != 0) GL.DeleteFramebuffer(_forwardHistoryBuffers[index]);
+            _forwardHistoryTextures[index] = 0;
+            _forwardHistoryBuffers[index] = 0;
+        }
+        _forwardColor = _forwardSurface = _forwardDepth = _forwardBuffer = 0;
+        _forwardHistoryValid = false;
+    }
+
     public MaterialTileUv GetMaterialTileUv(ushort materialId, MaterialFace face) =>
         _materialAtlas.GetTileUv(materialId, face);
 
@@ -743,7 +1420,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                 mesh.BoundsHalfHeight * mesh.BoundsHalfHeight);
             bool directlyVisible = IsSphereInView(center, radius, cameraPosition, camera.Forward,
                 camera.FieldOfViewDegrees, aspect, 12f);
-            bool shadowCaster = _deferred && !directlyVisible && IsShadowCasterNeeded(
+            bool shadowCaster = (_deferred || EnhancedForward) && !directlyVisible && IsShadowCasterNeeded(
                 center, radius, lightDirection, cameraPosition, camera.Forward,
                 camera.FieldOfViewDegrees, aspect);
             if (!directlyVisible && !shadowCaster)
@@ -760,7 +1437,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             float gridRadius = MathF.Max(1f, grid.BoundingRadius);
             if (IsSphereInView(grid.Position, gridRadius, cameraPosition, camera.Forward,
                     camera.FieldOfViewDegrees, aspect, 12f) ||
-                (_deferred && IsShadowCasterNeeded(grid.Position, gridRadius, lightDirection, cameraPosition,
+                ((_deferred || EnhancedForward) && IsShadowCasterNeeded(grid.Position, gridRadius, lightDirection, cameraPosition,
                     camera.Forward, camera.FieldOfViewDegrees, aspect)))
                 visibleGridIds.Add(grid.Id);
         }
@@ -805,9 +1482,9 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             if (_chunkMeshes.ContainsKey(chunk)) continue;
             _chunkMeshes.Add(chunk, CreateMeshBuffer());
             MarkChunkDirty(chunk);
-            if (_deferred) _dirtyDeferredLightChunks.Add(chunk);
+            if (_deferred || EnhancedForward) _dirtyDeferredLightChunks.Add(chunk);
         }
-        if (_deferred) _deferredLightsDirty = true;
+        if (_deferred || EnhancedForward) _deferredLightsDirty = true;
     }
 
     private bool IsInsideMeshResidency(ChunkCoordinate chunk) =>
@@ -961,8 +1638,11 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                 if (material == 0) continue;
                 BlockDefinition definition = definitions[material];
                 // Full opaque cubes and fluid tops are emitted by the greedy pass below.
-                // Transparent/special boundaries retain the exact per-cell path.
-                if (!IsGreedyOpaque(definition) && !definition.IsFluid)
+                // Fluid boundary walls remain per-cell so falling water is visible,
+                // while faces between adjacent water cells stay suppressed.
+                if (definition.IsFluid)
+                    AddFluidBoundarySides(vertices, x, y, z, material, snapshot, definitions);
+                else if (!IsGreedyOpaque(definition))
                     AddRegularVoxel(vertices, x, y, z, material, snapshot, definitions);
                 minimumY = Math.Min(minimumY, y);
                 maximumY = Math.Max(maximumY, y + 1);
@@ -1237,10 +1917,18 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         MaximumChunkGpuUploadMilliseconds = 0;
         DeferredShadowUpdateTotalMilliseconds = 0;
         MaximumDeferredShadowUpdateMilliseconds = 0;
+        DeferredGeometryCpuMilliseconds = 0;
+        DeferredLightingCpuMilliseconds = 0;
+        DeferredPostCpuMilliseconds = 0;
+        DeferredTransparencyCpuMilliseconds = 0;
         DirectionalShadowMapUpdateCount = 0;
         StaticShadowMapUpdateCount = 0;
         DynamicShadowMapUpdateCount = 0;
         PhysicsGridMeshUploadCount = 0;
+        _forwardShadowGpuTimer?.ResetMaximum();
+        _forwardMainGpuTimer?.ResetMaximum();
+        _forwardTransparencyGpuTimer?.ResetMaximum();
+        _forwardPostGpuTimer?.ResetMaximum();
     }
 
     private void RecordGpuUpload(double milliseconds, long bytes)
@@ -1289,6 +1977,66 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
         AddBox(vertices, new Vector3(x, y, z), new Vector3(x + 1f, maximumY, z + 1f),
             material, faceMask, x, y, z, 0, definitions);
+    }
+
+    private static void AddFluidBoundarySides(
+        PooledFloatBuffer vertices,
+        int x,
+        int y,
+        int z,
+        ushort material,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        ushort above = snapshot.GetBlock(x, y + 1, z);
+        bool fluidAbove = above != 0 && definitions[above].IsFluid;
+        byte level = snapshot.GetFluidLevel(x, y, z);
+        float maximumY = fluidAbove ? y + 1f : y + VoxelWorld.GetFluidSurfaceHeight(level);
+
+        // Generated oceans (level zero) retain their greedy top plane. Propagated
+        // water gets an individual top so its decreasing flow level is visible.
+        if (!fluidAbove && level > 0 && ShouldRenderFace(x, y + 1, z, material, snapshot, definitions))
+            AddBox(vertices, new Vector3(x, y, z), new Vector3(x + 1f, maximumY, z + 1f),
+                material, 1 << 0, x, y, z, 0, definitions);
+
+        ReadOnlySpan<(int X, int Z, int Face)> neighbors = stackalloc (int, int, int)[]
+        {
+            (x - 1, z, 1), (x + 1, z, 2), (x, z - 1, 3), (x, z + 1, 4),
+        };
+        foreach ((int neighborX, int neighborZ, int face) in neighbors)
+        {
+            ushort neighbor = snapshot.GetBlock(neighborX, y, neighborZ);
+            float minimumSideY = y;
+            if (neighbor != 0 && definitions[neighbor].IsFluid)
+            {
+                ushort neighborAbove = snapshot.GetBlock(neighborX, y + 1, neighborZ);
+                bool neighborHasFluidAbove = neighborAbove != 0 && definitions[neighborAbove].IsFluid;
+                float neighborMaximumY = neighborHasFluidAbove
+                    ? y + 1f
+                    : y + VoxelWorld.GetFluidSurfaceHeight(snapshot.GetFluidLevel(neighborX, y, neighborZ));
+                if (neighborMaximumY >= maximumY - 0.0001f) continue;
+                minimumSideY = neighborMaximumY;
+            }
+            else if (!ShouldRenderFace(neighborX, y, neighborZ, material, snapshot, definitions))
+            {
+                continue;
+            }
+            AddBox(vertices, new Vector3(x, minimumSideY, z), new Vector3(x + 1f, maximumY, z + 1f),
+                material, (byte)(1 << face), x, y, z, 0, definitions);
+        }
+    }
+
+    private static bool ShouldRenderFluidBoundary(
+        int neighborX,
+        int neighborY,
+        int neighborZ,
+        ushort material,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        ushort neighbor = snapshot.GetBlock(neighborX, neighborY, neighborZ);
+        if (neighbor != 0 && definitions[neighbor].IsFluid) return false;
+        return ShouldRenderFace(neighborX, neighborY, neighborZ, material, snapshot, definitions);
     }
 
     private static bool IsGreedyOpaque(BlockDefinition definition) =>
@@ -1346,6 +2094,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                 int z = chunk.MinimumZ + localZ;
                 ushort material = snapshot.GetBlock(x, y, z);
                 if (material == 0 || !definitions[material].IsFluid) continue;
+                if (snapshot.GetFluidLevel(x, y, z) > 0) continue;
                 ushort above = snapshot.GetBlock(x, y + 1, z);
                 bool fluidAbove = above != 0 && definitions[above].IsFluid;
                 if (!fluidAbove && ShouldRenderFace(x, y + 1, z, material, snapshot, definitions))
@@ -1722,7 +2471,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private void OnVoxelChanged(VoxelChangedEvent change)
     {
         bool lightChanged = IsEmissive(change.OldBlockId) || IsEmissive(change.NewBlockId);
-        if (_deferred && lightChanged)
+        if ((_deferred || EnhancedForward) && lightChanged)
         {
             ChunkCoordinate lightChunk = ChunkCoordinate.FromVoxel(change.X, change.Z);
             if (_chunkMeshes.ContainsKey(lightChunk))
@@ -1733,6 +2482,12 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
         if (!lightChanged && IsCompletelyOccludedOpaqueReplacement(change)) return;
         foreach (ChunkCoordinate chunk in ChunkCoordinate.MeshDependenciesForVoxel(change.X, change.Z))
+            if (_chunkMeshes.ContainsKey(chunk)) MarkChunkDirty(chunk);
+    }
+
+    private void OnFluidLevelChanged(int x, int y, int z)
+    {
+        foreach (ChunkCoordinate chunk in ChunkCoordinate.MeshDependenciesForVoxel(x, z))
             if (_chunkMeshes.ContainsKey(chunk)) MarkChunkDirty(chunk);
     }
 
@@ -1767,7 +2522,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _deferredLightsByChunk.Clear();
         _deferredLightsByGrid.Clear();
         _dirtyDeferredLightChunks.Clear();
-        if (_deferred)
+        if (_deferred || EnhancedForward)
             foreach (ChunkCoordinate chunk in _world.SnapshotLoadedChunks())
                 _dirtyDeferredLightChunks.Add(chunk);
         _directionalShadowDirty = true;
@@ -1794,7 +2549,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                  })
             if (_chunkMeshes.ContainsKey(neighbor)) MarkChunkDirty(neighbor);
         _deferredLightsDirty = true;
-        if (_deferred) _dirtyDeferredLightChunks.Add(chunk);
+        if (_deferred || EnhancedForward) _dirtyDeferredLightChunks.Add(chunk);
     }
 
     private void ReconcileLoadedChunkMeshes()
@@ -1836,7 +2591,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     {
         _physicsTopologyDirty = true;
         _dynamicDirectionalShadowDirty = true;
-        if (_deferred) _deferredLightsDirty = true;
+        if (_deferred || EnhancedForward) _deferredLightsDirty = true;
     }
 
     private void OnDefinitionsChanged()
@@ -1851,6 +2606,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         if (_disposed) return;
         _disposed = true;
         _world.DetailedVoxelChanged -= OnVoxelChanged;
+        _world.FluidLevelChanged -= OnFluidLevelChanged;
         _world.WorldReloaded -= OnWorldReloaded;
         _world.MicroVoxelCellChanged -= OnMicroVoxelCellChanged;
         _world.MicroVoxelsReloaded -= OnMicroVoxelsReloaded;
@@ -1861,14 +2617,23 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         foreach (PhysicsGridMesh mesh in _physicsGridMeshes.Values) mesh.Dispose();
         GL.DeleteTexture(_materialAtlasTexture);
         GL.DeleteTexture(_materialDetailTexture);
+        if (_sceneColorCopy != 0) GL.DeleteTexture(_sceneColorCopy);
         DeleteGBuffer();
+        DeleteForwardBuffers();
         DeleteDirectionalShadowMaps();
         if (_fullscreenVertexArray != 0) GL.DeleteVertexArray(_fullscreenVertexArray);
+        if (_analyticSphereVertexArray != 0) GL.DeleteVertexArray(_analyticSphereVertexArray);
         _deferredGeometry?.Dispose();
         _deferredLighting?.Dispose();
         _deferredDepth?.Dispose();
         _deferredPost?.Dispose();
+        _forwardPost?.Dispose();
+        _forwardShadowGpuTimer?.Dispose();
+        _forwardMainGpuTimer?.Dispose();
+        _forwardTransparencyGpuTimer?.Dispose();
+        _forwardPostGpuTimer?.Dispose();
         _shader.Dispose();
+        _analyticSphereShader.Dispose();
     }
 
     private void DeleteDirectionalShadowMaps()
@@ -1894,6 +2659,47 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         public void Dispose() => Vertices.Dispose();
     }
     private sealed record ChunkMeshBuildJob(int Version, Task<ChunkMeshData> Build);
+
+    private sealed class GpuPassTimer : IDisposable
+    {
+        private readonly int[] _queries = { GL.GenQuery(), GL.GenQuery() };
+        private readonly bool[] _issued = new bool[2];
+        private int _writeIndex;
+
+        public double LastMilliseconds { get; private set; }
+        public double MaximumMilliseconds { get; private set; }
+
+        public void Begin()
+        {
+            int readIndex = 1 - _writeIndex;
+            if (_issued[readIndex])
+            {
+                GL.GetQueryObject(_queries[readIndex], GetQueryObjectParam.QueryResultAvailable, out int available);
+                if (available != 0)
+                {
+                    GL.GetQueryObject(_queries[readIndex], GetQueryObjectParam.QueryResult, out long nanoseconds);
+                    LastMilliseconds = nanoseconds / 1_000_000.0;
+                    MaximumMilliseconds = Math.Max(MaximumMilliseconds, LastMilliseconds);
+                    _issued[readIndex] = false;
+                }
+            }
+            GL.BeginQuery(QueryTarget.TimeElapsed, _queries[_writeIndex]);
+        }
+
+        public void End()
+        {
+            GL.EndQuery(QueryTarget.TimeElapsed);
+            _issued[_writeIndex] = true;
+            _writeIndex = 1 - _writeIndex;
+        }
+
+        public void ResetMaximum() => MaximumMilliseconds = 0.0;
+
+        public void Dispose()
+        {
+            foreach (int query in _queries) GL.DeleteQuery(query);
+        }
+    }
 
     private sealed class PooledFloatBuffer : IDisposable
     {

@@ -5,6 +5,8 @@ using RTXSandbox.ModAPI;
 
 namespace RTXSandbox.World;
 
+internal readonly record struct FluidDisplacementEvent(int X, int Y, int Z, byte Amount);
+
 public sealed class VoxelWorld : IVoxelWorld
 {
     // Width/Depth are the legacy GPU clip-window dimensions, not horizontal world bounds.
@@ -15,8 +17,11 @@ public sealed class VoxelWorld : IVoxelWorld
     public const int Height = MaximumY - MinimumY;
     public const int DefaultGenerationRadiusChunks = 3;
     public const float FluidSurfaceHeight = 0.875f;
+    public const byte FluidCapacity = 16;
+    public const byte MaximumFluidLevel = FluidCapacity - 1;
 
     private readonly VoxelChunkStore _storage = new(MinimumY, MaximumY);
+    private readonly ConcurrentDictionary<(int X, int Y, int Z), byte> _fluidLevels = new();
     private readonly HashSet<ChunkCoordinate> _generatedChunks = new();
     private readonly ConcurrentQueue<ChunkGenerationRequest> _pendingChunkGeneration = new();
     private readonly ConcurrentQueue<ChunkGenerationResult> _completedChunkGeneration = new();
@@ -35,6 +40,7 @@ public sealed class VoxelWorld : IVoxelWorld
     private int _chunkGenerationCompletedCount;
     private int _chunkCommitCount;
     public PhysicsGridWorld PhysicsGrids { get; } = new();
+    public AnalyticSphereWorld AnalyticSpheres { get; } = new();
     public int Seed { get; private set; }
     public WorldGenerationSettings GenerationSettings { get; private set; }
 
@@ -46,6 +52,8 @@ public sealed class VoxelWorld : IVoxelWorld
     // Legacy aggregate notification retained for the GPU packed micro-voxel buffer and Mods.
     public event Action? MicroVoxelsChanged;
     public event Action<ChunkCoordinate>? ChunkGenerated;
+    public event Action<int, int, int>? FluidLevelChanged;
+    internal event Action<FluidDisplacementEvent>? FluidDisplaced;
 
     public ushort[] RawData => _storage.CreateLinearSnapshot(Width, Depth);
     public ushort[] CreateRenderWindowSnapshot(int originX, int originZ) =>
@@ -53,6 +61,21 @@ public sealed class VoxelWorld : IVoxelWorld
     internal ushort[] CreateRenderChunkSnapshot(ChunkCoordinate chunk) =>
         _storage.CreateWindowSnapshot(
             chunk.MinimumX, chunk.MinimumZ, ChunkCoordinate.Size, ChunkCoordinate.Size);
+    internal byte[] CreateFluidRenderWindowSnapshot(int originX, int originZ, int width, int depth)
+    {
+        var result = new byte[checked(width * Height * depth)];
+        foreach (((int x, int y, int z), byte level) in _fluidLevels)
+        {
+            int localX = x - originX;
+            int localY = y - MinimumY;
+            int localZ = z - originZ;
+            if ((uint)localX >= width || (uint)localY >= Height || (uint)localZ >= depth) continue;
+            result[localX + width * (localY + Height * localZ)] = level;
+        }
+        return result;
+    }
+    internal byte[] CreateFluidRenderChunkSnapshot(ChunkCoordinate chunk) =>
+        CreateFluidRenderWindowSnapshot(chunk.MinimumX, chunk.MinimumZ, ChunkCoordinate.Size, ChunkCoordinate.Size);
     public int LoadedChunkCount => _storage.ChunkCount;
     public int PendingChunkGenerationCount => _queuedChunkGeneration.Count;
     public int CompletedChunkGenerationPendingCommitCount => _completedChunkGeneration.Count;
@@ -64,8 +87,20 @@ public sealed class VoxelWorld : IVoxelWorld
     public double MaximumChunkCommitMilliseconds => TicksToMilliseconds(Interlocked.Read(ref _chunkCommitMaximumTicks));
     public int MicroVoxelContainerCount => _storage.MicroVoxelContainerCount;
     public IReadOnlyList<ChunkCoordinate> SnapshotLoadedChunks() => _storage.SnapshotCoordinates();
+    internal bool IsChunkLoaded(ChunkCoordinate coordinate) => _storage.Contains(coordinate);
     public IReadOnlyCollection<ChunkCoordinate> SnapshotGeneratedChunks() => _generatedChunks.ToArray();
-    internal VoxelChunkSnapshot SnapshotChunk(ChunkCoordinate coordinate) => _storage.SnapshotChunk(coordinate);
+    internal VoxelChunkSnapshot SnapshotChunk(ChunkCoordinate coordinate)
+    {
+        VoxelChunkSnapshot snapshot = _storage.SnapshotChunk(coordinate);
+        StoredFluidLevel[] levels = _fluidLevels
+            .Where(pair => ChunkCoordinate.FromVoxel(pair.Key.X, pair.Key.Z) == coordinate)
+            .Select(pair => new StoredFluidLevel(
+                pair.Key.X - coordinate.MinimumX, pair.Key.Y,
+                pair.Key.Z - coordinate.MinimumZ, pair.Value))
+            .OrderBy(level => level.Y).ThenBy(level => level.LocalZ).ThenBy(level => level.LocalX)
+            .ToArray();
+        return snapshot with { FluidLevels = levels };
+    }
     internal ChunkMeshingSnapshot CreateChunkMeshingSnapshot(ChunkCoordinate coordinate)
     {
         int minimumY = int.MaxValue;
@@ -81,23 +116,26 @@ public sealed class VoxelWorld : IVoxelWorld
 
         IReadOnlyList<StoredMicroVoxel> microVoxels = _storage.SnapshotChunk(coordinate).MicroVoxels;
         if (minimumY == int.MaxValue)
-            return new ChunkMeshingSnapshot(coordinate, 0, 0, Array.Empty<ushort>(), microVoxels);
+            return new ChunkMeshingSnapshot(
+                coordinate, 0, 0, Array.Empty<ushort>(), Array.Empty<byte>(), microVoxels);
 
         minimumY = Math.Max(MinimumY, minimumY - 1);
         maximumY = Math.Min(MaximumY, maximumY + 1);
         const int widthWithBorder = ChunkCoordinate.Size + 2;
         int height = maximumY - minimumY;
         var blocks = new ushort[checked(widthWithBorder * height * widthWithBorder)];
+        var fluidLevels = new byte[blocks.Length];
         for (int localZ = 0; localZ < widthWithBorder; localZ++)
         for (int y = minimumY; y < maximumY; y++)
         for (int localX = 0; localX < widthWithBorder; localX++)
         {
             int worldX = coordinate.MinimumX + localX - 1;
             int worldZ = coordinate.MinimumZ + localZ - 1;
-            blocks[localX + widthWithBorder * ((y - minimumY) + height * localZ)] =
-                _storage.GetBlock(worldX, y, worldZ);
+            int index = localX + widthWithBorder * ((y - minimumY) + height * localZ);
+            blocks[index] = _storage.GetBlock(worldX, y, worldZ);
+            fluidLevels[index] = GetFluidLevel(worldX, y, worldZ);
         }
-        return new ChunkMeshingSnapshot(coordinate, minimumY, maximumY, blocks, microVoxels);
+        return new ChunkMeshingSnapshot(coordinate, minimumY, maximumY, blocks, fluidLevels, microVoxels);
     }
     internal bool TryGetChunkVerticalBounds(
         ChunkCoordinate coordinate,
@@ -154,10 +192,53 @@ public sealed class VoxelWorld : IVoxelWorld
         return blockId != 0 && _blocks.Get(blockId).IsFluid;
     }
 
+    public byte GetFluidLevel(int x, int y, int z) =>
+        _fluidLevels.TryGetValue((x, y, z), out byte level) ? level : (byte)0;
+
+    public byte GetFluidAmount(int x, int y, int z) => IsFluid(x, y, z)
+        ? (byte)(FluidCapacity - Math.Min(GetFluidLevel(x, y, z), MaximumFluidLevel))
+        : (byte)0;
+
+    public static float GetFluidSurfaceHeight(byte level) =>
+        FluidSurfaceHeight * (FluidCapacity - Math.Min(level, MaximumFluidLevel)) / FluidCapacity;
+
+    internal bool SetFluidAmount(int x, int y, int z, byte amount)
+    {
+        amount = Math.Min(amount, FluidCapacity);
+        if (amount == 0)
+            return IsFluid(x, y, z) && SetBlockId(x, y, z, 0);
+
+        ushort existing = GetLoadedBlockId(x, y, z);
+        if (existing != (ushort)VoxelMaterial.Water)
+        {
+            if (!IsReplaceableMaterial(existing) ||
+                !SetBlockId(x, y, z, (ushort)VoxelMaterial.Water)) return false;
+        }
+        return SetFluidLevel(x, y, z, (byte)(FluidCapacity - amount)) || existing != (ushort)VoxelMaterial.Water;
+    }
+
+    internal bool SetFluidLevel(int x, int y, int z, byte level)
+    {
+        if (!IsFluid(x, y, z)) return false;
+        level = Math.Min(level, MaximumFluidLevel);
+        bool changed;
+        if (level == 0)
+            changed = _fluidLevels.TryRemove((x, y, z), out _);
+        else
+        {
+            changed = !_fluidLevels.TryGetValue((x, y, z), out byte existing) || existing != level;
+            if (changed) _fluidLevels[(x, y, z)] = level;
+        }
+        if (changed) FluidLevelChanged?.Invoke(x, y, z);
+        return changed;
+    }
+
     public bool IsFluidMaterial(ushort materialId) =>
         materialId != 0 && _blocks.Get(materialId).IsFluid;
     internal bool IsCollidableMaterial(ushort materialId) =>
         materialId != 0 && _blocks.Get(materialId).IsCollidable;
+    internal bool IsReplaceableMaterial(ushort materialId) =>
+        materialId == 0 || _blocks.Get(materialId).IsReplaceable;
     internal BlockDefinition[] CreateBlockDefinitionLookupSnapshot() =>
         _blocks.CreateLookupSnapshot();
     internal event Action BlockDefinitionsChanged
@@ -197,7 +278,11 @@ public sealed class VoxelWorld : IVoxelWorld
         if (_proceduralGenerationEnabled) EnsureChunkGenerated(chunk);
         else _generatedChunks.Add(chunk);
 
+        ushort previousBlockId = _storage.GetBlock(x, y, z);
+        byte displacedAmount = IsFluidMaterial(previousBlockId) ? GetFluidAmount(x, y, z) : (byte)0;
         if (!_storage.SetBlock(x, y, z, blockId, out ushort oldBlockId, out bool removedMicro)) return false;
+
+        if (!IsFluidMaterial(blockId)) _fluidLevels.TryRemove((x, y, z), out _);
 
         if (oldBlockId != blockId)
         {
@@ -205,6 +290,8 @@ public sealed class VoxelWorld : IVoxelWorld
             DetailedVoxelChanged?.Invoke(new VoxelChangedEvent(x, y, z, oldBlockId, blockId));
         }
         if (removedMicro) PublishMicroVoxelCellChanged(x, y, z);
+        if (displacedAmount > 0 && blockId != 0 && !IsFluidMaterial(blockId))
+            FluidDisplaced?.Invoke(new FluidDisplacementEvent(x, y, z, displacedAmount));
         return true;
     }
 
@@ -219,10 +306,12 @@ public sealed class VoxelWorld : IVoxelWorld
             throw new ArgumentException($"Expected {expectedLength} voxels, received {data.Length}.", nameof(data));
         }
         _storage.LoadLinear(data, Width, Depth);
+        _fluidLevels.Clear();
         _generatedChunks.Clear();
         foreach (ChunkCoordinate chunk in ChunkCoordinate.CoveringArea(Width, Depth))
             _generatedChunks.Add(chunk);
         PhysicsGrids.Clear();
+        AnalyticSpheres.Clear();
         WorldReloaded?.Invoke();
         MicroVoxelsReloaded?.Invoke();
         MicroVoxelsChanged?.Invoke();
@@ -232,9 +321,19 @@ public sealed class VoxelWorld : IVoxelWorld
     {
         ClearPendingChunkGeneration();
         _storage.LoadChunks(chunks);
+        _fluidLevels.Clear();
+        foreach (VoxelChunkSnapshot chunk in chunks)
+        foreach (StoredFluidLevel fluid in chunk.FluidLevels)
+        {
+            int x = chunk.Coordinate.MinimumX + fluid.LocalX;
+            int z = chunk.Coordinate.MinimumZ + fluid.LocalZ;
+            if (fluid.Level > 0 && fluid.Level <= MaximumFluidLevel && IsFluid(x, fluid.Y, z))
+                _fluidLevels[(x, fluid.Y, z)] = fluid.Level;
+        }
         _generatedChunks.Clear();
         foreach (VoxelChunkSnapshot chunk in chunks) _generatedChunks.Add(chunk.Coordinate);
         PhysicsGrids.Clear();
+        AnalyticSpheres.Clear();
         WorldReloaded?.Invoke();
         MicroVoxelsReloaded?.Invoke();
         MicroVoxelsChanged?.Invoke();
@@ -249,8 +348,10 @@ public sealed class VoxelWorld : IVoxelWorld
         Seed = GenerationSettings.Seed;
         _proceduralGenerationEnabled = true;
         _storage.Clear();
+        _fluidLevels.Clear();
         _generatedChunks.Clear();
         PhysicsGrids.Clear();
+        AnalyticSpheres.Clear();
         GenerateWorld();
         WorldReloaded?.Invoke();
         MicroVoxelsReloaded?.Invoke();

@@ -4,6 +4,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(rgba32f, binding = 0) uniform image2D uAccumulation;
 
 uniform usampler3D uVoxels;
+uniform usampler3D uFluidLevels;
 uniform usampler3D uMicroCells;
 uniform sampler1D uMaterialSurface;
 uniform sampler1D uMaterialEmission;
@@ -19,7 +20,14 @@ uniform float uTanHalfFov;
 uniform int uFrameIndex;
 uniform float uTimeOfDay;
 uniform int uMaxBounces;
+uniform float uRayDistance;
+uniform float uDirectLightingStrength;
+uniform float uEnvironmentIntensity;
+uniform float uEmissionIntensity;
+uniform float uReflectionStrength;
+uniform int uRussianRouletteStart;
 uniform int uHasSelection;
+uniform int uSelectionInReflections;
 uniform ivec3 uSelectedCell;
 uniform int uSelectedGrid;
 uniform int uDynamicBoxCount;
@@ -97,8 +105,49 @@ Hit traceDynamicBoxes(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool
     for (int index = 0; index < uDynamicBoxCount; ++index)
     {
         DynamicBox box = dynamicBoxes[index];
+        if (box.centerAndMaterial.w < 0.0)
+        {
+            float groupDistance;
+            vec3 groupNormal;
+            bool intersectsGroup = intersectMicroBox(
+                rayOrigin,
+                rayDirection,
+                box.centerAndMaterial.xyz - box.halfExtentsAndGrid.xyz,
+                box.centerAndMaterial.xyz + box.halfExtentsAndGrid.xyz,
+                0.0,
+                hit.distance,
+                groupDistance,
+                groupNormal);
+            if (!intersectsGroup)
+                index += int(-box.halfExtentsAndGrid.w + 0.5);
+            continue;
+        }
         uint material = uint(box.centerAndMaterial.w + 0.5);
         if (ignoreTransmissive && materialIsTransmissive(material)) continue;
+        if (box.halfExtentsAndGrid.w < -1.5)
+        {
+            float radius = box.halfExtentsAndGrid.x;
+            vec3 offset = rayOrigin - box.centerAndMaterial.xyz;
+            float projected = dot(offset, rayDirection);
+            float discriminant = projected * projected - (dot(offset, offset) - radius * radius);
+            if (discriminant < 0.0) continue;
+            float root = sqrt(discriminant);
+            float distance = -projected - root;
+            if (distance <= 0.0001) distance = -projected + root;
+            if (distance <= 0.0001 || distance >= hit.distance) continue;
+            hit.found = true;
+            hit.distance = distance;
+            hit.position = rayOrigin + rayDirection * distance;
+            hit.normal = normalize(hit.position - box.centerAndMaterial.xyz);
+            float longitude = atan(hit.normal.z, hit.normal.x) / (2.0 * PI) + 0.5;
+            float latitude = asin(clamp(hit.normal.y, -1.0, 1.0)) / PI + 0.5;
+            hit.surfaceCoordinates = vec3(longitude, latitude, longitude);
+            hit.surfaceNormal = hit.normal;
+            hit.cell = ivec3(-1);
+            hit.material = material;
+            hit.grid = -2;
+            continue;
+        }
         vec4 inverseRotation = vec4(-box.rotation.xyz, box.rotation.w);
         vec3 localOrigin = rotateQuaternion(inverseRotation, rayOrigin - box.centerAndMaterial.xyz);
         vec3 localDirection = rotateQuaternion(inverseRotation, rayDirection);
@@ -174,6 +223,12 @@ float firstBoundary(float origin, float direction, int cell)
 bool materialIsFluid(uint id)
 {
     return (texelFetch(uMaterialFlags, int(id), 0).r & 1u) != 0u;
+}
+
+float fluidSurfaceHeight(ivec3 cell)
+{
+    uint level = texelFetch(uFluidLevels, voxelTextureCell(cell), 0).r;
+    return 0.875 * float(16u - min(level, 15u)) / 16.0;
 }
 
 bool materialIsTransparent(uint id)
@@ -284,7 +339,7 @@ Hit traceVoxelWorld(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool i
                     rayOrigin,
                     rayDirection,
                     vec3(cell),
-                    vec3(cell) + vec3(1.0, fluidAbove ? 1.0 : 0.875, 1.0),
+                    vec3(cell) + vec3(1.0, fluidAbove ? 1.0 : fluidSurfaceHeight(cell), 1.0),
                     max(0.0, distance - 0.0001),
                     min(cellExitDistance + 0.0001, maxDistance),
                     materialDistance,
@@ -536,6 +591,11 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     uint originMaterial = insideWorld(originCell)
         ? texelFetch(uVoxels, voxelTextureCell(originCell), 0).r
         : 0u;
+    if (materialIsFluid(originMaterial) &&
+        fract(rayOrigin.y) >= fluidSurfaceHeight(originCell) &&
+        (!insideWorld(originCell + ivec3(0, 1, 0)) ||
+         !materialIsFluid(texelFetch(uVoxels, voxelTextureCell(originCell + ivec3(0, 1, 0)), 0).r)))
+        originMaterial = 0u;
     bool travellingThroughTransmissive = materialIsTransmissive(originMaterial);
     if (travellingThroughTransmissive)
     {
@@ -554,10 +614,10 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     {
         if (bounce >= uMaxBounces) break;
         bool wasTravellingThroughMedium = travellingThroughTransmissive;
-        Hit hit = traceVoxelWorld(rayOrigin, rayDirection, 140.0, travellingThroughTransmissive);
+        Hit hit = traceVoxelWorld(rayOrigin, rayDirection, uRayDistance, travellingThroughTransmissive);
         if (!hit.found)
         {
-            radiance += throughput * skyColor(rayDirection);
+            radiance += throughput * skyColor(rayDirection) * uEnvironmentIntensity;
             break;
         }
 
@@ -572,7 +632,8 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
 
         // Selection is part of the light transport instead of a screen-space overlay.
         // Emitting it at every bounce makes the frame visible in mirrors, water and glass.
-        if (uHasSelection != 0 && hit.grid == uSelectedGrid && all(equal(hit.cell, uSelectedCell)))
+        if (uHasSelection != 0 && (bounce == 0 || uSelectionInReflections != 0) &&
+            hit.grid == uSelectedGrid && all(equal(hit.cell, uSelectedCell)))
         {
             vec3 local = abs(hit.surfaceCoordinates - 0.5);
             vec3 tangentMask = vec3(1.0) - abs(hit.surfaceNormal);
@@ -592,7 +653,7 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
             float mediumMetallic;
             vec3 mediumEmission;
             materialProperties(hit.material, mediumAlbedo, mediumRoughness, mediumMetallic, mediumEmission);
-            radiance += throughput * mediumEmission;
+            radiance += throughput * mediumEmission * uEmissionIntensity;
             float ior = materialIsFluid(hit.material) ? 1.333 : materialIndexOfRefraction(hit.material);
             vec3 opticalNormal = hit.normal;
             if (!materialIsFluid(hit.material))
@@ -641,17 +702,37 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
         materialProperties(hit.material, albedo, roughness, metallic, emission);
         vec3 shadingNormal = hit.normal;
         applySurfaceDetail(hit.material, hit, albedo, roughness, shadingNormal);
-        radiance += throughput * emission;
+        radiance += throughput * emission * uEmissionIntensity;
 
-        Hit blocker = traceVoxelWorld(hit.position + hit.normal * 0.0025, primaryLightDirection, 140.0, true);
+        Hit blocker = traceVoxelWorld(hit.position + hit.normal * 0.0025,
+            primaryLightDirection, uRayDistance, true);
         float direct = blocker.found ? 0.0 : max(dot(shadingNormal, primaryLightDirection), 0.0);
-        radiance += throughput * albedo * primaryLightColor * direct * primaryLightIntensity * (1.0 - metallic);
+        radiance += throughput * albedo * primaryLightColor * direct * primaryLightIntensity *
+            uDirectLightingStrength * (1.0 - metallic);
+
+        // Metals have no diffuse lobe, but they still reflect the directional light.
+        // The old diffuse-only next-event estimate multiplied their entire direct
+        // contribution by (1-metallic), making the analytic iron sphere nearly black
+        // until many stochastic reflection samples had accumulated.
+        if (direct > 0.0 && metallic > 0.001)
+        {
+            vec3 viewDirection = normalize(-rayDirection);
+            vec3 halfDirection = normalize(primaryLightDirection + viewDirection);
+            float normalHalf = max(dot(shadingNormal, halfDirection), 0.0);
+            float glossExponent = mix(12.0, 768.0, 1.0 - roughness);
+            float normalizedLobe = (glossExponent + 2.0) / (2.0 * PI);
+            vec3 metalFresnel = mix(vec3(0.04), albedo, metallic);
+            radiance += throughput * metalFresnel * primaryLightColor * direct *
+                pow(normalHalf, glossExponent) * normalizedLobe * primaryLightIntensity *
+                uDirectLightingStrength;
+        }
 
         vec3 diffuseDirection = cosineHemisphere(shadingNormal, state);
         vec3 reflectedDirection = reflect(rayDirection, shadingNormal);
         float viewFacing = clamp(dot(-rayDirection, shadingNormal), 0.0, 1.0);
         float dielectricFresnel = 0.04 + 0.96 * pow(1.0 - viewFacing, 5.0);
-        float specularChance = clamp(mix(dielectricFresnel, 0.92, metallic), 0.04, 0.96);
+        float specularChance = clamp(mix(dielectricFresnel, 0.92, metallic) *
+            uReflectionStrength, 0.001, 0.98);
         bool chooseSpecular = random(state) < specularChance;
         rayDirection = chooseSpecular
             ? normalize(mix(reflectedDirection, diffuseDirection, roughness * roughness))
@@ -660,7 +741,8 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
         if (chooseSpecular)
         {
             vec3 f0 = mix(vec3(0.04), albedo, metallic);
-            vec3 fresnelColor = f0 + (vec3(1.0) - f0) * pow(1.0 - viewFacing, 5.0);
+            vec3 fresnelColor = (f0 + (vec3(1.0) - f0) * pow(1.0 - viewFacing, 5.0)) *
+                uReflectionStrength;
             throughput *= fresnelColor / max(specularChance, 0.001);
         }
         else
@@ -671,7 +753,7 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
 
         rayOrigin = hit.position + hit.normal * 0.003;
 
-        if (bounce > 0)
+        if (bounce >= uRussianRouletteStart)
         {
             float survive = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.15, 0.92);
             if (random(state) > survive) break;

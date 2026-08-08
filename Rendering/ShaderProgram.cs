@@ -19,7 +19,7 @@ internal sealed class ShaderProgram : IDisposable
             {
                 int shader = GL.CreateShader(type);
                 shaderHandles.Add(shader);
-                GL.ShaderSource(shader, source);
+                GL.ShaderSource(shader, PrepareSource(type, source));
                 GL.CompileShader(shader);
                 GL.GetShader(shader, ShaderParameter.CompileStatus, out int compiled);
                 if (compiled == 0)
@@ -61,4 +61,16 @@ internal sealed class ShaderProgram : IDisposable
     }
 
     public void Dispose() => GL.DeleteProgram(Handle);
+
+    private static string PrepareSource(ShaderType type, string source)
+    {
+        // Apple exposes desktop OpenGL 4.1 as its final OpenGL version. Raster
+        // shaders only use features available there; compute shaders remain
+        // unavailable and are filtered by the renderer capability catalog.
+        bool gl41Compatibility = OperatingSystem.IsMacOS() ||
+                                 Environment.GetEnvironmentVariable("RTX_SANDBOX_FORCE_GL41") == "1";
+        if (gl41Compatibility && type != ShaderType.ComputeShader)
+            return source.Replace("#version 430 core", "#version 410 core", StringComparison.Ordinal);
+        return source;
+    }
 }

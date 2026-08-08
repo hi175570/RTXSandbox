@@ -1,9 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
+    <!-- Visual Studio 2022 17.14 cannot evaluate a project that directly targets
+         net10.0. Keep net9.0 as the IDE-safe default while allowing the standalone
+         .NET 10 SDK to opt in with -p:RTXSandboxHostTargetFramework=net10.0. -->
+    <RTXSandboxHostTargetFramework Condition="'$(RTXSandboxHostTargetFramework)' == ''">net9.0</RTXSandboxHostTargetFramework>
+    <TargetFramework>$(RTXSandboxHostTargetFramework)</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
     <LangVersion>latest</LangVersion>
-    <CheckEolTargetFramework>false</CheckEolTargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -23,10 +27,14 @@
   <ItemGroup>
     <Compile Remove="RTXSandbox.ModAPI\**\*.cs" />
     <Compile Remove="Examples\**\*.cs" />
+    <Compile Remove="RTXSandbox.Android\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" />
+    <!-- The modern override also keeps the optional .NET 10 host free of the
+         RuntimeDetour PrepareMethod crash in BepInEx build 785. -->
+    <PackageReference Include="HarmonyX" Version="2.16.1" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
     <PackageReference Include="BepuPhysics" Version="2.4.0" />
     <PackageReference Include="OpenTK" Version="4.9.4" />
@@ -69,12 +77,20 @@
     <RemoveDir Directories="$(OutputPath)..\runtimes" Condition="Exists('$(OutputPath)..\runtimes')" />
   </Target>
 
+  <!-- Older output rules accidentally produced Content\Content and
+       ContentPacks\ContentPacks. Remove only those known generated copies;
+       user-created packs beside ExamplePack are left untouched. -->
+  <Target Name="RemoveLegacyDuplicatedContent" BeforeTargets="Build">
+    <RemoveDir Directories="$(OutputPath)..\Content\Content" />
+    <RemoveDir Directories="$(OutputPath)..\ContentPacks\ContentPacks\ExamplePack" />
+  </Target>
+
   <Target Name="CreateRootAppHost"
           AfterTargets="Build"
           DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration">
     <CreateAppHost AppHostSourcePath="$(AppHostSourcePath)"
                    AppHostDestinationPath="$(OutputPath)..\$(TargetName)$(_NativeExecutableExtension)"
-                   AppBinaryName="Managed\$(AssemblyName)$(TargetExt)"
+                   AppBinaryName="Managed/$(AssemblyName)$(TargetExt)"
                    IntermediateAssembly="@(IntermediateAssembly->'%(FullPath)')"
                    WindowsGraphicalUserInterface="$(_UseWindowsGraphicalUserInterface)"
                    Retries="$(CopyRetryCount)"
@@ -82,5 +98,40 @@
                    EnableMacOSCodeSign="$(_EnableMacOSCodeSign)"
                    DisableCetCompat="$(_DisableCetCompat)" />
     <Delete Files="$(TargetDir)$(TargetName)$(_NativeExecutableExtension)" />
+  </Target>
+
+  <!-- The platform build scripts opt into one consistent distributable layout:
+       native apphost in the root, managed/runtime files in Managed, and portable
+       game data beside it. Ordinary IDE publish remains unchanged. -->
+  <Target Name="CreateManagedPlatformPublish"
+          AfterTargets="Publish"
+          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration"
+          Condition="'$(RTXSandboxManagedPublish)' == 'true'">
+    <ItemGroup>
+      <PublishedShader Include="$(MSBuildProjectDirectory)\Shaders\*.glsl;$(MSBuildProjectDirectory)\Shaders\*.hlsl" />
+      <PublishedBaseContent Include="$(MSBuildProjectDirectory)\Content\**\*.json" />
+      <PublishedContentPack Include="$(MSBuildProjectDirectory)\ContentPacks\**\*.json" />
+    </ItemGroup>
+    <!-- CreateAppHost may leave an existing destination untouched. A stale root
+         host can therefore keep targeting the pre-layout root DLL instead of
+         Managed/RTXSandbox.dll when a publish directory is reused. -->
+    <Delete Files="$(PublishDir)..\$(TargetName)$(_NativeExecutableExtension)" />
+    <CreateAppHost AppHostSourcePath="$(AppHostSourcePath)"
+                   AppHostDestinationPath="$(PublishDir)..\$(TargetName)$(_NativeExecutableExtension)"
+                   AppBinaryName="Managed/$(AssemblyName)$(TargetExt)"
+                   IntermediateAssembly="@(IntermediateAssembly->'%(FullPath)')"
+                   WindowsGraphicalUserInterface="$(_UseWindowsGraphicalUserInterface)"
+                   Retries="$(CopyRetryCount)"
+                   RetryDelayMilliseconds="$(CopyRetryDelayMilliseconds)"
+                   EnableMacOSCodeSign="$(_EnableMacOSCodeSign)"
+                   DisableCetCompat="$(_DisableCetCompat)" />
+    <Delete Files="$(PublishDir)$(TargetName)$(_NativeExecutableExtension)" />
+    <Copy SourceFiles="@(PublishedShader)"
+          DestinationFiles="@(PublishedShader->'$(PublishDir)..\Shaders\%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(PublishedBaseContent)"
+          DestinationFiles="@(PublishedBaseContent->'$(PublishDir)..\Content\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(PublishedContentPack)"
+          DestinationFiles="@(PublishedContentPack->'$(PublishDir)..\ContentPacks\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\settings.json" DestinationFolder="$(PublishDir).." />
   </Target>
 </Project>

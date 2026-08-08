@@ -25,6 +25,13 @@ namespace RTXSandbox;
 public sealed partial class SandboxGame : GameWindow
 {
     private static readonly int[] QualityBounces = { 1, 2, 3, 4, 6, 8, 12, 16, 20, 30, 40, 50 };
+    private static readonly string[] BindableKeys =
+    {
+        "W", "A", "S", "D", "Q", "E", "R", "F", "V", "B", "I", "N", "M", "X",
+        "Space", "LeftShift", "RightShift", "LeftControl", "RightControl", "LeftAlt", "RightAlt",
+        "Tab", "Escape", "Up", "Down", "Left", "Right", "PageUp", "PageDown", "Home", "End",
+        "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9",
+    };
     private static readonly IReadOnlyDictionary<string, string> ChineseBlockWords =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -85,6 +92,7 @@ public sealed partial class SandboxGame : GameWindow
     private BuildToolSystem _buildTools = null!;
     private MicroBuildSystem _microBuild = null!;
     private VoxelPhysicsSimulator _physics = null!;
+    private WaterFlowSimulation _waterFlow = null!;
     private VoxelWorld _world = null!;
     private ModHost _modHost = null!;
     private WorldSaveService _worldSaves = null!;
@@ -103,17 +111,25 @@ public sealed partial class SandboxGame : GameWindow
     private VoxelHit? _regularSelection;
     private MicroVoxelHit? _microSelection;
     private PhysicsGridRayHit? _gridSelection;
+    private AnalyticSphereHit? _sphereSelection;
     private VoxelHit? _miningTarget;
     private float _miningProgress;
+    private ushort _selectedBlockNameId;
+    private float _selectedBlockNameSecondsRemaining;
     private bool _loaded;
     private bool _mouseCaptured = true;
     private bool _settingsVisible;
     private bool _inventoryVisible;
     private bool _toolboxVisible;
+    private float _analyticSphereRadius = 0.65f;
+    private int _analyticSphereMaterial;
     private bool _worldCreationVisible;
     private bool _mainMenuVisible;
     private bool _pauseMenuVisible;
     private bool _modsVisible;
+    private bool _achievementsVisible;
+    private bool _languageVisible;
+    private bool _keyBindingsVisible;
     private bool _settingsOpenedFromPause;
     private string _worldNameDraft = "world1";
     private WorldGenerationSettings _worldDraft = null!;
@@ -142,8 +158,11 @@ public sealed partial class SandboxGame : GameWindow
     private string? _modMoveSource;
     private string _modMoveDestination = string.Empty;
     private bool _modMovePopupRequested;
+    private bool _modMovePopupOpen;
     private string? _modDeleteSource;
     private bool _modDeletePopupRequested;
+    private bool _modDeletePopupOpen;
+    private bool _modRollbackPopupOpen;
     private double _autosaveTimer;
     private WorldSaveService.IncrementalSaveOperation? _autosaveOperation;
     private string _paletteSearch = string.Empty;
@@ -163,10 +182,25 @@ public sealed partial class SandboxGame : GameWindow
     private string _gpuSmokeShortcut = string.Empty;
     private bool _gpuSmokeShortcutTriggered;
     private int _pauseMenuButtonCountThisFrame;
+    private long _lastForwardPressTimestamp;
+    private bool _doubleTapSprint;
+    private float _sprintFovOffset;
     private bool _hardwareSmokeEdited;
     private bool _hardwareSmokeValidated;
+    private bool _hardwareInfiniteMirrorTailObserved;
+    private bool _gpuSmokeGlassOcclusion;
+    private bool _gpuSmokeDarkRoom;
+    private int _glassOcclusionSmokeStage;
+    private int _glassOcclusionTargetStaticBuilds;
+    private int _glassOcclusionWallY;
+    private double _glassOccludedLuminance;
     private int _imeSmokeStage;
     private int _gpuSmokeFrames;
+    private bool _pathTracingSphereSmokeValidated;
+    private bool _gpuSmokeHudPrepared;
+    private bool _selectedBlockNameObserved;
+    private bool _targetBlockInformationObserved;
+    private bool _gpuSmokeHudEvidenceReported;
     private bool _debugVisible;
     private long _lastSpacePressTimestamp;
     private ChunkCoordinate? _streamedPlayerChunk;
@@ -192,8 +226,16 @@ public sealed partial class SandboxGame : GameWindow
     public WorldSaveService WorldSaves => _worldSaves;
 
     public SandboxGame()
-        : this(GameSettings.Load())
+        : this(LoadLaunchSettings())
     {
+    }
+
+    private static GameSettings LoadLaunchSettings()
+    {
+        GameSettings settings = GameSettings.Load();
+        if (Environment.GetEnvironmentVariable("RTX_SANDBOX_STREAM_BENCHMARK") == "1")
+            ConfigureStreamingBenchmarkQuality(settings);
+        return settings;
     }
 
     private SandboxGame(GameSettings settings)
@@ -217,19 +259,36 @@ public sealed partial class SandboxGame : GameWindow
         _gpuSmokeIme = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_IME") == "1";
         _gpuSmokePause = Environment.GetEnvironmentVariable("RTX_SANDBOX_OPEN_PAUSE_MENU") == "1";
         _gpuSmokeStreaming = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_STREAMING") == "1";
+        _gpuSmokeGlassOcclusion =
+            Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_GLASS_OCCLUSION") == "1";
+        _gpuSmokeDarkRoom = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DARK_ROOM") == "1";
         _streamingBenchmark = Environment.GetEnvironmentVariable("RTX_SANDBOX_STREAM_BENCHMARK") == "1";
-        if (_streamingBenchmark) ConfigureStreamingBenchmarkQuality();
         _gpuSmokeShortcut = Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_SHORTCUT") ?? string.Empty;
         if (_gpuSmoke && Enum.TryParse(
                 Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEFERRED_DEBUG"),
                 ignoreCase: true, out DeferredDebugView smokeDebugView))
             _settings.DeferredDebugView = smokeDebugView;
+        if (_gpuSmoke && Enum.TryParse(
+                Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEFERRED_PRESET"),
+                ignoreCase: true, out DeferredQualityPreset smokePreset))
+            _settings.ApplyDeferredQualityPreset(smokePreset);
+        if (_gpuSmoke && Enum.TryParse(
+                Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_FORWARD_PRESET"),
+                ignoreCase: true, out ForwardQualityPreset forwardSmokePreset))
+            _settings.ApplyForwardQualityPreset(forwardSmokePreset);
+        if (_gpuSmoke && Enum.TryParse(
+                Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_FORWARD_DEBUG"),
+                ignoreCase: true, out ForwardDebugView forwardSmokeDebug))
+            _settings.ForwardDebugView = forwardSmokeDebug;
         if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEFERRED_MAX_QUALITY") == "1")
         {
             _settings.DeferredRendererQuality = 3;
             _settings.DeferredGBufferQuality = 3;
             _settings.DeferredLightingQuality = 3;
             _settings.DeferredShadowQuality = 3;
+            _settings.DeferredShadowResolution = 4096;
+            _settings.DeferredShadowDistance = 140f;
+            _settings.DeferredShadowSoftness = 1.35f;
             _settings.DeferredReflectionQuality = 3;
             _settings.DeferredAmbientOcclusionQuality = 3;
             _settings.DeferredWaterQuality = 3;
@@ -301,7 +360,10 @@ public sealed partial class SandboxGame : GameWindow
         if (!_streamingBenchmark) StreamWorldAroundPlayer();
         _player.FlightMode = _streamingBenchmark || _settings.StartInFlightMode;
         _player.NoClip = _streamingBenchmark || _settings.StartWithNoClip;
-        _buildTools = new BuildToolSystem(_world, _blocks, _toolRegistry, _player.WouldIntersectBlock);
+        _buildTools = new BuildToolSystem(_world, _blocks, _toolRegistry, _player.WouldIntersectBlock)
+        {
+            AutoApplyQueuedEdits = false,
+        };
         if (_blocks.TryGet(_settings.SelectedBlockKey, out BlockDefinition? rememberedBlock) && rememberedBlock!.IsPlaceable)
             _buildTools.SelectedBlockId = rememberedBlock.Id;
         if (Enum.TryParse(_settings.EditorTool, ignoreCase: true, out EditorToolMode rememberedTool) &&
@@ -323,6 +385,7 @@ public sealed partial class SandboxGame : GameWindow
             if (_blocks.TryGet(key, out BlockDefinition? recent) && recent!.IsPlaceable) _recentBlocks.Add(recent.Key);
         }
         _physics = new VoxelPhysicsSimulator(_world, _blocks);
+        _waterFlow = new WaterFlowSimulation(_world);
         _inventory = new PlayerInventory(_items);
         if (loadedSave && savedState.Inventory.Count > 0)
         {
@@ -407,14 +470,50 @@ public sealed partial class SandboxGame : GameWindow
             _world.SetBlockId(3, 250, 2, (ushort)VoxelMaterial.Glass);
             int glowY = Math.Clamp(_world.FindTopVoxelY(4, 2), VoxelWorld.MinimumY, 255);
             _world.SetBlockId(4, glowY, 2, (ushort)VoxelMaterial.Glow);
+            // Keep a visible stepped flow in every renderer smoke. This exercises the
+            // shared fluid-level snapshot instead of validating only full-height oceans.
+            for (byte level = 0; level <= VoxelWorld.MaximumFluidLevel; level++)
+            {
+                int waterX = 29 + level;
+                const int waterY = 5;
+                const int waterZ = 35;
+                _world.SetBlockId(waterX, waterY - 1, waterZ, (ushort)VoxelMaterial.Stone);
+                _world.SetBlockId(waterX, waterY, waterZ, (ushort)VoxelMaterial.Water);
+                _world.SetFluidLevel(waterX, waterY, waterZ, level);
+            }
             _physics.AnalyzeNow();
             if (_world.PhysicsGrids.Grids.LastOrDefault() is PhysicsGrid smokeGrid)
                 smokeGrid.AngularVelocity = new NumericsVector3(0.25f, 0.45f, 0.12f);
+            if (!_gpuSmokeGlassOcclusion && !_gpuSmokeDarkRoom &&
+                _blocks.TryGet("rtxsandbox:iron_block", out BlockDefinition? smokeIron) && smokeIron is not null)
+            {
+                NumericsVector3 smokeRight = NumericsVector3.Normalize(
+                    NumericsVector3.Cross(_camera.Forward, NumericsVector3.UnitY));
+                bool centerPathTracingSphere = string.Equals(
+                    Environment.GetEnvironmentVariable("RTX_SANDBOX_RENDERER"),
+                    nameof(RenderBackendKind.SoftwareRayTracing),
+                    StringComparison.OrdinalIgnoreCase);
+                AnalyticSphere smokeSphere = _world.AnalyticSpheres.Create(
+                    _player.EyePosition + _camera.Forward * 2.2f +
+                    smokeRight * (centerPathTracingSphere ? 0f : 0.85f),
+                    centerPathTracingSphere ? 0.72f : 0.48f,
+                    smokeIron.Id);
+                smokeSphere.IsSleeping = true;
+            }
+            if (_gpuSmokeGlassOcclusion)
+                SetUpGlassOcclusionSmokeScene();
+            else if (_gpuSmokeDarkRoom)
+                SetUpDarkRoomSmokeScene();
         }
         _clock = new WorldClock(
             loadedSave ? savedState.TimeOfDay : _settings.TimeOfDay,
             _settings.DayLengthMinutes,
             _settings.PauseTime);
+        if (_gpuSmokeDarkRoom)
+        {
+            _clock.SetTime(0f);
+            _clock.Paused = true;
+        }
         _modHost.RegisterService(_player);
         _modHost.RegisterService(_buildTools);
         _modHost.RegisterService(_microBuild);
@@ -470,7 +569,7 @@ public sealed partial class SandboxGame : GameWindow
             _modsVisible = false;
             _pauseMenuVisible = false;
         }
-        SetMouseCaptured(!AnyInterfaceVisible() && IsFocused);
+        SetMouseCaptured(!AnyInterfaceOrPopupVisible() && IsFocused);
         _loaded = true;
         _modHost.PublishWorldReady();
         UpdateSelection();
@@ -486,6 +585,10 @@ public sealed partial class SandboxGame : GameWindow
         {
             return;
         }
+        _ui.EnforceGameplayEnglishInput(_mouseCaptured && IsFocused && !AnyInterfaceOrPopupVisible());
+        _selectedBlockNameSecondsRemaining = Math.Max(
+            0f,
+            _selectedBlockNameSecondsRemaining - (float)args.Time);
         if (_gpuSmokeStreamingStage == 1)
         {
             double frameMilliseconds = args.Time * 1000.0;
@@ -499,6 +602,12 @@ public sealed partial class SandboxGame : GameWindow
         if (!_streamingBenchmark && (IsFocused || _gpuSmoke)) HandleSystemAndRenderSettings();
         int submittedChunks = _world.ProcessPendingChunkGeneration(
             FrameWorkBudget.Default.MaximumChunkCommitsPerFrame);
+        if (_buildTools.ApplyQueuedEdits(16))
+        {
+            _renderer.ResetAccumulation();
+            UpdateSelection();
+        }
+
         if (!_streamingBenchmark && _ui.WantsKeyboardInput)
         {
             ResetMining();
@@ -509,7 +618,7 @@ public sealed partial class SandboxGame : GameWindow
             // Deterministic benchmark actions are driven by the benchmark controller,
             // never by physical keys pressed in another foreground application.
         }
-        else if (!AnyInterfaceVisible())
+        else if (!AnyInterfaceOrPopupVisible())
         {
             if (IsFocused)
             {
@@ -526,6 +635,7 @@ public sealed partial class SandboxGame : GameWindow
 
         _clock.Update((float)args.Time);
         _modHost.Update((float)args.Time);
+        if (!_clock.Paused) _waterFlow.Update((float)args.Time);
         if (!_streamingBenchmark) StreamWorldAroundPlayer();
         if (!_clock.Paused && _clock.CircularDistanceFrom(_lastAccumulatedTime) >= 0.012f)
         {
@@ -535,6 +645,7 @@ public sealed partial class SandboxGame : GameWindow
 
         NumericsVector3 oldPosition = _player.Position;
         NumericsVector3 oldForward = _camera.Forward;
+        float oldFieldOfView = _camera.FieldOfViewDegrees;
 
         if (_mouseCaptured && IsFocused)
         {
@@ -546,19 +657,41 @@ public sealed partial class SandboxGame : GameWindow
         NumericsVector2 movement = NumericsVector2.Zero;
         if (_mouseCaptured && IsFocused)
         {
-            movement.X = (KeyboardState.IsKeyDown(Keys.D) ? 1f : 0f) -
-                         (KeyboardState.IsKeyDown(Keys.A) ? 1f : 0f);
-            movement.Y = (KeyboardState.IsKeyDown(Keys.W) ? 1f : 0f) -
-                         (KeyboardState.IsKeyDown(Keys.S) ? 1f : 0f);
+            movement.X = (IsBindingDown(_settings.MoveRightKey) ? 1f : 0f) -
+                         (IsBindingDown(_settings.MoveLeftKey) ? 1f : 0f);
+            movement.Y = (IsBindingDown(_settings.MoveForwardKey) ? 1f : 0f) -
+                         (IsBindingDown(_settings.MoveBackwardKey) ? 1f : 0f);
         }
 
-        bool sprint = KeyboardState.IsKeyDown(Keys.LeftShift) || KeyboardState.IsKeyDown(Keys.RightShift);
-        bool jump = _mouseCaptured && KeyboardState.IsKeyDown(Keys.Space);
-        bool descend = _mouseCaptured &&
-                       (KeyboardState.IsKeyDown(Keys.LeftControl) || KeyboardState.IsKeyDown(Keys.RightControl));
-        _player.Update((float)args.Time, movement, _camera.Forward, sprint, jump, descend);
+        if (_mouseCaptured && IsFocused && IsBindingPressed(_settings.MoveForwardKey))
+        {
+            long pressedAt = Stopwatch.GetTimestamp();
+            double elapsed = _lastForwardPressTimestamp == 0
+                ? double.MaxValue
+                : (pressedAt - _lastForwardPressTimestamp) / (double)Stopwatch.Frequency;
+            _doubleTapSprint = elapsed <= 0.30;
+            _lastForwardPressTimestamp = pressedAt;
+        }
+        if (!IsBindingDown(_settings.MoveForwardKey)) _doubleTapSprint = false;
+
+        bool crouch = _mouseCaptured && IsBindingDown(_settings.CrouchKey);
+        bool sprint = _mouseCaptured && movement.Y > 0.01f && !crouch &&
+                      (IsBindingDown(_settings.SprintKey) || _doubleTapSprint);
+        bool jump = _mouseCaptured && IsBindingDown(_settings.JumpKey);
+        _player.Update((float)args.Time, movement, _camera.Forward, sprint, jump,
+            descend: crouch, crouch: crouch);
+
+        float targetSprintFov = sprint ? 7f : 0f;
+        float fovBlend = 1f - MathF.Exp(-10f * Math.Clamp((float)args.Time, 0f, 0.05f));
+        _sprintFovOffset += (targetSprintFov - _sprintFovOffset) * fovBlend;
+        if (MathF.Abs(_sprintFovOffset - targetSprintFov) < 0.01f) _sprintFovOffset = targetSprintFov;
+        _camera.FieldOfViewDegrees = Math.Clamp(_settings.FieldOfView + _sprintFovOffset, 45f, 112f);
 
         _physics.SetSimulationFocus(_player.Position);
+        float playerDelta = Math.Max((float)args.Time, 0.0001f);
+        _physics.PushAnalyticSpheresFromPlayer(
+            _player.Position,
+            (_player.Position - oldPosition) / playerDelta);
         _physics.Update((float)args.Time);
         _player.ResolveExternalPenetration((float)args.Time);
 
@@ -579,7 +712,8 @@ public sealed partial class SandboxGame : GameWindow
         if (!_streamingBenchmark) UpdateAutosave(args.Time);
 
         bool viewChanged = NumericsVector3.DistanceSquared(oldPosition, _player.Position) > 0.0000001f ||
-                           NumericsVector3.DistanceSquared(oldForward, _camera.Forward) > 0.0000001f;
+                           NumericsVector3.DistanceSquared(oldForward, _camera.Forward) > 0.0000001f ||
+                           MathF.Abs(oldFieldOfView - _camera.FieldOfViewDegrees) > 0.0001f;
         if (viewChanged)
         {
             _renderer.ResetAccumulation();
@@ -587,6 +721,17 @@ public sealed partial class SandboxGame : GameWindow
 
         VoxelHit? previousSelection = RenderSelection();
         UpdateSelection();
+        if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_BLOCK_HUD") == "1")
+        {
+            if (!_gpuSmokeHudPrepared)
+            {
+                CycleQuickbar(1);
+                _gpuSmokeHudPrepared = true;
+            }
+            _selection ??= new VoxelHit(
+                0, 0, 0, NumericsVector3.UnitY, 2f,
+                (VoxelMaterial)_creativeHotbar.SelectedBlock.Id);
+        }
         if (previousSelection != RenderSelection())
         {
             ResetMining();
@@ -595,7 +740,13 @@ public sealed partial class SandboxGame : GameWindow
 
         if (_mouseCaptured && IsFocused)
         {
-            if (_buildTools.ToolMode == EditorToolMode.GridAssign && _selection.HasValue)
+            if (MouseState.IsButtonPressed(MouseButton.Left) && _sphereSelection.HasValue)
+            {
+                _world.AnalyticSpheres.Remove(_sphereSelection.Value.SphereId);
+                _renderer.ResetAccumulation();
+                UpdateSelection();
+            }
+            else if (_buildTools.ToolMode == EditorToolMode.GridAssign && _selection.HasValue)
             {
                 if (MouseState.IsButtonPressed(MouseButton.Left))
                     _physics.SelectGrid(_selection.Value.GridId);
@@ -610,13 +761,18 @@ public sealed partial class SandboxGame : GameWindow
             {
                 PhysicsGridRayHit gridHit = _gridSelection.Value;
                 if (MouseState.IsButtonPressed(MouseButton.Left) &&
-                    _physics.TryRemoveGridCell(gridHit.GridId, gridHit.CellX, gridHit.CellY, gridHit.CellZ))
+                    (_microBuild.Enabled
+                        ? _physics.TryRemoveGridElement(gridHit)
+                        : _physics.TryRemoveGridCell(gridHit.GridId, gridHit.CellX, gridHit.CellY, gridHit.CellZ)))
                 {
                     _renderer.ResetAccumulation();
                     UpdateSelection();
                 }
                 if (MouseState.IsButtonPressed(MouseButton.Right) &&
-                    _physics.TryPlaceOnGrid(gridHit, _buildTools.SelectedBlockId))
+                    (_microBuild.Enabled
+                        ? _physics.TryPlaceMicroOnGrid(
+                            gridHit, _buildTools.SelectedBlockId, _microBuild.GridDivisor)
+                        : _physics.TryPlaceOnGrid(gridHit, _buildTools.SelectedBlockId)))
                 {
                     _renderer.ResetAccumulation();
                     UpdateSelection();
@@ -674,6 +830,11 @@ public sealed partial class SandboxGame : GameWindow
         {
             ResetMining();
         }
+        if (_buildTools.ApplyQueuedEdits(8))
+        {
+            _renderer.ResetAccumulation();
+            UpdateSelection();
+        }
         RecordStreamingBenchmarkUpdateEnd(submittedChunks);
     }
 
@@ -708,12 +869,24 @@ public sealed partial class SandboxGame : GameWindow
                     _settings.PathBounces,
                     _settings.PathSamplesPerFrame,
                     _settings.PathMaxAccumulatedSamples,
+                    _settings.PathRayDistance,
+                    _settings.PathDirectLightingStrength,
+                    _settings.PathEnvironmentIntensity,
+                    _settings.PathEmissionIntensity,
+                    _settings.PathReflectionStrength,
+                    _settings.PathRussianRouletteStart,
                     _settings.DeferredSpecularQuality,
                     _settings.DeferredReflectionQuality,
                     _settings.DeferredRendererQuality,
                     _settings.DeferredGBufferQuality,
                     _settings.DeferredLightingQuality,
                     _settings.DeferredShadowQuality,
+                    _settings.DeferredShadowResolution,
+                    _settings.DeferredShadowBias,
+                    _settings.DeferredShadowNormalBias,
+                    _settings.DeferredShadowSlopeBias,
+                    _settings.DeferredShadowSoftness,
+                    _settings.DeferredShadowDistance,
                     _settings.DeferredAmbientOcclusionQuality,
                     _settings.DeferredWaterQuality,
                     _settings.DeferredTransparencyQuality,
@@ -723,17 +896,66 @@ public sealed partial class SandboxGame : GameWindow
                     _settings.DeferredBloom,
                     _settings.DeferredToneMapping,
                     _settings.DeferredDebugView,
+                    _settings.HybridLightingQuality,
+                    _settings.HybridSpecularQuality,
+                    _settings.HybridShadowQuality,
+                    _settings.HybridShadowResolution,
+                    _settings.HybridReflectionQuality,
+                    _settings.HybridAmbientOcclusionQuality,
+                    _settings.HybridWaterQuality,
+                    _settings.HybridTransparencyQuality,
+                    _settings.HybridFogQuality,
+                    _settings.HybridBloom,
                     _settings.PbrSpecularQuality,
                     _settings.PbrReflectionQuality,
+                    _settings.ForwardShadowQuality,
+                    _settings.ForwardShadowResolution,
+                    _settings.ForwardShadowBias,
+                    _settings.ForwardShadowNormalBias,
+                    _settings.ForwardShadowSlopeBias,
+                    _settings.ForwardShadowSoftness,
+                    _settings.ForwardShadowDistance,
+                    _settings.ForwardAmbientOcclusionQuality,
+                    _settings.ForwardWaterQuality,
+                    _settings.ForwardVolumetricQuality,
+                    _settings.ForwardPostProcessingQuality,
+                    _settings.ForwardToneMapping,
+                    _settings.ForwardBloom,
+                    _settings.ForwardPbr,
+                    _settings.ForwardShadows,
+                    _settings.ForwardAmbientOcclusion,
+                    _settings.ForwardScreenSpaceReflections,
+                    _settings.ForwardVolumetric,
+                    _settings.ForwardWaterEffects,
+                    _settings.ForwardApproximateGi,
+                    _settings.ForwardTemporalAntiAliasing,
+                    _settings.ForwardDebugView,
                     _settings.ClassicLightingQuality,
+                    _settings.ClassicSunlightStrength,
+                    _settings.ClassicAmbientStrength,
+                    _settings.ClassicColorSaturation,
+                    _settings.ClassicWaterQuality,
+                    _settings.ClassicWaterWaveStrength,
+                    _settings.ClassicTransparencyQuality,
+                    _settings.ClassicFogDensity,
                     _settings.HardwareRayTracingQuality,
                     _settings.HardwareRayTracingReflectionBounces,
-                    _settings.HardwareRayTracingRenderStyle),
+                    _settings.HardwareRayTracingRayDistance,
+                    _settings.HardwareRayTracingShadowStrength,
+                    _settings.HardwareRayTracingEmissionStrength,
+                    _settings.HardwareRayTracingReflectionStrength,
+                    _settings.HardwareRayTracingRenderStyle,
+                    _settings.InfiniteMirrorQuality,
+                    _settings.SelectionOutlineReflections),
                 _settings.Exposure);
         }
         if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") == "1")
         {
-            if (!_hardwareSmokeEdited &&
+            if (_gpuSmokeGlassOcclusion && _renderer.ActiveBackend is DxrHardwareRenderer occlusionDxr)
+                UpdateGlassOcclusionSmoke(occlusionDxr);
+            if (_gpuSmokeDarkRoom && _renderer.ActiveBackend is DxrHardwareRenderer darkRoomDxr)
+                UpdateDarkRoomSmoke(darkRoomDxr);
+            if (!_gpuSmokeGlassOcclusion && !_gpuSmokeDarkRoom && !_hardwareSmokeEdited &&
                 _renderer.ActiveBackend is DxrHardwareRenderer readyDxr &&
                 _world.PendingChunkGenerationCount == 0 &&
                 readyDxr.StaticAccelerationStructureBuildCount >= 1 &&
@@ -741,6 +963,13 @@ public sealed partial class SandboxGame : GameWindow
             {
                 _hardwareSmokeEdited = true;
                 _settings.HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.WaxMode;
+                bool infiniteMirrorSmoke =
+                    Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_INFINITE_MIRROR") == "1";
+                if (infiniteMirrorSmoke)
+                {
+                    _settings.HardwareRayTracingReflectionBounces = 29;
+                    _settings.InfiniteMirrorQuality = InfiniteMirrorQuality.Extreme;
+                }
                 int editX = VoxelWorld.Width / 2;
                 int editZ = VoxelWorld.Depth / 2;
                 int editY = _world.FindSurfaceY(editX, editZ);
@@ -754,19 +983,40 @@ public sealed partial class SandboxGame : GameWindow
                 // player collider, which would push the camera away before the trace.
                 NumericsVector3 gridCenter = _player.EyePosition + _camera.Forward * 2f;
                 NumericsVector3 gridOrigin = gridCenter - new NumericsVector3(0.5f);
+                ushort opticalSmokeMaterial = (ushort)VoxelMaterial.Water;
+                if (infiniteMirrorSmoke &&
+                    _blocks.TryGet("rtxsandbox:red_glass", out BlockDefinition? redGlass) && redGlass is not null)
+                    opticalSmokeMaterial = redGlass.Id;
                 _world.PhysicsGrids.Create(new[]
                 {
                     // Put water on the optical axis so the strict smoke test proves
                     // that primary DXR rays execute the transmission/refraction path.
                     new PhysicsGridElement(0, 0, 0, NumericsVector3.Zero, NumericsVector3.One,
-                        (ushort)VoxelMaterial.Water),
+                        opticalSmokeMaterial),
                     new PhysicsGridElement(-1, 0, 0, new NumericsVector3(-0.78f, 0f, 0f),
                         new NumericsVector3(-0.10f, 1f, 1f), (ushort)VoxelMaterial.Stone),
                     new PhysicsGridElement(1, 0, 0, new NumericsVector3(1.10f, 0f, 0f),
                         new NumericsVector3(1.78f, 1f, 1f), (ushort)VoxelMaterial.Glow),
                 }, gridOrigin);
+                if (infiniteMirrorSmoke &&
+                    _blocks.TryGet("rtxsandbox:perfect_mirror", out BlockDefinition? perfectMirror) &&
+                    perfectMirror is not null)
+                {
+                    var mirrorCells = new List<PhysicsGridElement>();
+                    for (int y = -2; y <= 3; y++)
+                    for (int z = -4; z <= 4; z++)
+                    {
+                        mirrorCells.Add(new PhysicsGridElement(-3, y, z,
+                            new NumericsVector3(-3, y, z), new NumericsVector3(-2, y + 1, z + 1),
+                            perfectMirror.Id));
+                        mirrorCells.Add(new PhysicsGridElement(3, y, z,
+                            new NumericsVector3(3, y, z), new NumericsVector3(4, y + 1, z + 1),
+                            perfectMirror.Id));
+                    }
+                    _world.PhysicsGrids.Create(mirrorCells, gridOrigin);
+                }
             }
-            if (_gpuSmokeFrames + 1 >= 3)
+            if (!_gpuSmokeGlassOcclusion && !_gpuSmokeDarkRoom && _gpuSmokeFrames + 1 >= 3)
             {
                 if (_renderer.ActiveBackend is not DxrHardwareRenderer dxr)
                     throw new InvalidOperationException("DXR smoke lost the Hardware RT backend.");
@@ -776,6 +1026,7 @@ public sealed partial class SandboxGame : GameWindow
                     dxr.LastTransparentHitPixelCount <= 0 || dxr.EmissiveLightCount <= 0 ||
                     dxr.VisibleDxrChunkCount <= 0 || dxr.ViewCullingExpansion < 1.6f ||
                     dxr.TracedPhysicsGridCount <= 0 || dxr.TracedPhysicsGridTriangleCount <= 0 ||
+                    dxr.TracedAnalyticSphereCount <= 0 ||
                     dxr.TracedMicroVoxelTriangleCount <= 0 || dxr.DynamicTopologyBuildCount <= 0 ||
                     (!_gpuSmokeStreaming && dxr.LastPhysicsGridHitPixelCount <= 0) ||
                     dxr.LastTexturedHitPixelCount <= 0 ||
@@ -792,6 +1043,7 @@ public sealed partial class SandboxGame : GameWindow
                         $"DXR smoke evidence incomplete: triangles={dxr.TracedTriangleCount}, hits={dxr.LastHitPixelCount}, " +
                         $"shadow={dxr.LastShadowRayPixelCount}, occluded={dxr.LastShadowOccludedPixelCount}, reflection={dxr.LastReflectionRayPixelCount}, wax={dxr.LastWaxReflectionPixelCount}, transparent={dxr.LastTransparentHitPixelCount}, emissiveLights={dxr.EmissiveLightCount}, " +
                         $"grids={dxr.TracedPhysicsGridCount}, gridTriangles={dxr.TracedPhysicsGridTriangleCount}, " +
+                        $"analyticSpheres={dxr.TracedAnalyticSphereCount}, " +
                         $"gridHits={dxr.LastPhysicsGridHitPixelCount}, texturedHits={dxr.LastTexturedHitPixelCount}, " +
                         $"asBuilds={dxr.AccelerationStructureBuildCount}, staticBuilds={dxr.StaticAccelerationStructureBuildCount}, " +
                         $"dynamicRefits={dxr.DynamicAccelerationStructureBuildCount}, tlasUpdates={dxr.TlasUpdateCount}, " +
@@ -799,6 +1051,33 @@ public sealed partial class SandboxGame : GameWindow
                         $"shadowCasterChunks={dxr.ShadowCasterDxrChunkCount}, quality={dxr.LastHardwareQuality}.");
                 if (!evidenceIncomplete)
                 {
+                    bool infiniteMirrorSmoke =
+                        Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_INFINITE_MIRROR") == "1";
+                    if (infiniteMirrorSmoke && !_hardwareInfiniteMirrorTailObserved)
+                    {
+                        if (dxr.ActualRealReflectionLayers != 29 || dxr.ApproximateReflectionLayers != 971 ||
+                            dxr.ReflectionTailAtlasMemoryBytes == 0 || dxr.LastSynchronizedTraceMilliseconds <= 0 ||
+                            dxr.LastGpuTraceMilliseconds <= 0 ||
+                            dxr.LastChromaticTransparentPixelCount <= 0)
+                            throw new InvalidOperationException(
+                                $"Infinite mirror evidence incomplete: real={dxr.ActualRealReflectionLayers}, " +
+                                $"approx={dxr.ApproximateReflectionLayers}, atlas={dxr.ReflectionTailAtlasMemoryBytes}, " +
+                                $"trace={dxr.LastSynchronizedTraceMilliseconds:0.00} ms, " +
+                                $"gpuTrace={dxr.LastGpuTraceMilliseconds:0.00} ms, " +
+                                $"chromaticTransparent={dxr.LastChromaticTransparentPixelCount}.");
+                        Console.WriteLine($"Infinite mirror evidence: real DXR {dxr.ActualRealReflectionLayers}, " +
+                                          $"reprojected 30-128, analytic 129-1000, " +
+                                          $"atlas {dxr.ReflectionTailAtlasMemoryBytes:N0} bytes, synchronized trace " +
+                                          $"{dxr.LastSynchronizedTraceMilliseconds:0.00} ms, DispatchRays GPU " +
+                                          $"{dxr.LastGpuTraceMilliseconds:0.00} ms, chromatic glass pixels " +
+                                          $"{dxr.LastChromaticTransparentPixelCount:N0}.");
+                        _hardwareInfiniteMirrorTailObserved = true;
+                        _settings.InfiniteMirrorQuality = InfiniteMirrorQuality.Off;
+                        return;
+                    }
+                    if (infiniteMirrorSmoke && dxr.ReflectionTailAtlasMemoryBytes != 0)
+                        throw new InvalidOperationException(
+                            $"Infinite mirror Off did not release its atlas ({dxr.ReflectionTailAtlasMemoryBytes:N0} bytes remain).");
                     Console.WriteLine($"DXR evidence: tier {dxr.RaytracingTier}, triangles {dxr.TracedTriangleCount:N0}, " +
                                   $"hit pixels {dxr.LastHitPixelCount:N0}, AS builds {dxr.AccelerationStructureBuildCount}, " +
                                   $"static builds {dxr.StaticAccelerationStructureBuildCount}, " +
@@ -814,6 +1093,7 @@ public sealed partial class SandboxGame : GameWindow
                                    $"global ray geometry {dxr.GlobalRayGeometryRetained}, " +
                                   $"offscreen shadow casters {dxr.ShadowCasterDxrChunkCount}, " +
                                    $"grid triangles {dxr.TracedPhysicsGridTriangleCount:N0}, micro triangles {dxr.TracedMicroVoxelTriangleCount:N0}, " +
+                                   $"analytic spheres {dxr.TracedAnalyticSphereCount}, " +
                                    $"topology builds {dxr.DynamicTopologyBuildCount}, grid hits {dxr.LastPhysicsGridHitPixelCount:N0}, " +
                                       $"textured hits {dxr.LastTexturedHitPixelCount:N0}.");
                     ValidateHardwareRtFramebuffer();
@@ -841,6 +1121,18 @@ public sealed partial class SandboxGame : GameWindow
         {
             DrawModsInterface();
         }
+        if (_achievementsVisible)
+        {
+            DrawAchievementsInterface();
+        }
+        if (_languageVisible)
+        {
+            DrawLanguageInterface();
+        }
+        if (_keyBindingsVisible)
+        {
+            DrawKeyBindingsInterface();
+        }
         if (_worldCreationVisible)
         {
             DrawCreateWorldInterface();
@@ -849,11 +1141,26 @@ public sealed partial class SandboxGame : GameWindow
         {
             DrawMainMenu();
         }
-        if (_pauseMenuVisible && !_settingsVisible && !_modsVisible && !_mainMenuVisible)
+        if (_pauseMenuVisible && !_settingsVisible && !_modsVisible && !_achievementsVisible &&
+            !_languageVisible && !_keyBindingsVisible && !_mainMenuVisible)
         {
             DrawPauseMenu();
         }
         _ui.EndFrame(ClientSize.X, ClientSize.Y);
+        if (_gpuSmoke && _gpuSmokeFrames + 1 >= 3 &&
+            Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_BLOCK_HUD") == "1")
+        {
+            if (!_gpuSmokeHudPrepared || !_selectedBlockNameObserved ||
+                !_targetBlockInformationObserved)
+                throw new InvalidOperationException(
+                    $"Block HUD smoke incomplete: switched={_gpuSmokeHudPrepared}, " +
+                    $"name={_selectedBlockNameObserved}, target={_targetBlockInformationObserved}.");
+            if (!_gpuSmokeHudEvidenceReported)
+            {
+                Console.WriteLine("Block HUD evidence: quickbar switch name and target material information rendered.");
+                _gpuSmokeHudEvidenceReported = true;
+            }
+        }
         if (_gpuSmokePause && _gpuSmokeFrames + 1 >= 3 &&
             (!_pauseMenuVisible || _pauseMenuButtonCountThisFrame != 8))
             throw new InvalidOperationException(
@@ -916,13 +1223,32 @@ public sealed partial class SandboxGame : GameWindow
             _world.PendingChunkGenerationCount == 0 &&
             _renderer.ActiveBackend is RasterVoxelRenderer raster &&
             raster.PendingVisibleMeshRebuildCount == 0 &&
-            (_renderer.Kind == RenderBackendKind.Classic || _renderer.Kind == RenderBackendKind.PbrForward))
+            _renderer.Kind == RenderBackendKind.PbrForward)
         {
-            if (raster.VisibleChunkCount <= 0 || raster.CulledChunkCount <= 0)
+            ValidateForwardSmokeFrame();
+        }
+        if (_gpuSmoke && _gpuSmokeFrames + 1 >= 3 &&
+            _world.PendingChunkGenerationCount == 0 &&
+            _renderer.ActiveBackend is RasterVoxelRenderer classicRaster &&
+            classicRaster.PendingVisibleMeshRebuildCount == 0 &&
+            _renderer.Kind == RenderBackendKind.Classic)
+        {
+            if (classicRaster.VisibleChunkCount <= 0 || classicRaster.CulledChunkCount <= 0)
                 throw new InvalidOperationException(
-                    $"Raster culling evidence incomplete: visible={raster.VisibleChunkCount}, culled={raster.CulledChunkCount}.");
-            Console.WriteLine($"Raster culling evidence: {raster.VisibleChunkCount} visible chunks, " +
-                              $"{raster.CulledChunkCount} culled chunks.");
+                    $"Raster culling evidence incomplete: visible={classicRaster.VisibleChunkCount}, culled={classicRaster.CulledChunkCount}.");
+            Console.WriteLine($"Raster culling evidence: {classicRaster.VisibleChunkCount} visible chunks, " +
+                              $"{classicRaster.CulledChunkCount} culled chunks.");
+        }
+        if (_gpuSmoke && !_pathTracingSphereSmokeValidated &&
+            _renderer.Kind == RenderBackendKind.SoftwareRayTracing &&
+            _gpuSmokeFrames + 1 >= 12 && _world.PendingChunkGenerationCount == 0)
+        {
+            double luminance = ReadCenterFramebufferLuminance(48);
+            if (luminance < 2.0)
+                throw new InvalidOperationException(
+                    $"Compute Path Tracing analytic metal sphere remained black: center luminance {luminance:0.00}.");
+            Console.WriteLine($"Compute Path Tracing sphere evidence: center luminance {luminance:0.00}.");
+            _pathTracingSphereSmokeValidated = true;
         }
         SwapBuffers();
         RecordStreamingBenchmarkRenderEnd(args.Time * 1000.0);
@@ -931,6 +1257,7 @@ public sealed partial class SandboxGame : GameWindow
             (!_gpuSmokeStreaming || _gpuSmokeStreamingStage >= 2) &&
             (_renderer.ActiveBackend is not RasterVoxelRenderer closingRaster ||
              closingRaster.PendingVisibleMeshRebuildCount == 0) &&
+            (_renderer.Kind != RenderBackendKind.SoftwareRayTracing || _pathTracingSphereSmokeValidated) &&
             (Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") != "1" ||
              _hardwareSmokeValidated))
         {
@@ -940,6 +1267,150 @@ public sealed partial class SandboxGame : GameWindow
             Close();
         }
 
+    }
+
+    private void SetUpGlassOcclusionSmokeScene()
+    {
+        _settings.HardwareRayTracingQuality = Math.Max(2, _settings.HardwareRayTracingQuality);
+        _settings.HardwareRayTracingReflectionBounces = 3;
+        _settings.HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.Default;
+        _settings.InfiniteMirrorQuality = InfiniteMirrorQuality.Off;
+        int centerX = VoxelWorld.Width / 2;
+        int centerZ = VoxelWorld.Depth / 2;
+        int surfaceY = _world.FindSurfaceY(centerX, centerZ);
+        int glassY = Math.Clamp(surfaceY + 6, VoxelWorld.MinimumY + 4, VoxelWorld.MaximumY - 2);
+        _glassOcclusionWallY = glassY - 1;
+        ushort glass = _blocks.TryGet("rtxsandbox:clear_glass", out BlockDefinition? clearGlass)
+            ? clearGlass!.Id
+            : (ushort)VoxelMaterial.Glass;
+        ushort wall = _blocks.TryGet("rtxsandbox:light_absorber", out BlockDefinition? absorber)
+            ? absorber!.Id
+            : (ushort)VoxelMaterial.Obsidian;
+        ushort light = _blocks.TryGet("rtxsandbox:white_led", out BlockDefinition? whiteLed)
+            ? whiteLed!.Id
+            : (ushort)VoxelMaterial.Glow;
+
+        for (int offsetX = -2; offsetX <= 2; offsetX++)
+        for (int offsetZ = -2; offsetZ <= 2; offsetZ++)
+        {
+            int x = centerX + offsetX;
+            int z = centerZ + offsetZ;
+            _world.SetBlockId(x, glassY, z, glass);
+            _world.SetBlockId(x, glassY - 1, z, wall);
+            _world.SetBlockId(x, glassY - 2, z, light);
+            if (Math.Abs(offsetX) == 2 || Math.Abs(offsetZ) == 2)
+            {
+                for (int y = surfaceY + 1; y < glassY - 2; y++)
+                    _world.SetBlockId(x, y, z, (ushort)VoxelMaterial.Stone);
+            }
+        }
+
+        _player.Teleport(new NumericsVector3(centerX + 0.5f, glassY + 3.1f, centerZ + 0.5f));
+        _player.FlightMode = true;
+        _player.NoClip = true;
+        _camera.Rotate(new NumericsVector2(0f, 70f / 0.11f)); // -12° -> -82° pitch.
+        _renderer?.ResetAccumulation();
+    }
+
+    private void SetUpDarkRoomSmokeScene()
+    {
+        _settings.HardwareRayTracingQuality = 3;
+        _settings.HardwareRayTracingReflectionBounces = 12;
+        _settings.HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.Reference;
+        _settings.InfiniteMirrorQuality = InfiniteMirrorQuality.Off;
+        _world.LoadRawData(new ushort[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth]);
+        if (!_blocks.TryGet("rtxsandbox:perfect_mirror", out BlockDefinition? mirror) || mirror is null)
+            throw new InvalidOperationException("Dark-room smoke requires rtxsandbox:perfect_mirror.");
+
+        const int centerX = VoxelWorld.Width / 2;
+        const int centerZ = VoxelWorld.Depth / 2;
+        const int floorY = 8;
+        const int ceilingY = 14;
+        for (int x = centerX - 3; x <= centerX + 3; x++)
+        for (int y = floorY; y <= ceilingY; y++)
+        for (int z = centerZ - 3; z <= centerZ + 3; z++)
+        {
+            bool shell = x == centerX - 3 || x == centerX + 3 ||
+                         y == floorY || y == ceilingY ||
+                         z == centerZ - 3 || z == centerZ + 3;
+            if (shell) _world.SetBlockId(x, y, z, mirror.Id);
+        }
+        _player.Teleport(new NumericsVector3(centerX + 0.5f, floorY + 1.001f, centerZ + 0.5f));
+        _player.FlightMode = true;
+        _player.NoClip = true;
+        _renderer?.ResetAccumulation();
+    }
+
+    private void UpdateDarkRoomSmoke(DxrHardwareRenderer dxr)
+    {
+        if (_hardwareSmokeValidated || _world.PendingChunkGenerationCount != 0 ||
+            dxr.PendingStaticGeometryBuildCount != 0 || _gpuSmokeFrames < 4 ||
+            dxr.StaticAccelerationStructureBuildCount < 1)
+            return;
+
+        double luminance = ReadCenterFramebufferLuminance(48);
+        if (luminance > 18.0)
+            throw new InvalidOperationException(
+                $"DXR sealed mirror room leaked environment light at midnight: luminance {luminance:0.00}.");
+        if (dxr.LastReflectionRayPixelCount <= 0 || dxr.LastHitPixelCount <= 0)
+            throw new InvalidOperationException(
+                $"DXR dark-room evidence incomplete: hits={dxr.LastHitPixelCount}, reflections={dxr.LastReflectionRayPixelCount}.");
+        Console.WriteLine($"DXR sealed mirror room evidence: midnight luminance {luminance:0.00}, " +
+                          $"hits {dxr.LastHitPixelCount:N0}, reflections {dxr.LastReflectionRayPixelCount:N0}.");
+        _hardwareSmokeValidated = true;
+    }
+
+    private void UpdateGlassOcclusionSmoke(DxrHardwareRenderer dxr)
+    {
+        if (_world.PendingChunkGenerationCount != 0 || dxr.PendingStaticGeometryBuildCount != 0)
+            return;
+
+        if (_glassOcclusionSmokeStage == 0)
+        {
+            if (_gpuSmokeFrames < 3 || dxr.StaticAccelerationStructureBuildCount < 1)
+                return;
+            _glassOccludedLuminance = ReadCenterFramebufferLuminance(32);
+            int centerX = VoxelWorld.Width / 2;
+            int centerZ = VoxelWorld.Depth / 2;
+            for (int offsetX = -1; offsetX <= 1; offsetX++)
+            for (int offsetZ = -1; offsetZ <= 1; offsetZ++)
+                _world.SetBlockId(centerX + offsetX, _glassOcclusionWallY, centerZ + offsetZ, 0);
+            _glassOcclusionTargetStaticBuilds = dxr.StaticAccelerationStructureBuildCount + 1;
+            _glassOcclusionSmokeStage = 1;
+            _renderer.ResetAccumulation();
+            return;
+        }
+
+        if (_glassOcclusionSmokeStage != 1 ||
+            dxr.StaticAccelerationStructureBuildCount < _glassOcclusionTargetStaticBuilds)
+            return;
+
+        double exposedLuminance = ReadCenterFramebufferLuminance(32);
+        if (exposedLuminance < _glassOccludedLuminance + 12.0 ||
+            exposedLuminance < _glassOccludedLuminance * 1.25)
+            throw new InvalidOperationException(
+                $"Glass occlusion regression: covered={_glassOccludedLuminance:0.00}, " +
+                $"wall removed={exposedLuminance:0.00}; the opaque layer did not reliably hide the emitter.");
+        Console.WriteLine($"Glass occlusion evidence: opaque wall {_glassOccludedLuminance:0.00}, " +
+                          $"wall removed {exposedLuminance:0.00}, transparent hits " +
+                          $"{dxr.LastTransparentHitPixelCount:N0}.");
+        _glassOcclusionSmokeStage = 2;
+        _hardwareSmokeValidated = true;
+    }
+
+    private double ReadCenterFramebufferLuminance(int sampleSize)
+    {
+        int width = Math.Min(sampleSize, Math.Max(1, ClientSize.X));
+        int height = Math.Min(sampleSize, Math.Max(1, ClientSize.Y));
+        int x = Math.Max(0, ClientSize.X / 2 - width / 2);
+        int y = Math.Max(0, ClientSize.Y / 2 - height / 2);
+        var pixels = new byte[width * height * 3];
+        GL.Finish();
+        GL.ReadPixels(x, y, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, pixels);
+        double total = 0;
+        for (int index = 0; index < pixels.Length; index += 3)
+            total += pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722;
+        return total / Math.Max(1, width * height);
     }
 
     private void SetUpUnderwaterSmokeScene()
@@ -999,7 +1470,11 @@ public sealed partial class SandboxGame : GameWindow
             maximum = Math.Max(maximum, value);
         }
         double average = luminance / Math.Max(1, width * height);
-        if (average < 4.0 || maximum - minimum < 3)
+        if (_settings.ForwardDebugView == ForwardDebugView.NanInfinity && average > 12.0)
+            throw new InvalidOperationException(
+                $"Enhanced Forward NaN/Infinity debug view found highlighted pixels (average {average:0.00}).");
+        if (_settings.ForwardDebugView != ForwardDebugView.NanInfinity &&
+            (average < 4.0 || maximum - minimum < 3))
             throw new InvalidOperationException(
                 $"Underwater render is black or blank (average luminance {average:0.00}, range {minimum}-{maximum}).");
         Console.WriteLine($"Underwater framebuffer passed: average luminance {average:0.00}, range {minimum}-{maximum}.");
@@ -1039,9 +1514,16 @@ public sealed partial class SandboxGame : GameWindow
             (deferred.Kind != RenderBackendKind.DeferredLighting &&
              deferred.Kind != RenderBackendKind.HybridPbrRaster))
             throw new InvalidOperationException("Deferred/Hybrid smoke lost its raster backend.");
+        bool hybrid = deferred.Kind == RenderBackendKind.HybridPbrRaster;
         const int requiredFeatures = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512;
+        int activeLightingQuality = hybrid ? _settings.HybridLightingQuality : _settings.DeferredLightingQuality;
+        int activeShadowQuality = hybrid ? _settings.HybridShadowQuality : _settings.DeferredShadowQuality;
+        string activeProfile = hybrid ? "獨立 Hybrid" : _settings.DeferredQualityPreset.ToString();
+        DeferredDebugView activeDebugView = hybrid ? DeferredDebugView.FinalImage : _settings.DeferredDebugView;
+        bool spotLightExpected = activeLightingQuality >= 2;
         if ((deferred.DeferredFeatureMask & requiredFeatures) != requiredFeatures ||
-            deferred.DeferredPointLightCount <= 0 || deferred.DeferredSpotLightCount <= 0 ||
+            deferred.DeferredPointLightCount <= 0 ||
+            (spotLightExpected && deferred.DeferredSpotLightCount <= 0) ||
             deferred.VisibleChunkCount <= 0 || deferred.DirectionalShadowDrawCount <= 0 ||
             deferred.DirectionalShadowMapUpdateCount <= 0 || deferred.ViewCullingExpansion < 1.6f)
             throw new InvalidOperationException(
@@ -1060,6 +1542,29 @@ public sealed partial class SandboxGame : GameWindow
             throw new InvalidOperationException(
                 $"Deferred Physics Grid evidence incomplete: uploads={deferred.PhysicsGridMeshUploadCount}, " +
                 $"dynamicShadowUpdates={deferred.DynamicShadowMapUpdateCount}.");
+
+        DeferredBufferDiagnostics diagnostics = deferred.ReadDeferredBufferDiagnostics();
+        if (diagnostics.ActivePixelCount <= 0 || diagnostics.InvalidGBufferPixelCount > 0 ||
+            diagnostics.InvalidHdrPixelCount > 0)
+            throw new InvalidOperationException(
+                $"Deferred buffer diagnostics failed: active={diagnostics.ActivePixelCount}, " +
+                $"invalidGBuffer={diagnostics.InvalidGBufferPixelCount}, invalidHdr={diagnostics.InvalidHdrPixelCount}, " +
+                $"normal={diagnostics.MinimumNormalLength:0.0000}-{diagnostics.MaximumNormalLength:0.0000}, " +
+                $"roughness={diagnostics.MinimumRoughness:0.0000}-{diagnostics.MaximumRoughness:0.0000}.");
+
+        if (!hybrid && activeDebugView == DeferredDebugView.Shadow)
+        {
+            DeferredShadowCoverageDiagnostics shadowCoverage = deferred.ReadDeferredShadowCoverageDiagnostics();
+            if (shadowCoverage.ActivePixelCount <= 0 || shadowCoverage.ShadowedPixelCount <= 0)
+                throw new InvalidOperationException(
+                    $"Deferred shadow debug contains no shadowed receiver pixels: active={shadowCoverage.ActivePixelCount}, " +
+                    $"shadowed={shadowCoverage.ShadowedPixelCount}, visibility=" +
+                    $"{shadowCoverage.MinimumVisibility:0.000}-{shadowCoverage.MaximumVisibility:0.000}.");
+            Console.WriteLine($"Deferred shadow coverage: {shadowCoverage.ShadowedPixelCount:N0}/" +
+                              $"{shadowCoverage.ActivePixelCount:N0} receiver pixels, " +
+                              $"{shadowCoverage.DeepShadowPixelCount:N0} below 0.5 visibility, range " +
+                              $"{shadowCoverage.MinimumVisibility:0.000}-{shadowCoverage.MaximumVisibility:0.000}.");
+        }
 
         const int sampleSize = 64;
         int width = Math.Min(sampleSize, Math.Max(1, ClientSize.X));
@@ -1082,18 +1587,96 @@ public sealed partial class SandboxGame : GameWindow
         if (average < 4.0 || maximum - minimum < 3)
             throw new InvalidOperationException(
                 $"Deferred framebuffer is black or blank (average {average:0.00}, range {minimum}-{maximum}).");
-        Console.WriteLine($"Deferred evidence: feature mask {deferred.DeferredFeatureMask}, " +
-                          $"point lights {deferred.DeferredPointLightCount}, spot lights {deferred.DeferredSpotLightCount}, " +
-                           $"shadow quality {_settings.DeferredShadowQuality}, " +
+        Console.WriteLine($"{(hybrid ? "Hybrid" : "Deferred")} evidence: feature mask {deferred.DeferredFeatureMask}, " +
+                           $"point lights {deferred.DeferredPointLightCount}, spot lights {deferred.DeferredSpotLightCount}, " +
+                           $"profile {activeProfile}, shadow quality {activeShadowQuality} " +
+                           $"at {deferred.DirectionalShadowMapResolution}², " +
                            $"culling expansion {deferred.ViewCullingExpansion:0.0}x, " +
                            $"directional shadow draws {deferred.DirectionalShadowDrawCount}, " +
                            $"shadow depth {shadowMinimum:0.000000}-{shadowMaximum:0.000000}, " +
                            $"static/dynamic shadow updates {deferred.StaticShadowMapUpdateCount}/" +
                            $"{deferred.DynamicShadowMapUpdateCount}, Grid mesh uploads {deferred.PhysicsGridMeshUploadCount}, " +
                            $"chunks {deferred.VisibleChunkCount} visible/{deferred.CulledChunkCount} culled, " +
-                          $"offscreen shadow casters {deferred.ShadowCasterChunkCount}, " +
-                          $"debug view {_settings.DeferredDebugView}, " +
-                          $"framebuffer average {average:0.00}, range {minimum}-{maximum}.");
+                           $"offscreen shadow casters {deferred.ShadowCasterChunkCount}, " +
+                           $"debug view {activeDebugView}, " +
+                           $"GBuffer active/invalid {diagnostics.ActivePixelCount:N0}/{diagnostics.InvalidGBufferPixelCount}, " +
+                           $"HDR invalid {diagnostics.InvalidHdrPixelCount}, normal " +
+                           $"{diagnostics.MinimumNormalLength:0.000}-{diagnostics.MaximumNormalLength:0.000}, " +
+                           $"roughness {diagnostics.MinimumRoughness:0.000}-{diagnostics.MaximumRoughness:0.000}, " +
+                           $"CPU geometry/light/post/transparent " +
+                           $"{deferred.DeferredGeometryCpuMilliseconds:0.00}/" +
+                           $"{deferred.DeferredLightingCpuMilliseconds:0.00}/" +
+                           $"{deferred.DeferredPostCpuMilliseconds:0.00}/" +
+                           $"{deferred.DeferredTransparencyCpuMilliseconds:0.00} ms, " +
+                           $"triangles {deferred.DeferredVisibleTriangleCount:N0}, " +
+                           $"GBuffer {deferred.DeferredGBufferBytes / (1024.0 * 1024.0):0.0} MiB, " +
+                           $"framebuffer average {average:0.00}, range {minimum}-{maximum}.");
+    }
+
+    private void ValidateForwardSmokeFrame()
+    {
+        if (_renderer.ActiveBackend is not RasterVoxelRenderer forward ||
+            forward.Kind != RenderBackendKind.PbrForward)
+            throw new InvalidOperationException("Enhanced Forward smoke lost its raster backend.");
+        int requiredFeatures = 8 |
+            (_settings.ForwardPbr ? 1 | 4 : 0) |
+            (_settings.ForwardShadows && _settings.ForwardShadowQuality > 0 ? 2 : 0) |
+            (_settings.ForwardAmbientOcclusion && _settings.ForwardAmbientOcclusionQuality > 0 ? 16 : 0) |
+            (_settings.ForwardScreenSpaceReflections && _settings.PbrReflectionQuality > 0 ? 32 : 0) |
+            (_settings.ForwardWaterEffects && _settings.ForwardWaterQuality > 0 ? 64 : 0) |
+            (_settings.ForwardVolumetric && _settings.ForwardVolumetricQuality > 0 ? 128 : 0) |
+            (_settings.ForwardBloom ? 256 : 0) |
+            (_settings.ForwardTemporalAntiAliasing ? 512 : 0) |
+            (_settings.ForwardApproximateGi ? 1024 : 0);
+        if ((forward.ForwardFeatureMask & requiredFeatures) != requiredFeatures ||
+            (_settings.ForwardPbr && forward.DeferredPointLightCount <= 0) || forward.VisibleChunkCount <= 0 ||
+            (_settings.ForwardShadows && (forward.DirectionalShadowDrawCount <= 0 ||
+                                          forward.DirectionalShadowMapUpdateCount <= 0)))
+            throw new InvalidOperationException(
+                $"Enhanced Forward feature evidence incomplete: mask={forward.ForwardFeatureMask}, " +
+                $"pointLights={forward.DeferredPointLightCount}, visibleChunks={forward.VisibleChunkCount}, " +
+                $"shadowDraws={forward.DirectionalShadowDrawCount}, shadowUpdates={forward.DirectionalShadowMapUpdateCount}.");
+
+        (float shadowMinimum, float shadowMaximum) = forward.ReadDirectionalShadowDepthRange(dynamicLayer: false);
+        if (_settings.ForwardShadows &&
+            (shadowMinimum >= 0.9999f || shadowMaximum - shadowMinimum < 0.0001f))
+            throw new InvalidOperationException(
+                $"Enhanced Forward shadow texture is empty or constant: {shadowMinimum:0.000000}-{shadowMaximum:0.000000}.");
+        ForwardBufferDiagnostics diagnostics = forward.ReadForwardBufferDiagnostics();
+        if (diagnostics.ActivePixelCount <= 0 || diagnostics.InvalidSurfacePixelCount > 0 ||
+            diagnostics.InvalidHdrPixelCount > 0)
+            throw new InvalidOperationException(
+                $"Enhanced Forward buffer diagnostics failed: active={diagnostics.ActivePixelCount}, " +
+                $"invalidSurface={diagnostics.InvalidSurfacePixelCount}, invalidHdr={diagnostics.InvalidHdrPixelCount}, " +
+                $"normal={diagnostics.MinimumNormalLength:0.0000}-{diagnostics.MaximumNormalLength:0.0000}, " +
+                $"roughness={diagnostics.MinimumRoughness:0.0000}-{diagnostics.MaximumRoughness:0.0000}.");
+
+        const int sampleSize = 64;
+        int width = Math.Min(sampleSize, Math.Max(1, ClientSize.X));
+        int height = Math.Min(sampleSize, Math.Max(1, ClientSize.Y));
+        int x = Math.Max(0, ClientSize.X / 2 - width / 2);
+        int y = Math.Max(0, ClientSize.Y / 2 - height / 2);
+        var pixels = new byte[width * height * 3];
+        GL.Finish();
+        GL.ReadPixels(x, y, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, pixels);
+        double average = pixels.Average(value => (double)value);
+        byte minimum = pixels.Min();
+        byte maximum = pixels.Max();
+        if (average < 4.0 || maximum - minimum < 3)
+            throw new InvalidOperationException(
+                $"Enhanced Forward framebuffer is black or blank (average {average:0.00}, range {minimum}-{maximum}).");
+        Console.WriteLine($"Enhanced Forward evidence: feature mask {forward.ForwardFeatureMask}, " +
+                          $"preset {_settings.ForwardQualityPreset}, local lights {forward.DeferredPointLightCount}, " +
+                          $"shadow {_settings.ForwardShadowQuality} at {forward.DirectionalShadowMapResolution}², " +
+                          $"shadow depth {shadowMinimum:0.000000}-{shadowMaximum:0.000000}, " +
+                          $"active pixels {diagnostics.ActivePixelCount:N0}, invalid surface/HDR " +
+                          $"{diagnostics.InvalidSurfacePixelCount}/{diagnostics.InvalidHdrPixelCount}, " +
+                          $"CPU shadow/main/transparent/post {forward.ForwardShadowCpuMilliseconds:0.00}/" +
+                          $"{forward.ForwardMainCpuMilliseconds:0.00}/{forward.ForwardTransparencyCpuMilliseconds:0.00}/" +
+                          $"{forward.ForwardPostCpuMilliseconds:0.00} ms, " +
+                          $"GPU {forward.ForwardShadowGpuMilliseconds:0.00}/{forward.ForwardMainGpuMilliseconds:0.00}/" +
+                          $"{forward.ForwardTransparencyGpuMilliseconds:0.00}/{forward.ForwardPostGpuMilliseconds:0.00} ms, " +
+                          $"framebuffer {average:0.00} ({minimum}-{maximum}).");
     }
 
     protected override void OnResize(ResizeEventArgs e)
@@ -1135,6 +1718,8 @@ public sealed partial class SandboxGame : GameWindow
             _ui.Dispose();
             _renderer.Dispose();
             _physics.Dispose();
+            _waterFlow.Dispose();
+            if (_streamingBenchmark) CleanupStreamingBenchmarkStorage();
             _loaded = false;
         }
         base.OnUnload();
@@ -1148,7 +1733,10 @@ public sealed partial class SandboxGame : GameWindow
         StartFocused = false,
         Title = "RTX Sandbox — loading…",
         API = ContextAPI.OpenGL,
-        APIVersion = new Version(4, 3),
+        APIVersion = OperatingSystem.IsMacOS() ||
+                     Environment.GetEnvironmentVariable("RTX_SANDBOX_FORCE_GL41") == "1"
+            ? new Version(4, 1)
+            : new Version(4, 3),
         Profile = ContextProfile.Core,
         Flags = ContextFlags.ForwardCompatible,
         NumberOfSamples = 0,
@@ -1165,12 +1753,41 @@ public sealed partial class SandboxGame : GameWindow
         bool enteringText = _loaded && _ui.WantsTextEntry;
         bool simulateShortcut = _gpuSmoke && !_gpuSmokeShortcutTriggered &&
                                 _gpuSmokeFrames >= 1 && !string.IsNullOrEmpty(_gpuSmokeShortcut);
-        bool escapePressed = KeyboardState.IsKeyPressed(Keys.Escape) ||
+        bool escapePressed = IsBindingPressed(_settings.PauseKey) ||
                              (simulateShortcut && _gpuSmokeShortcut == "settings");
         if (!imeComposing && escapePressed)
         {
             if (simulateShortcut) _gpuSmokeShortcutTriggered = true;
-            if (_worldCreationVisible)
+            if (_modRollbackPopupOpen || _modMovePopupOpen || _modDeletePopupOpen || _modEditorVisible)
+            {
+                if (_modMovePopupOpen || ImGui.IsPopupOpen("移動模組檔案"))
+                {
+                    ImGui.CloseCurrentPopup();
+                }
+
+                if (_modDeletePopupOpen || ImGui.IsPopupOpen("確認刪除模組檔案"))
+                {
+                    ImGui.CloseCurrentPopup();
+                }
+
+                if (_modRollbackPopupOpen || ImGui.IsPopupOpen("確認回滾文字"))
+                {
+                    ImGui.CloseCurrentPopup();
+                }
+
+                _modRollbackPopupOpen = false;
+                _modMovePopupOpen = false;
+                _modDeletePopupOpen = false;
+                _modMoveSource = null;
+                _modDeleteSource = null;
+
+                _modEditorVisible = false;
+                _modEditorPath = null;
+                _modEditorText = string.Empty;
+                _modEditorSavedText = string.Empty;
+                _modCompilationLog = string.Empty;
+            }
+            else if (_worldCreationVisible)
             {
                 _worldCreationVisible = false;
                 _advancedWorldCreation = false;
@@ -1193,6 +1810,21 @@ public sealed partial class SandboxGame : GameWindow
             {
                 _modsVisible = false;
             }
+            else if (_achievementsVisible)
+            {
+                _achievementsVisible = false;
+                _pauseMenuVisible = true;
+            }
+            else if (_languageVisible)
+            {
+                _languageVisible = false;
+                _pauseMenuVisible = true;
+            }
+            else if (_keyBindingsVisible)
+            {
+                _keyBindingsVisible = false;
+                _pauseMenuVisible = true;
+            }
             else if (_pauseMenuVisible)
             {
                 if (SaveWorld())
@@ -1208,12 +1840,12 @@ public sealed partial class SandboxGame : GameWindow
             {
                 _pauseMenuVisible = true;
             }
-            SetMouseCaptured(!AnyInterfaceVisible());
+            SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
 
-        bool inventoryTogglePressed = KeyboardState.IsKeyPressed(Keys.Tab) ||
+        bool inventoryTogglePressed = IsBindingPressed(_settings.InventoryKey) ||
+                                      KeyboardState.IsKeyPressed(Keys.Tab) ||
                                       KeyboardState.IsKeyPressed(Keys.I) ||
-                                      KeyboardState.IsKeyPressed(Keys.E) ||
                                       (simulateShortcut && _gpuSmokeShortcut == "inventory");
         if (!enteringText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible &&
             inventoryTogglePressed)
@@ -1221,17 +1853,18 @@ public sealed partial class SandboxGame : GameWindow
             if (simulateShortcut) _gpuSmokeShortcutTriggered = true;
             _inventoryVisible = !_inventoryVisible;
             if (_inventoryVisible) _toolboxVisible = false;
-            SetMouseCaptured(!AnyInterfaceVisible());
+                SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
 
-        if (!enteringText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible && KeyboardState.IsKeyPressed(Keys.B))
+        if (!enteringText && !_mainMenuVisible && !_settingsVisible && !_worldCreationVisible &&
+            IsBindingPressed(_settings.BuildToolsKey))
         {
             _toolboxVisible = !_toolboxVisible;
             if (_toolboxVisible) _inventoryVisible = false;
-            SetMouseCaptured(!AnyInterfaceVisible());
+                SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
 
-        if (AnyInterfaceVisible())
+        if (AnyInterfaceOrPopupVisible())
         {
             return;
         }
@@ -1254,6 +1887,30 @@ public sealed partial class SandboxGame : GameWindow
             _debugVisible = !_debugVisible;
         }
 
+        if (KeyboardState.IsKeyPressed(Keys.F4) &&
+            _renderer.Kind is RenderBackendKind.DeferredLighting or RenderBackendKind.HybridPbrRaster)
+        {
+            int next = ((int)_settings.DeferredDebugView + 1) % ((int)DeferredDebugView.LightCount + 1);
+            _settings.DeferredDebugView = (DeferredDebugView)next;
+        }
+        else if (KeyboardState.IsKeyPressed(Keys.F4) && _renderer.Kind == RenderBackendKind.PbrForward)
+        {
+            int next = ((int)_settings.ForwardDebugView + 1) % ((int)ForwardDebugView.NanInfinity + 1);
+            _settings.ForwardDebugView = (ForwardDebugView)next;
+            _renderer.ResetAccumulation();
+        }
+
+        if (KeyboardState.IsKeyPressed(Keys.F6) && _renderer.Switch(RenderBackendKind.Classic))
+        {
+            _settings.Renderer = RenderBackendKind.Classic;
+            _renderer.ResetAccumulation();
+        }
+        if (KeyboardState.IsKeyPressed(Keys.F7) && _renderer.Switch(RenderBackendKind.PbrForward))
+        {
+            _settings.Renderer = RenderBackendKind.PbrForward;
+            _renderer.ResetAccumulation();
+        }
+
         if (KeyboardState.IsKeyPressed(Keys.F5))
         {
             SaveWorld();
@@ -1272,12 +1929,12 @@ public sealed partial class SandboxGame : GameWindow
 
         if (KeyboardState.IsKeyPressed(Keys.Home))
         {
-            _camera.FieldOfViewDegrees = Math.Clamp(_camera.FieldOfViewDegrees - 5f, 45f, 105f);
+            _settings.FieldOfView = Math.Clamp(_settings.FieldOfView - 5f, 45f, 105f);
             _renderer.ResetAccumulation();
         }
         if (KeyboardState.IsKeyPressed(Keys.End))
         {
-            _camera.FieldOfViewDegrees = Math.Clamp(_camera.FieldOfViewDegrees + 5f, 45f, 105f);
+            _settings.FieldOfView = Math.Clamp(_settings.FieldOfView + 5f, 45f, 105f);
             _renderer.ResetAccumulation();
         }
     }
@@ -1350,7 +2007,7 @@ public sealed partial class SandboxGame : GameWindow
 
         bool control = KeyboardState.IsKeyDown(Keys.LeftControl) || KeyboardState.IsKeyDown(Keys.RightControl);
         bool changed = false;
-        if (!control && KeyboardState.IsKeyPressed(Keys.V))
+        if (!control && IsBindingPressed(_settings.PrecisionModeKey))
         {
             _microBuild.Enabled = !_microBuild.Enabled;
             ResetMining();
@@ -1391,6 +2048,10 @@ public sealed partial class SandboxGame : GameWindow
             _player.EyePosition,
             _camera.Forward,
             _settings.SelectionDistance);
+        _sphereSelection = _world.AnalyticSpheres.Raycast(
+            _player.EyePosition,
+            _camera.Forward,
+            _settings.SelectionDistance);
 
         _selection = _regularSelection;
         if (_microSelection.HasValue &&
@@ -1417,6 +2078,19 @@ public sealed partial class SandboxGame : GameWindow
                 grid.Distance,
                 (VoxelMaterial)grid.MaterialId,
                 grid.GridId);
+        }
+        if (_sphereSelection.HasValue &&
+            (!_selection.HasValue || _sphereSelection.Value.Distance < _selection.Value.Distance))
+        {
+            // A sphere has no voxel cell to outline. Suppress the block behind it so
+            // ordinary left click destroys the object actually under the crosshair.
+            _selection = null;
+        }
+        else
+        {
+            // Keep the solid voxel/grid in front authoritative; a hidden sphere
+            // farther along the same ray must not consume the click.
+            _sphereSelection = null;
         }
     }
 
@@ -1502,7 +2176,7 @@ public sealed partial class SandboxGame : GameWindow
             return;
         }
 
-        if (_world.SetBlockId(breakEvent.X, breakEvent.Y, breakEvent.Z, 0))
+        if (_buildTools.QueueEdit(breakEvent.X, breakEvent.Y, breakEvent.Z, 0, "Break block"))
         {
             _modHost.Publish(new BlockBrokenEvent(
                 _world,
@@ -1557,10 +2231,9 @@ public sealed partial class SandboxGame : GameWindow
             return;
         }
 
-        if (_world.SetBlockId(x, y, z, placeEvent.NewBlockId))
+        if (_buildTools.QueueEdit(x, y, z, placeEvent.NewBlockId, "Place block"))
         {
             _progression.NotifyBlockPlaced(_blocks.Get(placeEvent.NewBlockId));
-            UpdateSelection();
         }
     }
 
@@ -1601,15 +2274,19 @@ public sealed partial class SandboxGame : GameWindow
 
     private void CycleQuickbar(int direction)
     {
+        int previousSlot = _creativeHotbar.SelectedSlot;
         _creativeHotbar.Cycle(direction);
         _buildTools.SelectedBlockId = _creativeHotbar.SelectedBlock.Id;
+        if (previousSlot != _creativeHotbar.SelectedSlot) ShowSelectedBlockName();
     }
 
     private void SelectQuickbarSlot(int index)
     {
+        int previousSlot = _creativeHotbar.SelectedSlot;
         _creativeHotbar.Select(index);
         _buildTools.SelectedBlockId = _creativeHotbar.SelectedBlock.Id;
         RememberRecent(_creativeHotbar.SelectedBlock.Key);
+        if (previousSlot != _creativeHotbar.SelectedSlot) ShowSelectedBlockName();
     }
 
     private void AssignCreativeBlock(ushort blockId)
@@ -1619,7 +2296,14 @@ public sealed partial class SandboxGame : GameWindow
         _creativeHotbar.Assign(_creativeHotbar.SelectedSlot, block.Id);
         _buildTools.SelectedBlockId = block.Id;
         RememberRecent(block.Key);
+        ShowSelectedBlockName();
         _renderer.ResetAccumulation();
+    }
+
+    private void ShowSelectedBlockName()
+    {
+        _selectedBlockNameId = _creativeHotbar.SelectedBlock.Id;
+        _selectedBlockNameSecondsRemaining = 2.2f;
     }
 
     private void RememberRecent(string key)
@@ -1686,13 +2370,51 @@ public sealed partial class SandboxGame : GameWindow
     private void SetMouseCaptured(bool captured)
     {
         _mouseCaptured = captured;
+        if (captured) _ui?.EnforceGameplayEnglishInput(true);
         CursorState = captured
             ? OpenTK.Windowing.Common.CursorState.Grabbed
             : OpenTK.Windowing.Common.CursorState.Normal;
     }
 
     private bool AnyInterfaceVisible() =>
-        _mainMenuVisible || _pauseMenuVisible || _settingsVisible || _modsVisible || _inventoryVisible || _toolboxVisible || _worldCreationVisible;
+        _mainMenuVisible || _pauseMenuVisible || _settingsVisible || _modsVisible || _inventoryVisible ||
+        _toolboxVisible || _worldCreationVisible || _achievementsVisible || _languageVisible || _keyBindingsVisible ||
+        _modEditorVisible;
+
+    private bool AnyInterfaceOrPopupVisible() =>
+        AnyInterfaceVisible() || _modMovePopupOpen || _modDeletePopupOpen || _modRollbackPopupOpen;
+
+    private bool IsBindingDown(string binding)
+    {
+        if (!Enum.TryParse(binding, ignoreCase: true, out Keys key)) return false;
+        return key switch
+        {
+            Keys.LeftShift or Keys.RightShift =>
+                KeyboardState.IsKeyDown(Keys.LeftShift) || KeyboardState.IsKeyDown(Keys.RightShift),
+            Keys.LeftControl or Keys.RightControl =>
+                KeyboardState.IsKeyDown(Keys.LeftControl) || KeyboardState.IsKeyDown(Keys.RightControl),
+            Keys.LeftAlt or Keys.RightAlt =>
+                KeyboardState.IsKeyDown(Keys.LeftAlt) || KeyboardState.IsKeyDown(Keys.RightAlt),
+            _ => KeyboardState.IsKeyDown(key),
+        };
+    }
+
+    private bool IsBindingPressed(string binding)
+    {
+        if (!Enum.TryParse(binding, ignoreCase: true, out Keys key)) return false;
+        return key switch
+        {
+            Keys.LeftShift or Keys.RightShift =>
+                KeyboardState.IsKeyPressed(Keys.LeftShift) || KeyboardState.IsKeyPressed(Keys.RightShift),
+            Keys.LeftControl or Keys.RightControl =>
+                KeyboardState.IsKeyPressed(Keys.LeftControl) || KeyboardState.IsKeyPressed(Keys.RightControl),
+            Keys.LeftAlt or Keys.RightAlt =>
+                KeyboardState.IsKeyPressed(Keys.LeftAlt) || KeyboardState.IsKeyPressed(Keys.RightAlt),
+            _ => KeyboardState.IsKeyPressed(key),
+        };
+    }
+
+    private string L(string key) => UiText.Get(_settings.Language, key);
 
     private void DrawHud()
     {
@@ -1711,12 +2433,73 @@ public sealed partial class SandboxGame : GameWindow
             ImGui.Text($"RTX Sandbox | {ImGui.GetIO().Framerate:0} FPS");
             ImGui.Text($"XYZ {_player.Position.X:0.0} / {_player.Position.Y:0.0} / {_player.Position.Z:0.0}");
             ImGui.Text($"渲染器 {_renderer.Name} | {_renderer.AccumulatedSamples} samples");
+            if (_renderer.ActiveBackend is RasterVoxelRenderer deferred &&
+                deferred.Kind is RenderBackendKind.DeferredLighting or RenderBackendKind.HybridPbrRaster)
+            {
+                float fps = Math.Max(ImGui.GetIO().Framerate, 0.001f);
+                ImGui.Text($"Frame {1000f / fps:0.00} ms | Triangle {deferred.DeferredVisibleTriangleCount:N0} | " +
+                           $"Visible Chunk {deferred.VisibleChunkCount}");
+                ImGui.Text($"Deferred CPU  Geometry {deferred.DeferredGeometryCpuMilliseconds:0.00} | " +
+                           $"Lighting {deferred.DeferredLightingCpuMilliseconds:0.00} | " +
+                           $"Post {deferred.DeferredPostCpuMilliseconds:0.00} | " +
+                           $"Transparent {deferred.DeferredTransparencyCpuMilliseconds:0.00} ms");
+                ImGui.Text($"Shadow {deferred.MaximumDeferredShadowUpdateMilliseconds:0.00} ms max | " +
+                           $"Lights {deferred.DeferredPointLightCount + deferred.DeferredSpotLightCount + 1} | " +
+                           $"GBuffer {deferred.DeferredGBufferBytes / (1024.0 * 1024.0):0.0} MiB | History 0 MiB");
+            }
+            if (_renderer.ActiveBackend is RasterVoxelRenderer forwardRenderer &&
+                forwardRenderer.Kind == RenderBackendKind.PbrForward)
+            {
+                float fps = Math.Max(ImGui.GetIO().Framerate, 0.001f);
+                ImGui.Text($"Forward {1000f / fps:0.00} ms | Triangle {forwardRenderer.DeferredVisibleTriangleCount:N0} | " +
+                           $"Visible Chunk {forwardRenderer.VisibleChunkCount}");
+                ImGui.Text($"CPU  Shadow {forwardRenderer.ForwardShadowCpuMilliseconds:0.00} | " +
+                           $"Main {forwardRenderer.ForwardMainCpuMilliseconds:0.00} | " +
+                           $"Transparent {forwardRenderer.ForwardTransparencyCpuMilliseconds:0.00} | " +
+                           $"Post {forwardRenderer.ForwardPostCpuMilliseconds:0.00} ms");
+                ImGui.Text($"GPU Shadow {forwardRenderer.ForwardShadowGpuMilliseconds:0.00} | " +
+                           $"Main {forwardRenderer.ForwardMainGpuMilliseconds:0.00} | " +
+                           $"Transparent {forwardRenderer.ForwardTransparencyGpuMilliseconds:0.00} | " +
+                           $"Post {forwardRenderer.ForwardPostGpuMilliseconds:0.00} ms");
+                ImGui.Text($"Local Light {forwardRenderer.DeferredPointLightCount} | " +
+                           $"Forward Buffer {forwardRenderer.ForwardBufferBytes / (1024.0 * 1024.0):0.0} MiB | " +
+                           $"Shadow {forwardRenderer.DirectionalShadowMapResolution}²");
+            }
             ImGui.Text($"鏡頭 {(_player.NoClip ? "自由鏡頭" : _player.FlightMode ? "飛行（碰撞）" : "行走（碰撞）")}");
             ImGui.Text($"{_physics.BackendName} | Grid {_physics.ActiveGridCount} | " +
                        $"碰撞步 {_physics.SimulationSubstepsLastStep} | 時間 {_clock.DisplayTime}");
             ImGui.Text($"世界 {_world.GenerationSettings.Preset} | 種子 {_world.Seed} | Chunk {_world.LoadedChunkCount}");
             if (_microBuild.Enabled)
                 ImGui.Text($"精密網格 1/{_microBuild.GridDivisor} | {_world.MicroVoxelContainerCount:N0} cells");
+            ImGui.End();
+        }
+
+        if (_renderer.Kind is RenderBackendKind.DeferredLighting or RenderBackendKind.HybridPbrRaster &&
+            _settings.DeferredDebugView != DeferredDebugView.FinalImage)
+        {
+            ImGui.SetNextWindowPos(new NumericsVector2(ClientSize.X - 12f, 12f), ImGuiCond.Always,
+                new NumericsVector2(1f, 0f));
+            ImGui.SetNextWindowBgAlpha(0.72f);
+            ImGui.Begin("##deferred-debug-mode",
+                ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.AlwaysAutoResize |
+                ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoInputs | ImGuiWindowFlags.NoSavedSettings);
+            ImGui.TextColored(new System.Numerics.Vector4(0.35f, 0.85f, 1f, 1f),
+                $"Deferred Debug：{DeferredDebugViewDisplayName(_settings.DeferredDebugView)}");
+            ImGui.TextDisabled("F4：下一個通道");
+            ImGui.End();
+        }
+        if (_renderer.Kind == RenderBackendKind.PbrForward &&
+            _settings.ForwardDebugView != ForwardDebugView.FinalImage)
+        {
+            ImGui.SetNextWindowPos(new NumericsVector2(ClientSize.X - 12f, 12f), ImGuiCond.Always,
+                new NumericsVector2(1f, 0f));
+            ImGui.SetNextWindowBgAlpha(0.72f);
+            ImGui.Begin("##forward-debug-mode",
+                ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.AlwaysAutoResize |
+                ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoInputs | ImGuiWindowFlags.NoSavedSettings);
+            ImGui.TextColored(new System.Numerics.Vector4(0.35f, 0.85f, 1f, 1f),
+                $"Forward Debug：{ForwardDebugViewDisplayName(_settings.ForwardDebugView)}");
+            ImGui.TextDisabled("F4：下一個通道");
             ImGui.End();
         }
 
@@ -1744,6 +2527,8 @@ public sealed partial class SandboxGame : GameWindow
         }
         ImGui.End();
 
+        DrawTargetBlockInformation();
+        DrawSelectedBlockName();
         DrawCrosshair();
     }
 
@@ -1838,8 +2623,10 @@ public sealed partial class SandboxGame : GameWindow
         uint rightTint = ImGui.ColorConvertFloat4ToU32(new System.Numerics.Vector4(0.55f, 0.6f, 0.69f, alpha));
         uint topTint = ImGui.ColorConvertFloat4ToU32(new System.Numerics.Vector4(1f, 1f, 1f, alpha));
 
-        AddTexturedQuad(drawList, texture, left, middle, middleBottom, leftBottom, sideUv, leftTint, flipX: true);
-        AddTexturedQuad(drawList, texture, middle, right, rightBottom, middleBottom, sideUv, rightTint);
+        AddTexturedQuad(drawList, texture, left, middle, middleBottom, leftBottom, sideUv, leftTint,
+            flipX: true, flipY: true);
+        AddTexturedQuad(drawList, texture, middle, right, rightBottom, middleBottom, sideUv, rightTint,
+            flipY: true);
         AddTexturedQuad(drawList, texture, top, right, middle, left, topUv, topTint);
 
         uint outline = ImGui.ColorConvertFloat4ToU32(new System.Numerics.Vector4(0.86f, 0.9f, 0.96f, 0.72f));
@@ -1863,13 +2650,26 @@ public sealed partial class SandboxGame : GameWindow
         NumericsVector2 d,
         MaterialTileUv uv,
         uint tint,
-        bool flipX = false)
+        bool flipX = false,
+        bool flipY = false)
     {
-        NumericsVector2 uvA = flipX ? new NumericsVector2(uv.Maximum.X, uv.Minimum.Y) : uv.Minimum;
-        NumericsVector2 uvB = flipX ? uv.Minimum : new NumericsVector2(uv.Maximum.X, uv.Minimum.Y);
-        NumericsVector2 uvC = flipX ? new NumericsVector2(uv.Minimum.X, uv.Maximum.Y) : uv.Maximum;
-        NumericsVector2 uvD = flipX ? uv.Maximum : new NumericsVector2(uv.Minimum.X, uv.Maximum.Y);
+        (NumericsVector2 uvA, NumericsVector2 uvB, NumericsVector2 uvC, NumericsVector2 uvD) =
+            ResolveMaterialPreviewUvs(uv, flipX, flipY);
         drawList.AddImageQuad(texture, a, b, c, d, uvA, uvB, uvC, uvD, tint);
+    }
+
+    internal static (NumericsVector2 A, NumericsVector2 B, NumericsVector2 C, NumericsVector2 D)
+        ResolveMaterialPreviewUvs(MaterialTileUv uv, bool flipX, bool flipY)
+    {
+        float left = flipX ? uv.Maximum.X : uv.Minimum.X;
+        float right = flipX ? uv.Minimum.X : uv.Maximum.X;
+        float top = flipY ? uv.Maximum.Y : uv.Minimum.Y;
+        float bottom = flipY ? uv.Minimum.Y : uv.Maximum.Y;
+        return (
+            new NumericsVector2(left, top),
+            new NumericsVector2(right, top),
+            new NumericsVector2(right, bottom),
+            new NumericsVector2(left, bottom));
     }
 
     private void DrawBlockTooltip(BlockDefinition block)
@@ -1891,9 +2691,82 @@ public sealed partial class SandboxGame : GameWindow
         ImGui.EndTooltip();
     }
 
+    private void DrawSelectedBlockName()
+    {
+        if (_selectedBlockNameSecondsRemaining <= 0f || AnyInterfaceOrPopupVisible()) return;
+
+        BlockDefinition block = _blocks.Get(_selectedBlockNameId);
+        float alpha = Math.Clamp(_selectedBlockNameSecondsRemaining / 0.35f, 0f, 1f);
+        ImGui.SetNextWindowPos(
+            new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y - 92f),
+            ImGuiCond.Always,
+            new NumericsVector2(0.5f, 1f));
+        ImGui.SetNextWindowBgAlpha(0.62f * alpha);
+        ImGui.Begin(
+            "##selected-block-name",
+            ImGuiWindowFlags.NoDecoration |
+            ImGuiWindowFlags.AlwaysAutoResize |
+            ImGuiWindowFlags.NoMove |
+            ImGuiWindowFlags.NoInputs |
+            ImGuiWindowFlags.NoSavedSettings);
+        ImGui.TextColored(new System.Numerics.Vector4(1f, 1f, 1f, alpha), BlockDisplayName(block));
+        ImGui.End();
+        _selectedBlockNameObserved = true;
+    }
+
+    private void DrawTargetBlockInformation()
+    {
+        if (AnyInterfaceOrPopupVisible() || !_selection.HasValue) return;
+
+        VoxelHit hit = _selection.Value;
+        BlockDefinition block = _blocks.Get(hit.MaterialId);
+        bool microVoxel = !hit.IsPhysicsGrid && _microSelection.HasValue &&
+                          _microSelection.Value.MaterialId == hit.MaterialId &&
+                          MathF.Abs(_microSelection.Value.Distance - hit.Distance) < 0.001f;
+        string source = hit.IsPhysicsGrid ? "物理結構" : microVoxel ? "微方塊" : "世界方塊";
+        string localizedName = BlockDisplayName(block);
+        NumericsVector3 displayAlbedo = NumericsVector3.Clamp(
+            block.Albedo,
+            NumericsVector3.Zero,
+            NumericsVector3.One);
+
+        ImGui.SetNextWindowPos(
+            new NumericsVector2(ClientSize.X * 0.5f, 16f),
+            ImGuiCond.Always,
+            new NumericsVector2(0.5f, 0f));
+        ImGui.SetNextWindowSizeConstraints(
+            new NumericsVector2(330f, 0f),
+            new NumericsVector2(390f, float.MaxValue));
+        ImGui.SetNextWindowBgAlpha(0.76f);
+        ImGui.Begin(
+            "##target-block-information",
+            ImGuiWindowFlags.NoDecoration |
+            ImGuiWindowFlags.AlwaysAutoResize |
+            ImGuiWindowFlags.NoMove |
+            ImGuiWindowFlags.NoInputs |
+            ImGuiWindowFlags.NoSavedSettings);
+
+        ImGui.ColorButton(
+            "##target-block-color",
+            new System.Numerics.Vector4(displayAlbedo, 1f),
+            ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoPicker,
+            new NumericsVector2(20f, 20f));
+        ImGui.SameLine();
+        ImGui.Text(localizedName);
+        if (!string.Equals(localizedName, block.DisplayName, StringComparison.Ordinal))
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"({block.DisplayName})");
+        }
+        ImGui.TextDisabled($"{source}  |  ID {block.Id}  |  {block.Key}");
+        ImGui.Text($"金屬度 {block.Metallic:0.00}  |  粗糙度 {block.Roughness:0.00}");
+        ImGui.End();
+        _targetBlockInformationObserved = true;
+    }
+
     private void DrawCrosshair()
     {
-        if (!_settings.ShowCrosshair || AnyInterfaceVisible()) return;
+        if (!_settings.ShowCrosshair || AnyInterfaceOrPopupVisible()) return;
 
         NumericsVector2 center = new(ClientSize.X * 0.5f, ClientSize.Y * 0.5f);
         float size = _settings.CrosshairSize;
@@ -2137,7 +3010,7 @@ public sealed partial class SandboxGame : GameWindow
         if (!open)
         {
             _inventoryVisible = false;
-            SetMouseCaptured(!AnyInterfaceVisible());
+            SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
     }
 
@@ -2205,6 +3078,41 @@ public sealed partial class SandboxGame : GameWindow
             if (ImGui.SliderInt("爆炸半徑", ref explosionRadius, 1, 12)) _buildTools.ExplosionRadius = explosionRadius;
 
             ImGui.Separator();
+            ImGui.TextColored(new System.Numerics.Vector4(0.72f, 0.82f, 0.92f, 1f), "解析球體");
+            string[] sphereMaterials = { "鐵球", "完美鏡面球" };
+            ImGui.SetNextItemWidth(180f);
+            ImGui.Combo("球體材質", ref _analyticSphereMaterial, sphereMaterials, sphereMaterials.Length);
+            ImGui.SetNextItemWidth(180f);
+            ImGui.SliderFloat("球體半徑", ref _analyticSphereRadius, 0.25f, 2f, "%.2f 格");
+            if (ImGui.Button("放置可推動球體", new NumericsVector2(180f, 34f)))
+            {
+                string materialKey = _analyticSphereMaterial == 0
+                    ? "rtxsandbox:iron_block"
+                    : "rtxsandbox:perfect_mirror";
+                if (_blocks.TryGet(materialKey, out BlockDefinition? sphereMaterial))
+                {
+                    NumericsVector3 direction = NumericsVector3.Normalize(_camera.Forward);
+                    NumericsVector3 center = _selection.HasValue
+                        ? _player.EyePosition + direction * _selection.Value.Distance +
+                          _selection.Value.Normal * (_analyticSphereRadius + 0.025f)
+                        : _player.EyePosition + direction * 3f;
+                    _world.AnalyticSpheres.Create(center, _analyticSphereRadius, sphereMaterial!.Id);
+                    _renderer.ResetAccumulation();
+                }
+            }
+            if (_world.AnalyticSpheres.Count == 0) ImGui.BeginDisabled();
+            ImGui.SameLine();
+            if (ImGui.Button("移除最後球體"))
+            {
+                AnalyticSphere last = _world.AnalyticSpheres.Spheres[^1];
+                _world.AnalyticSpheres.Remove(last.Id);
+                _renderer.ResetAccumulation();
+            }
+            if (_world.AnalyticSpheres.Count == 0) ImGui.EndDisabled();
+            ImGui.TextDisabled($"場景球體：{_world.AnalyticSpheres.Count}；碰撞與光追皆使用解析球面");
+
+
+            ImGui.Separator();
             ImGui.Text($"選區 A：{_buildTools.SelectionA?.ToString() ?? "未設定"}");
             ImGui.Text($"選區 B：{_buildTools.SelectionB?.ToString() ?? "未設定"}");
             ImGui.TextDisabled($"體積 {_buildTools.SelectionVolume:N0} · 剪貼簿 {_buildTools.ClipboardDescription}");
@@ -2238,7 +3146,7 @@ public sealed partial class SandboxGame : GameWindow
         if (!open)
         {
             _toolboxVisible = false;
-            SetMouseCaptured(!AnyInterfaceVisible());
+            SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
     }
 
@@ -2691,45 +3599,32 @@ public sealed partial class SandboxGame : GameWindow
 
     private void DrawPauseMenu()
     {
-        _pauseMenuButtonCountThisFrame = 0;
-        ImGui.SetNextWindowPos(new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y * 0.5f),
-            ImGuiCond.Always, new NumericsVector2(0.5f));
-        ImGui.SetNextWindowSize(new NumericsVector2(520f, 500f), ImGuiCond.Always);
-        ImGui.SetNextWindowBgAlpha(0.94f);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 2f);
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 1f);
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new NumericsVector2(12f, 12f));
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, new System.Numerics.Vector4(0.08f, 0.09f, 0.10f, 0.96f));
-        ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.28f, 0.29f, 0.30f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0.42f, 0.44f, 0.46f, 1f));
-        if (ImGui.Begin("##pause-menu", ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize))
+        SharedPauseAction action = SharedImGuiScreens.DrawPauseMenu(
+            new NumericsVector2(ClientSize.X, ClientSize.Y), L, modsAvailable: true, showTouchControls: false);
+        _pauseMenuButtonCountThisFrame = 8;
+        switch (action)
         {
-            float width = ImGui.GetContentRegionAvail().X;
-            ImGui.Dummy(new NumericsVector2(0f, 10f));
-            if (PauseMenuButton("繼續遊戲", new NumericsVector2(width, 58f)))
-            {
+            case SharedPauseAction.Continue:
                 _pauseMenuVisible = false;
                 SetMouseCaptured(true);
-            }
-            ImGui.Separator();
-            float half = (width - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
-            if (PauseMenuButton("設定", new NumericsVector2(half, 54f)))
-            {
+                break;
+            case SharedPauseAction.Settings:
                 _settingsOpenedFromPause = true;
                 _settingsVisible = true;
-            }
-            ImGui.SameLine();
-            PauseMenuButton("成就", new NumericsVector2(half, 54f));
-            PauseMenuButton("統計", new NumericsVector2(half, 54f));
-            ImGui.SameLine();
-            if (PauseMenuButton("模組", new NumericsVector2(half, 54f)))
+                break;
+            case SharedPauseAction.Achievements:
+                _achievementsVisible = true;
+                break;
+            case SharedPauseAction.Mods:
                 _modsVisible = true;
-            PauseMenuButton("語言（之後）", new NumericsVector2(half, 54f));
-            ImGui.SameLine();
-            PauseMenuButton("按鍵（之後）", new NumericsVector2(half, 54f));
-            ImGui.Separator();
-            if (PauseMenuButton("離開世界", new NumericsVector2(width, 58f)))
-            {
+                break;
+            case SharedPauseAction.Language:
+                _languageVisible = true;
+                break;
+            case SharedPauseAction.Controls:
+                _keyBindingsVisible = true;
+                break;
+            case SharedPauseAction.LeaveWorld:
                 if (SaveWorld())
                 {
                     _pauseMenuVisible = false;
@@ -2737,17 +3632,119 @@ public sealed partial class SandboxGame : GameWindow
                     _mainMenuVisible = true;
                     RefreshWorldList();
                 }
+                break;
+        }
+    }
+
+    private void DrawAchievementsInterface()
+    {
+        bool open = SharedImGuiScreens.DrawAchievements(
+            new NumericsVector2(ClientSize.X, ClientSize.Y), L);
+        if (!open)
+        {
+            _achievementsVisible = false;
+            _pauseMenuVisible = true;
+        }
+    }
+
+    private void DrawLanguageInterface()
+    {
+        UiLanguage language = _settings.Language;
+        bool open = SharedImGuiScreens.DrawLanguage(
+            new NumericsVector2(ClientSize.X, ClientSize.Y), L, ref language, out bool changed);
+        if (changed)
+        {
+            _settings.Language = language;
+            _settings.Save();
+        }
+        if (!open)
+        {
+            _languageVisible = false;
+            _pauseMenuVisible = true;
+        }
+    }
+
+    private void DrawKeyBindingsInterface()
+    {
+        ImGui.SetNextWindowPos(new NumericsVector2(ClientSize.X * 0.5f, ClientSize.Y * 0.5f),
+            ImGuiCond.Always, new NumericsVector2(0.5f));
+        ImGui.SetNextWindowSize(new NumericsVector2(580f, 650f), ImGuiCond.Always);
+        bool open = _keyBindingsVisible;
+        if (ImGui.Begin(L("controls_title"), ref open,
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
+        {
+            ImGui.TextWrapped(_settings.Language == UiLanguage.English
+                ? "Sprint while moving forward with the Sprint key, or double-tap Move Forward. Shift is the default crouch key."
+                : _settings.Language == UiLanguage.SimplifiedChinese
+                    ? "按住冲刺键并向前移动，或双击向前键即可冲刺。Shift 默认为蹲下。"
+                    : "按住衝刺鍵並向前移動，或雙擊向前鍵即可衝刺。Shift 預設為蹲下。");
+            ImGui.Separator();
+            if (ImGui.BeginChild("bindings", new NumericsVector2(0f, -96f), ImGuiChildFlags.Borders))
+            {
+                _settings.MoveForwardKey = DrawBindingRow(L("move_forward"), _settings.MoveForwardKey);
+                _settings.MoveBackwardKey = DrawBindingRow(L("move_backward"), _settings.MoveBackwardKey);
+                _settings.MoveLeftKey = DrawBindingRow(L("move_left"), _settings.MoveLeftKey);
+                _settings.MoveRightKey = DrawBindingRow(L("move_right"), _settings.MoveRightKey);
+                _settings.JumpKey = DrawBindingRow(L("jump"), _settings.JumpKey);
+                _settings.CrouchKey = DrawBindingRow(L("crouch"), _settings.CrouchKey);
+                _settings.SprintKey = DrawBindingRow(L("sprint"), _settings.SprintKey);
+                _settings.InventoryKey = DrawBindingRow(L("inventory"), _settings.InventoryKey);
+                _settings.BuildToolsKey = DrawBindingRow(L("build_tools"), _settings.BuildToolsKey);
+                _settings.PrecisionModeKey = DrawBindingRow(L("precision"), _settings.PrecisionModeKey);
+                _settings.PauseKey = DrawBindingRow(L("pause"), _settings.PauseKey);
+            }
+            ImGui.EndChild();
+            if (ImGui.Button(_settings.Language == UiLanguage.English ? "Restore Defaults" :
+                    _settings.Language == UiLanguage.SimplifiedChinese ? "恢复默认" : "恢復預設",
+                    new NumericsVector2(180f, 40f)))
+            {
+                _settings.MoveForwardKey = "W";
+                _settings.MoveBackwardKey = "S";
+                _settings.MoveLeftKey = "A";
+                _settings.MoveRightKey = "D";
+                _settings.JumpKey = "Space";
+                _settings.CrouchKey = "LeftShift";
+                _settings.SprintKey = "LeftControl";
+                _settings.InventoryKey = "E";
+                _settings.BuildToolsKey = "B";
+                _settings.PrecisionModeKey = "V";
+                _settings.PauseKey = "Escape";
+            }
+            ImGui.SameLine();
+            if (ImGui.Button(L("done"), new NumericsVector2(180f, 40f)))
+            {
+                _settings.Save();
+                open = false;
             }
         }
         ImGui.End();
-        ImGui.PopStyleColor(3);
-        ImGui.PopStyleVar(3);
+        if (!open)
+        {
+            _settings.Save();
+            _keyBindingsVisible = false;
+            _pauseMenuVisible = true;
+        }
     }
 
-    private bool PauseMenuButton(string label, NumericsVector2 size)
+    private static string DrawBindingRow(string label, string binding)
     {
-        _pauseMenuButtonCountThisFrame++;
-        return ImGui.Button(label, size);
+        ImGui.PushID(label);
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted(label);
+        ImGui.SameLine(250f);
+        ImGui.SetNextItemWidth(260f);
+        if (ImGui.BeginCombo("##key", binding))
+        {
+            foreach (string candidate in BindableKeys)
+            {
+                bool selected = string.Equals(binding, candidate, StringComparison.OrdinalIgnoreCase);
+                if (ImGui.Selectable(candidate, selected)) binding = candidate;
+                if (selected) ImGui.SetItemDefaultFocus();
+            }
+            ImGui.EndCombo();
+        }
+        ImGui.PopID();
+        return binding;
     }
 
     private void DrawCreateWorldInterface()
@@ -2852,7 +3849,7 @@ public sealed partial class SandboxGame : GameWindow
             _worldCreationVisible = false;
             _advancedWorldCreation = false;
             _rebuildWorldStorage = null;
-            SetMouseCaptured(!AnyInterfaceVisible());
+                SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
     }
 
@@ -2892,6 +3889,7 @@ public sealed partial class SandboxGame : GameWindow
             _worldSaves = newWorldSaves;
             _modHost.RegisterService(_worldSaves);
             _world.Regenerate(_worldDraft);
+            _waterFlow.Reset();
             _buildTools.ResetForNewWorld();
             _microBuild.ResetForNewWorld();
             _droppedItems.Clear();
@@ -3216,6 +4214,7 @@ public sealed partial class SandboxGame : GameWindow
                     ImGui.Separator();
                     DrawActivePipelineAdvancedSettings();
                     DrawCommonPipelineSettings();
+                    DrawSelectionReflectionSetting();
                     ImGui.EndTabItem();
                 }
 
@@ -3344,7 +4343,7 @@ public sealed partial class SandboxGame : GameWindow
         {
             _settingsVisible = false;
             _settingsOpenedFromPause = false;
-            SetMouseCaptured(!AnyInterfaceVisible());
+            SetMouseCaptured(!AnyInterfaceOrPopupVisible());
         }
     }
 
@@ -3534,11 +4533,13 @@ public sealed partial class SandboxGame : GameWindow
 
         if (_modMovePopupRequested)
         {
+            _modMovePopupOpen = true;
             ImGui.OpenPopup("移動模組檔案");
             _modMovePopupRequested = false;
         }
         if (ImGui.BeginPopupModal("移動模組檔案", ImGuiWindowFlags.AlwaysAutoResize))
         {
+            _modMovePopupOpen = true;
             ImGui.TextWrapped(_modMoveSource is null
                 ? "沒有選取檔案。"
                 : Path.GetRelativePath(BepInExBootstrap.PluginDirectory, _modMoveSource));
@@ -3547,20 +4548,31 @@ public sealed partial class SandboxGame : GameWindow
             if (ImGui.Button("移動", new NumericsVector2(110f, 0f)))
             {
                 MoveModFile();
+                _modMovePopupOpen = false;
                 ImGui.CloseCurrentPopup();
             }
             ImGui.SameLine();
-            if (ImGui.Button("取消", new NumericsVector2(110f, 0f))) ImGui.CloseCurrentPopup();
+            if (ImGui.Button("取消", new NumericsVector2(110f, 0f)))
+            {
+                _modMovePopupOpen = false;
+                ImGui.CloseCurrentPopup();
+            }
             ImGui.EndPopup();
+        }
+        else if (_modMovePopupOpen)
+        {
+            _modMovePopupOpen = false;
         }
 
         if (_modDeletePopupRequested)
         {
+            _modDeletePopupOpen = true;
             ImGui.OpenPopup("確認刪除模組檔案");
             _modDeletePopupRequested = false;
         }
         if (ImGui.BeginPopupModal("確認刪除模組檔案", ImGuiWindowFlags.AlwaysAutoResize))
         {
+            _modDeletePopupOpen = true;
             ImGui.TextWrapped(_modDeleteSource is null
                 ? "沒有選取檔案。"
                 : $"確定刪除 {Path.GetRelativePath(BepInExBootstrap.PluginDirectory, _modDeleteSource)}？");
@@ -3568,11 +4580,20 @@ public sealed partial class SandboxGame : GameWindow
             if (ImGui.Button("確認刪除", new NumericsVector2(120f, 0f)))
             {
                 DeleteModFile();
+                _modDeletePopupOpen = false;
                 ImGui.CloseCurrentPopup();
             }
             ImGui.SameLine();
-            if (ImGui.Button("取消", new NumericsVector2(120f, 0f))) ImGui.CloseCurrentPopup();
+            if (ImGui.Button("取消", new NumericsVector2(120f, 0f)))
+            {
+                _modDeletePopupOpen = false;
+                ImGui.CloseCurrentPopup();
+            }
             ImGui.EndPopup();
+        }
+        else if (_modDeletePopupOpen)
+        {
+            _modDeletePopupOpen = false;
         }
 
         if (!string.IsNullOrWhiteSpace(_modCompilationLog) && ImGui.TreeNode("最近一次編譯輸出"))
@@ -3613,7 +4634,10 @@ public sealed partial class SandboxGame : GameWindow
             if (!changed || compilationActive) ImGui.EndDisabled();
             ImGui.SameLine();
             if (ImGui.Button("回滾上次保存", new NumericsVector2(135f, 0f)))
+            {
+                _modRollbackPopupOpen = true;
                 ImGui.OpenPopup("確認回滾文字");
+            }
             if (compilationActive) ImGui.EndDisabled();
             ImGui.SameLine();
             if (compilationActive) ImGui.BeginDisabled();
@@ -3623,15 +4647,25 @@ public sealed partial class SandboxGame : GameWindow
 
             if (ImGui.BeginPopupModal("確認回滾文字", ImGuiWindowFlags.AlwaysAutoResize))
             {
+                _modRollbackPopupOpen = true;
                 ImGui.TextWrapped("將磁碟內容回滾到這個檔案上次保存前的備份？目前未保存文字也會被捨棄。");
                 if (ImGui.Button("確認回滾", new NumericsVector2(115f, 0f)))
                 {
                     RollbackModEditor();
+                    _modRollbackPopupOpen = false;
                     ImGui.CloseCurrentPopup();
                 }
                 ImGui.SameLine();
-                if (ImGui.Button("取消", new NumericsVector2(115f, 0f))) ImGui.CloseCurrentPopup();
+                if (ImGui.Button("取消", new NumericsVector2(115f, 0f)))
+                {
+                    _modRollbackPopupOpen = false;
+                    ImGui.CloseCurrentPopup();
+                }
                 ImGui.EndPopup();
+            }
+            else if (_modRollbackPopupOpen)
+            {
+                _modRollbackPopupOpen = false;
             }
         }
         ImGui.End();
@@ -3972,7 +5006,9 @@ public sealed partial class SandboxGame : GameWindow
         _settings.WindowHeight = ClientSize.Y;
         _settings.VSync = VSync == VSyncMode.On;
         _settings.Renderer = _renderer.Kind;
-        _settings.FieldOfView = _camera.FieldOfViewDegrees;
+        // The camera may currently include the animated sprint kick. Persist only
+        // the player's configured base FOV.
+        _settings.FieldOfView = Math.Clamp(_settings.FieldOfView, 45f, 105f);
         _settings.TimeOfDay = _clock.TimeOfDayHours;
         _settings.DayLengthMinutes = _clock.DayLengthMinutes;
         _settings.PauseTime = _clock.Paused;
@@ -4113,6 +5149,7 @@ public sealed partial class SandboxGame : GameWindow
 
     private void ApplyLoadedWorldState(SavedWorldState state)
     {
+        _waterFlow.Reset();
         _player.Teleport(state.PlayerPosition);
         _streamedPlayerChunk = null;
         StreamWorldAroundPlayer();

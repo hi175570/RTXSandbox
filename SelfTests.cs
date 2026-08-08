@@ -8,14 +8,18 @@ using RTXSandbox.Modding;
 using RTXSandbox.Persistence;
 using RTXSandbox.Rendering;
 using RTXSandbox.Rendering.Backends;
+using RTXSandbox.UI;
 using RTXSandbox.World;
 
 namespace RTXSandbox;
 
 public static class SelfTests
 {
+    private static int _testsRun;
+
     public static int Run()
     {
+        _testsRun = 0;
         var failures = new List<string>();
         Run("voxel set/get", TestVoxelSetGet, failures);
         Run("infinite world generates deterministic distant negative chunks", TestInfiniteWorldGeneration, failures);
@@ -27,11 +31,19 @@ public static class SelfTests
         Run("placement requires 1.1 blocks of eye distance", TestMinimumPlacementDistance, failures);
         Run("world clock cycle and pause", TestWorldClock, failures);
         Run("settings save atomically and recover from backup", TestSettingsRecovery, failures);
+        Run("input defaults and navigation localization are stable", TestInputAndLocalizationDefaults, failures);
         Run("water raycast and collision", TestWaterBehavior, failures);
+        Run("finite water falls, spreads, and conserves volume", TestWaterFlow, failures);
+        Run("solid placement displaces water without deleting it", TestWaterDisplacement, failures);
+        Run("connected water columns equalize their surfaces", TestCommunicatingWaterColumns, failures);
         Run("player can swim upward", TestSwimming, failures);
+        Run("water jump impulse ignores fluid thickness", TestWaterJumpIgnoresFluidThickness, failures);
         Run("player continuously climbs out at a shoreline", TestSwimmingShoreExit, failures);
         Run("player does not auto-climb walls from water", TestSwimmingDoesNotAutoClimb, failures);
         Run("physics grids push players continuously without teleporting", TestContinuousGridPush, failures);
+        Run("analytic sphere uses rigid-body gravity and player pushing", TestAnalyticSpherePhysics, failures);
+        Run("analytic spheres wait for and remain supported by floor colliders", TestAnalyticSphereFloorCollision, failures);
+        Run("analytic sphere raycast selects nearest surface for ordinary destruction", TestAnalyticSphereRaycast, failures);
         Run("modded world save remaps block keys", TestWorldSaveRemapping, failures);
         Run("directory worlds save and recover independent chunks", TestDirectoryChunkPersistence, failures);
         Run("world management renames rebuilds and deletes safely", TestWorldManagement, failures);
@@ -54,7 +66,8 @@ public static class SelfTests
         Run("explosions protect bedrock", TestEditorExplosion, failures);
         Run("unsupported components become continuous physics grids", TestVoxelPhysics, failures);
         Run("diagonal voxel contact does not transmit support", TestDiagonalFracture, failures);
-        Run("flight noclip passes through structures", TestFlightNoClip, failures);
+        Run("crouching slows movement and prevents edge falls", TestCrouchMovement, failures);
+        Run("flight movement is independent of view direction", TestFlightMovementAxes, failures);
         Run("transparent and gravity materials load from content", TestEditorMaterialMetadata, failures);
         Run("mod build tools participate in editor history", TestModBuildToolHistory, failures);
         Run("flat preset honors layers and options", TestFlatWorldPreset, failures);
@@ -76,6 +89,7 @@ public static class SelfTests
         Run("precision edits undo and persist with key remapping", TestMicroVoxelEditingAndPersistence, failures);
         Run("primary destroys while secondary placement stays explicit", TestPrimaryDestroySemantics, failures);
         Run("renderer catalog exposes only working backends", TestRenderBackendCatalog, failures);
+        Run("renderer failures preserve a safe usable backend", TestRendererFailureFallback, failures);
         Run("chunk coordinates and mesh invalidation cross boundaries", TestChunkCoordinates, failures);
         Run("voxel data is owned and released by chunks", TestChunkOwnedVoxelStorage, failures);
         Run("chunk storage preserves the legacy linear snapshot", TestChunkLinearSnapshot, failures);
@@ -95,12 +109,13 @@ public static class SelfTests
         Run("removing an offset support gives structure angular velocity", TestOffsetSupportTorque, failures);
         Run("dynamic grid selection follows translation and rotation", TestDynamicGridSelectionTransform, failures);
         Run("dynamic grid placement preview matches the committed cell", TestDynamicGridPlacementPreview, failures);
+        Run("precision placement on physics grids preserves micro size", TestPhysicsGridMicroPlacement, failures);
         Run("floor contact preserves rigid-body rotation", TestFloorContactRotation, failures);
         Run("resting grid does not enter a perpetual bounce cycle", TestGridSettlesWithoutBounce, failures);
 
         if (failures.Count == 0)
         {
-            Console.WriteLine("All 79 RTX Sandbox self-tests passed.");
+            Console.WriteLine($"All {_testsRun} RTX Sandbox self-tests passed.");
             return 0;
         }
 
@@ -123,6 +138,83 @@ public static class SelfTests
         Assert(!world.Set(0, VoxelWorld.MinimumY - 1, 0, VoxelMaterial.Stone) &&
                !world.Set(0, VoxelWorld.MaximumY, 0, VoxelMaterial.Stone),
             "vertical out-of-bounds write succeeded");
+    }
+
+    private static void TestAnalyticSpherePhysics()
+    {
+        string saveRoot = Path.Combine(Path.GetTempPath(), $"rtxsandbox-sphere-{Guid.NewGuid():N}");
+        try
+        {
+            var blocks = new BlockRegistry();
+            var world = new VoxelWorld(generate: false, registry: blocks);
+            AnalyticSphere sphere = world.AnalyticSpheres.Create(
+                new Vector3(0.8f, 10f, 0f), 0.6f, (ushort)VoxelMaterial.Metal);
+            using var physics = new VoxelPhysicsSimulator(world, blocks);
+            float startingX = sphere.Center.X;
+            float startingY = sphere.Center.Y;
+            physics.PushAnalyticSpheresFromPlayer(new Vector3(0f, 9f, 0f), new Vector3(4f, 0f, 0f));
+            for (int step = 0; step < 20; step++) physics.Update(1f / 120f);
+            Assert(sphere.Center.X > startingX + 0.03f,
+                "player contact did not transfer horizontal motion to the sphere body");
+            Assert(sphere.Center.Y < startingY - 0.02f,
+                "analytic sphere was not advanced by BEPU gravity");
+            Assert(MathF.Abs(sphere.Radius - 0.6f) < 0.0001f,
+                "sphere radius changed during rigid-body integration");
+
+            var saves = new WorldSaveService(blocks, worldName: "sphere", saveRoot: saveRoot);
+            saves.Save(world, Vector3.Zero, 12f);
+            var restoredWorld = new VoxelWorld(generate: false, registry: blocks);
+            Assert(saves.TryLoad(restoredWorld, out _, out string? error),
+                error ?? "analytic sphere world did not load");
+            Assert(restoredWorld.AnalyticSpheres.Count == 1,
+                "analytic sphere count was not restored");
+            AnalyticSphere restored = restoredWorld.AnalyticSpheres.Spheres[0];
+            Assert(Vector3.Distance(restored.Center, sphere.Center) < 0.001f &&
+                   Vector3.Distance(restored.LinearVelocity, sphere.LinearVelocity) < 0.001f &&
+                   restored.MaterialId == sphere.MaterialId,
+                "analytic sphere transform, velocity, or material was not restored");
+        }
+        finally
+        {
+            if (Directory.Exists(saveRoot)) Directory.Delete(saveRoot, recursive: true);
+        }
+    }
+
+    private static void TestAnalyticSphereFloorCollision()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        world.Set(64, 0, 64, VoxelMaterial.Bedrock);
+        AnalyticSphere sphere = world.AnalyticSpheres.Create(
+            new Vector3(64.5f, 1.525f, 64.5f), 0.5f, (ushort)VoxelMaterial.Metal);
+        using var backend = new BepuPhysicsBackend(world, Vector3.Zero);
+
+        // Advance simulation time faster than the asynchronous collider can be built.
+        // A newly placed sphere must not begin falling through its known solid support.
+        for (int step = 0; step < 120; step++) backend.Step(1f / 120f);
+        Assert(sphere.Center.Y >= 1.45f,
+            "sphere advanced through a solid floor while its Chunk collider was still pending");
+
+        WaitForColliderJobs(backend);
+        for (int step = 0; step < 240; step++) backend.Step(1f / 120f);
+        Assert(sphere.Center.Y >= 1.45f,
+            "sphere floor collider was absent after the player-centered collider residency range");
+    }
+
+    private static void TestAnalyticSphereRaycast()
+    {
+        var spheres = new AnalyticSphereWorld();
+        AnalyticSphere far = spheres.Create(new Vector3(0f, 0f, 6f), 1f, (ushort)VoxelMaterial.Metal);
+        AnalyticSphere near = spheres.Create(new Vector3(0f, 0f, 3f), 0.5f, (ushort)VoxelMaterial.Stone);
+
+        AnalyticSphereHit? hit = spheres.Raycast(Vector3.Zero, Vector3.UnitZ, 8f);
+        Assert(hit.HasValue && hit.Value.SphereId == near.Id,
+            "sphere raycast did not return the nearest analytic surface");
+        Assert(MathF.Abs(hit!.Value.Distance - 2.5f) < 0.0001f &&
+               Vector3.Distance(hit.Value.Normal, -Vector3.UnitZ) < 0.0001f,
+            "sphere raycast returned an incorrect distance or normal");
+        Assert(spheres.Remove(hit.Value.SphereId) && spheres.Get(near.Id) is null && spheres.Get(far.Id) is not null,
+            "selected sphere could not be removed without a special tool mode");
     }
 
     private static void TestInfiniteWorldGeneration()
@@ -353,6 +445,30 @@ public static class SelfTests
 
     private static void TestSettingsRecovery()
     {
+        var presetSettings = new GameSettings();
+        presetSettings.ApplyDeferredQualityPreset(DeferredQualityPreset.Performance);
+        Assert(presetSettings.DeferredShadowResolution == 1024 &&
+               presetSettings.DeferredShadowDistance == 72f &&
+               presetSettings.DeferredReflectionQuality == 1,
+            "Deferred Performance preset did not apply its bounded quality profile");
+        presetSettings.ApplyDeferredQualityPreset(DeferredQualityPreset.Quality);
+        Assert(presetSettings.DeferredShadowResolution == 4096 &&
+               presetSettings.DeferredShadowDistance == 140f &&
+               presetSettings.DeferredAmbientOcclusionQuality == 3 &&
+               presetSettings.DeferredPostProcessingQuality == 3,
+            "Deferred Quality preset did not apply its complete quality profile");
+        presetSettings.ApplyForwardQualityPreset(ForwardQualityPreset.Potato);
+        Assert(presetSettings.ForwardShadowResolution == 1024 &&
+               presetSettings.ForwardShadowDistance == 64f &&
+               !presetSettings.ForwardBloom && !presetSettings.ForwardTemporalAntiAliasing,
+            "Forward Potato preset did not disable its expensive optional stages");
+        presetSettings.ApplyForwardQualityPreset(ForwardQualityPreset.Ultra);
+        Assert(presetSettings.ForwardShadowResolution == 4096 &&
+               presetSettings.ForwardShadowDistance == 144f &&
+               presetSettings.ForwardAmbientOcclusionQuality == 3 &&
+               presetSettings.ForwardTemporalAntiAliasing && presetSettings.ForwardApproximateGi,
+            "Forward Ultra preset did not apply its complete shader-pack profile");
+
         string directory = Path.Combine(Path.GetTempPath(), $"rtxsandbox-settings-{Guid.NewGuid():N}");
         string path = Path.Combine(directory, "settings.json");
         try
@@ -363,14 +479,62 @@ public static class SelfTests
                 PathBounces = 5,
                 PathSamplesPerFrame = 2,
                 PathMaxAccumulatedSamples = 2048,
+                PathRayDistance = 176f,
+                PathDirectLightingStrength = 1.25f,
+                PathEnvironmentIntensity = 0.8f,
+                PathEmissionIntensity = 1.4f,
+                PathReflectionStrength = 1.6f,
+                PathRussianRouletteStart = 4,
                 DeferredSpecularQuality = 1,
                 DeferredShadowQuality = 3,
+                DeferredShadowResolution = 4096,
+                DeferredShadowBias = 0.00072f,
+                DeferredShadowNormalBias = 0.041f,
+                DeferredShadowSlopeBias = 0.0021f,
+                DeferredShadowSoftness = 1.7f,
+                DeferredShadowDistance = 132f,
                 DeferredAmbientOcclusionQuality = 1,
                 DeferredDebugView = DeferredDebugView.Normal,
+                DeferredQualityPreset = DeferredQualityPreset.Custom,
+                HybridLightingQuality = 1,
+                HybridSpecularQuality = 2,
+                HybridShadowQuality = 3,
+                HybridShadowResolution = 4096,
+                HybridReflectionQuality = 1,
+                HybridAmbientOcclusionQuality = 2,
+                HybridWaterQuality = 3,
+                HybridTransparencyQuality = 1,
+                HybridFogQuality = 0,
+                HybridBloom = false,
                 PbrReflectionQuality = 3,
+                ForwardQualityPreset = ForwardQualityPreset.Custom,
+                ForwardShadowResolution = 4096,
+                ForwardShadowQuality = 3,
+                ForwardAmbientOcclusionQuality = 1,
+                ForwardVolumetricQuality = 3,
+                ForwardDebugView = ForwardDebugView.ScreenSpaceReflection,
+                ForwardTemporalAntiAliasing = false,
                 ClassicLightingQuality = 2,
+                ClassicSunlightStrength = 1.3f,
+                ClassicAmbientStrength = 0.7f,
+                ClassicColorSaturation = 1.15f,
+                ClassicWaterQuality = 3,
+                ClassicWaterWaveStrength = 1.2f,
+                ClassicTransparencyQuality = 2,
+                ClassicFogDensity = 0.35f,
                 HardwareRayTracingReflectionBounces = 5,
+                HardwareRayTracingRayDistance = 184f,
+                HardwareRayTracingShadowStrength = 0.75f,
+                HardwareRayTracingEmissionStrength = 1.35f,
+                HardwareRayTracingReflectionStrength = 1.6f,
                 HardwareRayTracingRenderStyle = HardwareRayTracingRenderStyle.Reference,
+                InfiniteMirrorQuality = InfiniteMirrorQuality.Extreme,
+                SelectionOutlineReflections = false,
+                Language = UiLanguage.English,
+                MoveForwardKey = "Up",
+                JumpKey = "J",
+                CrouchKey = "C",
+                SprintKey = "LeftAlt",
                 FpsLimit = 144,
             };
             settings.Save(path);
@@ -381,7 +545,8 @@ public static class SelfTests
                    !settingsJson.Contains("impactFracture", StringComparison.OrdinalIgnoreCase) &&
                    !settingsJson.Contains("gameMode", StringComparison.OrdinalIgnoreCase) &&
                    !settingsJson.Contains("difficulty", StringComparison.OrdinalIgnoreCase) &&
-                   !settingsJson.Contains("enableItemDrops", StringComparison.OrdinalIgnoreCase),
+                   !settingsJson.Contains("enableItemDrops", StringComparison.OrdinalIgnoreCase) &&
+                   !settingsJson.Contains("hardwareRayTracingDenoiser", StringComparison.OrdinalIgnoreCase),
                 "removed physics or survival switches still leaked into the settings schema");
 
             settings.Exposure = 2.2f;
@@ -393,12 +558,50 @@ public static class SelfTests
             Assert(!latest.RecoveredFromBackup && MathF.Abs(latest.Exposure - 2.2f) < 0.001f &&
                    latest.PathBounces == 9 && latest.FpsLimit == 165 &&
                    latest.PathSamplesPerFrame == 2 && latest.PathMaxAccumulatedSamples == 2048 &&
+                   MathF.Abs(latest.PathRayDistance - 176f) < 0.001f &&
+                   MathF.Abs(latest.PathDirectLightingStrength - 1.25f) < 0.001f &&
+                   MathF.Abs(latest.PathEnvironmentIntensity - 0.8f) < 0.001f &&
+                   MathF.Abs(latest.PathEmissionIntensity - 1.4f) < 0.001f &&
+                   MathF.Abs(latest.PathReflectionStrength - 1.6f) < 0.001f &&
+                   latest.PathRussianRouletteStart == 4 &&
                    latest.DeferredSpecularQuality == 1 && latest.PbrReflectionQuality == 3 &&
                    latest.DeferredShadowQuality == 3 && latest.DeferredAmbientOcclusionQuality == 1 &&
+                   latest.DeferredShadowResolution == 4096 &&
+                   MathF.Abs(latest.DeferredShadowBias - 0.00072f) < 0.000001f &&
+                   MathF.Abs(latest.DeferredShadowNormalBias - 0.041f) < 0.000001f &&
+                   MathF.Abs(latest.DeferredShadowSlopeBias - 0.0021f) < 0.000001f &&
+                   MathF.Abs(latest.DeferredShadowSoftness - 1.7f) < 0.0001f &&
+                   MathF.Abs(latest.DeferredShadowDistance - 132f) < 0.001f &&
                    latest.DeferredDebugView == DeferredDebugView.Normal &&
+                   latest.DeferredQualityPreset == DeferredQualityPreset.Custom &&
+                   latest.HybridLightingQuality == 1 && latest.HybridSpecularQuality == 2 &&
+                   latest.HybridShadowQuality == 3 && latest.HybridShadowResolution == 4096 &&
+                   latest.HybridReflectionQuality == 1 && latest.HybridAmbientOcclusionQuality == 2 &&
+                   latest.HybridWaterQuality == 3 && latest.HybridTransparencyQuality == 1 &&
+                   latest.HybridFogQuality == 0 && !latest.HybridBloom &&
+                   latest.ForwardQualityPreset == ForwardQualityPreset.Custom &&
+                   latest.ForwardShadowResolution == 4096 && latest.ForwardShadowQuality == 3 &&
+                   latest.ForwardAmbientOcclusionQuality == 1 && latest.ForwardVolumetricQuality == 3 &&
+                   latest.ForwardDebugView == ForwardDebugView.ScreenSpaceReflection &&
+                   !latest.ForwardTemporalAntiAliasing &&
                    latest.ClassicLightingQuality == 2 &&
+                   MathF.Abs(latest.ClassicSunlightStrength - 1.3f) < 0.001f &&
+                   MathF.Abs(latest.ClassicAmbientStrength - 0.7f) < 0.001f &&
+                   MathF.Abs(latest.ClassicColorSaturation - 1.15f) < 0.001f &&
+                   latest.ClassicWaterQuality == 3 &&
+                   MathF.Abs(latest.ClassicWaterWaveStrength - 1.2f) < 0.001f &&
+                   latest.ClassicTransparencyQuality == 2 &&
+                   MathF.Abs(latest.ClassicFogDensity - 0.35f) < 0.001f &&
                    latest.HardwareRayTracingReflectionBounces == 5 &&
+                   MathF.Abs(latest.HardwareRayTracingRayDistance - 184f) < 0.001f &&
+                   MathF.Abs(latest.HardwareRayTracingShadowStrength - 0.75f) < 0.001f &&
+                   MathF.Abs(latest.HardwareRayTracingEmissionStrength - 1.35f) < 0.001f &&
+                   MathF.Abs(latest.HardwareRayTracingReflectionStrength - 1.6f) < 0.001f &&
                    latest.HardwareRayTracingRenderStyle == HardwareRayTracingRenderStyle.Reference &&
+                   latest.InfiniteMirrorQuality == InfiniteMirrorQuality.Extreme &&
+                   !latest.SelectionOutlineReflections &&
+                   latest.Language == UiLanguage.English && latest.MoveForwardKey == "Up" &&
+                   latest.JumpKey == "J" && latest.CrouchKey == "C" && latest.SprintKey == "LeftAlt" &&
                    latest.Version == GameSettings.CurrentVersion,
                 "settings did not round-trip through the current schema");
 
@@ -459,6 +662,119 @@ public static class SelfTests
             "precision editing still treated water as unbreakable");
     }
 
+    private static void TestInputAndLocalizationDefaults()
+    {
+        var settings = new GameSettings();
+        Assert(settings.CrouchKey == "LeftShift" && settings.SprintKey == "LeftControl" &&
+               settings.MoveForwardKey == "W" && settings.JumpKey == "Space",
+            "new input defaults do not match Shift crouch and Ctrl+W sprint");
+        Assert(UiText.Get(UiLanguage.TraditionalChinese, "controls") == "按鍵" &&
+               UiText.Get(UiLanguage.SimplifiedChinese, "controls") == "按键" &&
+               UiText.Get(UiLanguage.English, "controls") == "Controls",
+            "navigation localization did not distinguish Traditional, Simplified and English");
+    }
+
+    private static void TestWaterFlow()
+    {
+        var world = new VoxelWorld(generate: false);
+        using var flow = new WaterFlowSimulation(world);
+        for (int x = 0; x <= 10; x++)
+        for (int z = 0; z <= 10; z++)
+            world.Set(x, 0, z, VoxelMaterial.Stone);
+        world.Set(5, 3, 5, VoxelMaterial.Water);
+
+        flow.Update(0.05f);
+        Assert(world.Get(5, 2, 5) == VoxelMaterial.Water,
+            "water did not fall into the empty cell below");
+        Assert(world.Get(5, 3, 5) == VoxelMaterial.Air,
+            "finite water duplicated its source while falling");
+        flow.Update(0.05f);
+        Assert(world.Get(5, 1, 5) == VoxelMaterial.Water,
+            "falling water did not continue to the floor");
+        for (int step = 0; step < 12; step++) flow.Update(0.05f);
+        (int X, int Z) horizontal = world.Get(6, 1, 5) == VoxelMaterial.Water ? (6, 5) :
+            world.Get(4, 1, 5) == VoxelMaterial.Water ? (4, 5) :
+            world.Get(5, 1, 6) == VoxelMaterial.Water ? (5, 6) : (5, 4);
+        Assert(world.Get(horizontal.X, 1, horizontal.Z) == VoxelMaterial.Water,
+            "supported water did not spread horizontally");
+        Assert(world.GetFluidAmount(horizontal.X, 1, horizontal.Z) < VoxelWorld.FluidCapacity,
+            "outward water did not become a partial-volume layer");
+        Assert(SumWater(world, 0, 10, 0, 5, 0, 10) == VoxelWorld.FluidCapacity,
+            "water flow created or destroyed finite volume");
+        ChunkMeshingSnapshot waterSnapshot = world.CreateChunkMeshingSnapshot(
+            ChunkCoordinate.FromVoxel(horizontal.X, horizontal.Z));
+        Assert(waterSnapshot.GetFluidLevel(horizontal.X, 1, horizontal.Z) ==
+               world.GetFluidLevel(horizontal.X, 1, horizontal.Z),
+            "fluid level was not copied into the immutable renderer snapshot");
+    }
+
+    private static void TestWaterDisplacement()
+    {
+        var world = new VoxelWorld(generate: false);
+        using var flow = new WaterFlowSimulation(world);
+        for (int x = 1; x <= 9; x++)
+        for (int z = 1; z <= 9; z++)
+            world.Set(x, 0, z, VoxelMaterial.Stone);
+        world.Set(5, 1, 5, VoxelMaterial.Water);
+        Assert(world.Set(5, 1, 5, VoxelMaterial.Stone), "solid did not replace the water cell");
+        flow.Update(0.05f);
+        Assert(world.Get(5, 1, 5) == VoxelMaterial.Stone,
+            "water displacement removed the newly placed solid");
+        Assert(SumWater(world, 0, 10, 0, 5, 0, 10) == VoxelWorld.FluidCapacity,
+            "placing a solid deleted or duplicated displaced water");
+        Assert(new[] { (4, 1, 5), (6, 1, 5), (5, 1, 4), (5, 1, 6) }
+                .Any(cell => world.GetFluidAmount(cell.Item1, cell.Item2, cell.Item3) is > 0 and < VoxelWorld.FluidCapacity),
+            "displaced water did not form a thin spill around the block");
+    }
+
+    private static void TestCommunicatingWaterColumns()
+    {
+        var world = new VoxelWorld(generate: false);
+        using var flow = new WaterFlowSimulation(world);
+        for (int x = 2; x <= 6; x++)
+        {
+            world.Set(x, 0, 5, VoxelMaterial.Stone);
+            world.Set(x, 1, 5, VoxelMaterial.Water);
+        }
+        // Sealed U-shaped vessel: the only connection between both open shafts is
+        // the full-water pipe at y=1, so balancing must move water upward by pressure.
+        for (int y = 1; y <= 4; y++)
+        {
+            world.Set(1, y, 5, VoxelMaterial.Stone);
+            world.Set(7, y, 5, VoxelMaterial.Stone);
+            for (int x = 2; x <= 6; x++)
+            {
+                world.Set(x, y, 4, VoxelMaterial.Stone);
+                world.Set(x, y, 6, VoxelMaterial.Stone);
+            }
+        }
+        for (int x = 3; x <= 5; x++)
+        for (int y = 2; y <= 4; y++)
+            world.Set(x, y, 5, VoxelMaterial.Stone);
+        world.Set(2, 2, 5, VoxelMaterial.Water);
+        world.Set(2, 3, 5, VoxelMaterial.Water);
+        int initialVolume = SumWater(world, 0, 8, 0, 6, 3, 7);
+        for (int step = 0; step < 80; step++) flow.Update(0.05f);
+
+        Assert(world.GetFluidAmount(6, 2, 5) == VoxelWorld.FluidCapacity,
+            "the low vessel did not rise through its connected bottom pipe");
+        Assert(world.GetFluidAmount(2, 3, 5) == 0,
+            "the high vessel did not drain while equalizing");
+        Assert(SumWater(world, 0, 8, 0, 6, 3, 7) == initialVolume,
+            "communicating-vessel balancing did not conserve water");
+    }
+
+    private static int SumWater(
+        VoxelWorld world, int minimumX, int maximumX, int minimumY, int maximumY, int minimumZ, int maximumZ)
+    {
+        int amount = 0;
+        for (int z = minimumZ; z <= maximumZ; z++)
+        for (int y = minimumY; y <= maximumY; y++)
+        for (int x = minimumX; x <= maximumX; x++)
+            amount += world.GetFluidAmount(x, y, z);
+        return amount;
+    }
+
     private static void TestSwimming()
     {
         var world = new VoxelWorld(generate: false);
@@ -474,6 +790,30 @@ public static class SelfTests
         }
         Assert(player.IsInWater, "player did not detect water");
         Assert(player.Position.Y > initialY + 0.2f, "swim-up input did not raise the player");
+    }
+
+    private static void TestWaterJumpIgnoresFluidThickness()
+    {
+        static PlayerController CreatePlayer(byte fluidLevel)
+        {
+            var world = new VoxelWorld(generate: false);
+            world.Set(3, 0, 3, VoxelMaterial.Bedrock);
+            world.Set(3, 1, 3, VoxelMaterial.Water);
+            world.SetFluidLevel(3, 1, 3, fluidLevel);
+            return new PlayerController(world, new Vector3(3.5f, 1f, 3.5f));
+        }
+
+        PlayerController fullWater = CreatePlayer(0);
+        PlayerController thinnestWater = CreatePlayer(VoxelWorld.MaximumFluidLevel);
+        fullWater.Update(1f / 60f, Vector2.Zero, -Vector3.UnitZ, false, true);
+        thinnestWater.Update(1f / 60f, Vector2.Zero, -Vector3.UnitZ, false, true);
+
+        Assert(fullWater.IsInWater && thinnestWater.IsInWater,
+            "the thinnest water layer did not enable the jump-out action");
+        Assert(MathF.Abs(fullWater.VerticalVelocity - thinnestWater.VerticalVelocity) < 0.0001f,
+            $"water thickness changed jump speed ({fullWater.VerticalVelocity:0.000} vs {thinnestWater.VerticalVelocity:0.000})");
+        Assert(fullWater.VerticalVelocity >= 6.19f,
+            $"water jump still used gradual acceleration ({fullWater.VerticalVelocity:0.000})");
     }
 
     private static void TestSwimmingShoreExit()
@@ -629,6 +969,8 @@ public static class SelfTests
             });
             originalWorld.SetBlockId(15, 3, 15, originalMaterial);
             originalWorld.SetBlockId(16, 4, 15, originalMaterial);
+            originalWorld.SetBlockId(14, 6, 14, (ushort)VoxelMaterial.Water);
+            originalWorld.SetFluidLevel(14, 6, 14, 3);
             var micro = new MicroVoxelContainer(4);
             micro.PaintCell(4, 0, 0, 0, originalMaterial);
             originalWorld.SetMicroVoxels(32, 5, 15, micro);
@@ -663,6 +1005,9 @@ public static class SelfTests
                    loadedWorld.GetBlockId(15, 3, 15) == remappedMaterial &&
                    loadedWorld.GetBlockId(16, 4, 15) == remappedMaterial,
                 "independent chunk material keys were not remapped");
+            Assert(loadedWorld.Get(14, 6, 14) == VoxelMaterial.Water &&
+                   loadedWorld.GetFluidLevel(14, 6, 14) == 3,
+                "flowing-water height was not restored from region v2");
             Assert(loadedWorld.TryGetMicroVoxels(32, 5, 15, out MicroVoxelContainer? loadedMicro) &&
                    loadedMicro!.Boxes.All(box => box.MaterialId == remappedMaterial),
                 "precision geometry was not restored from its chunk");
@@ -1184,20 +1529,60 @@ public static class SelfTests
             "diagonally touching voxels were incorrectly merged into one supported component");
     }
 
-    private static void TestFlightNoClip()
+    private static void TestCrouchMovement()
     {
         var world = new VoxelWorld(generate: false);
-        for (int y = 0; y < 4; y++) world.Set(3, y, 2, VoxelMaterial.Stone);
-        var player = new PlayerController(world, new Vector3(2.5f, 1f, 2.5f))
+        for (int z = -2; z <= 2; z++)
+        for (int x = -4; x <= 4; x++)
+            world.Set(x, 0, z, VoxelMaterial.Stone);
+
+        var standing = new PlayerController(world, new Vector3(0.5f, 1f, 0.5f));
+        var crouching = new PlayerController(world, new Vector3(0.5f, 1f, -0.5f));
+        standing.Update(1f / 60f, Vector2.Zero, Vector3.UnitX, false, false);
+        crouching.Update(1f / 60f, Vector2.Zero, Vector3.UnitX, false, false, crouch: true);
+        for (int index = 0; index < 30; index++)
+        {
+            standing.Update(1f / 60f, new Vector2(0f, 1f), Vector3.UnitX, false, false);
+            crouching.Update(1f / 60f, new Vector2(0f, 1f), Vector3.UnitX, false, false, crouch: true);
+        }
+        Assert(crouching.IsCrouching && crouching.Position.X < standing.Position.X * 0.6f,
+            "crouching did not lower movement speed");
+        Assert(crouching.EyePosition.Y < crouching.Position.Y + PlayerController.EyeHeight,
+            "crouching did not lower the player eye height");
+
+        var edgeWorld = new VoxelWorld(generate: false);
+        edgeWorld.Set(0, 0, 0, VoxelMaterial.Stone);
+        edgeWorld.Set(1, 0, 0, VoxelMaterial.Stone);
+        var edgePlayer = new PlayerController(edgeWorld, new Vector3(1.5f, 1f, 0.5f));
+        edgePlayer.Update(1f / 60f, Vector2.Zero, Vector3.UnitX, false, false, crouch: true);
+        for (int index = 0; index < 120; index++)
+            edgePlayer.Update(1f / 60f, new Vector2(0f, 1f), Vector3.UnitX, false, false, crouch: true);
+        Assert(edgePlayer.Position.Y > 0.99f && edgePlayer.Position.X <= 2f + PlayerController.Radius,
+            "crouching allowed the player to walk off a block edge");
+    }
+
+    private static void TestFlightMovementAxes()
+    {
+        var world = new VoxelWorld(generate: false);
+        var facingEast = new PlayerController(world, new Vector3(2.5f, 4f, 2.5f))
         {
             FlightMode = true,
             NoClip = true,
         };
-        for (int i = 0; i < 30; i++)
+        var facingUp = new PlayerController(world, new Vector3(2.5f, 4f, 2.5f))
         {
-            player.Update(1f / 60f, new Vector2(0f, 1f), Vector3.UnitX, false, false);
+            FlightMode = true,
+            NoClip = true,
+        };
+        for (int index = 0; index < 30; index++)
+        {
+            facingEast.Update(1f / 60f, new Vector2(0f, 1f), Vector3.UnitX, false, false);
+            facingUp.Update(1f / 60f, new Vector2(0f, 1f), Vector3.UnitY, false, false);
         }
-        Assert(player.Position.X > 4f, "noclip flight was blocked by a voxel wall");
+        Assert(Vector3.DistanceSquared(facingEast.Position, facingUp.Position) < 0.000001f,
+            "flight movement changed with camera direction");
+        Assert(facingEast.Position.Z < 0f && MathF.Abs(facingEast.Position.X - 2.5f) < 0.001f,
+            "forward flight did not follow the fixed world axis");
     }
 
     private static void TestEditorMaterialMetadata()
@@ -1409,6 +1794,10 @@ public static class SelfTests
         }
         Assert(sideTop.Y > sideBottom.Y + 4f,
             "grass side texture is vertically inverted: the green cap is not on the top edge");
+        MaterialTileUv grassSideUv = first.GetTileUv(grass!.Id, Rendering.MaterialFace.Side);
+        var previewUv = SandboxGame.ResolveMaterialPreviewUvs(grassSideUv, flipX: false, flipY: true);
+        Assert(previewUv.A.Y > previewUv.C.Y && previewUv.B.Y > previewUv.D.Y,
+            "inventory cube preview does not sample the top of side textures at the top of the icon");
 
         string[] surfaceGlassKeys =
         {
@@ -1444,6 +1833,26 @@ public static class SelfTests
         }
         Assert(maximumFrostRoughness - minimumFrostRoughness > 0.1f,
             "frosted glass has no measurable roughness texture detail");
+
+        blocks.TryGet("rtxsandbox:matte_glass", out BlockDefinition? matteGlass);
+        int frostedRepeatedNeighbors = 0;
+        int matteRepeatedNeighbors = 0;
+        for (int y = 0; y < ProceduralMaterialAtlas.TileSize; y++)
+        for (int x = 0; x + 1 < ProceduralMaterialAtlas.TileSize; x++)
+        {
+            if (Vector3.DistanceSquared(
+                    first.ReadColor(frostedGlass!.Id, Rendering.MaterialFace.Side, x, y),
+                    first.ReadColor(frostedGlass.Id, Rendering.MaterialFace.Side, x + 1, y)) < 0.000001f)
+                frostedRepeatedNeighbors++;
+            if (Vector3.DistanceSquared(
+                    first.ReadColor(matteGlass!.Id, Rendering.MaterialFace.Side, x, y),
+                    first.ReadColor(matteGlass.Id, Rendering.MaterialFace.Side, x + 1, y)) < 0.000001f)
+                matteRepeatedNeighbors++;
+        }
+        Assert(frostedRepeatedNeighbors >= 96,
+            $"frosted glass no longer has medium 2x2 grain ({frostedRepeatedNeighbors} repeated neighbors)");
+        Assert(matteRepeatedNeighbors < frostedRepeatedNeighbors / 4,
+            "matte glass grain is not visibly finer than frosted glass");
 
         Assert(blocks.TryGet("rtxsandbox:white_concrete", out BlockDefinition? concrete), "white concrete is missing");
         Vector3 reference = first.ReadColor(concrete!.Id, Rendering.MaterialFace.Top, 0, 0);
@@ -1716,6 +2125,7 @@ public static class SelfTests
         }
     }
 
+
     private static void TestPrimaryDestroySemantics()
     {
         var blocks = new BlockRegistry();
@@ -1766,6 +2176,36 @@ public static class SelfTests
                     descriptor.Kind != RenderBackendKind.HardwareRayTracing).All(descriptor =>
                 descriptor.Capabilities.HasFlag(RenderBackendCapabilities.MicroVoxels)),
             "a selectable renderer cannot display precision-built geometry");
+    }
+
+    private static void TestRendererFailureFallback()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        TestRenderBackend? classic = null;
+        using var host = new RenderBackendHost(
+            world,
+            blocks,
+            320,
+            180,
+            1f,
+            RenderBackendKind.DeferredLighting,
+            kind =>
+            {
+                if (kind is RenderBackendKind.DeferredLighting or RenderBackendKind.PbrForward)
+                    throw new InvalidOperationException("simulated renderer initialization failure");
+                var backend = new TestRenderBackend(kind);
+                if (kind == RenderBackendKind.Classic) classic = backend;
+                return backend;
+            });
+
+        Assert(host.Kind == RenderBackendKind.Classic && host.Status.Contains("安全回退", StringComparison.Ordinal),
+            "a failed startup renderer did not fall back to Classic with a clear reason");
+        Assert(!host.Switch((RenderBackendKind)999) && host.Kind == RenderBackendKind.Classic,
+            "an unknown renderer ID threw or replaced the active renderer");
+        Assert(!host.Switch(RenderBackendKind.PbrForward) && host.Kind == RenderBackendKind.Classic &&
+               classic is { Disposed: false },
+            "a failed runtime switch disposed or replaced the working renderer");
     }
 
     private static void TestChunkCoordinates()
@@ -2231,6 +2671,35 @@ public static class SelfTests
             "grid placement preview accepted an occupied destination");
     }
 
+    private static void TestPhysicsGridMicroPlacement()
+    {
+        var blocks = new BlockRegistry();
+        var world = new VoxelWorld(generate: false, registry: blocks);
+        PhysicsGrid grid = world.PhysicsGrids.Create(
+            new[] { new PhysicsGridElement(0, 0, 0, Vector3.Zero, Vector3.One, (ushort)VoxelMaterial.Stone) },
+            new Vector3(8f, 8f, 8f));
+        using var physics = new VoxelPhysicsSimulator(world, blocks);
+        var hit = new PhysicsGridRayHit(
+            grid.Id, 0, 0, 0, (ushort)VoxelMaterial.Stone,
+            grid.LocalToWorld(new Vector3(1f, 0.53f, 0.53f)),
+            grid.LocalDirectionToWorld(Vector3.UnitX), 2f);
+
+        Assert(physics.TryPlaceMicroOnGrid(hit, (ushort)VoxelMaterial.Glass, 16),
+            "precision grid placement was rejected");
+        PhysicsGridElement placed = grid.Elements.Single(element => element.MaterialId == (ushort)VoxelMaterial.Glass);
+        Vector3 size = placed.Maximum - placed.Minimum;
+        Assert(Vector3.DistanceSquared(size, new Vector3(1f / 16f)) < 0.0000001f,
+            $"precision grid placement became a full cell: {size}");
+        PhysicsGridRayHit? microHit = grid.Raycast(
+            grid.LocalToWorld(placed.Center + Vector3.UnitX),
+            grid.LocalDirectionToWorld(-Vector3.UnitX),
+            2f);
+        Assert(microHit.HasValue && physics.TryRemoveGridElement(microHit.Value),
+            "precision grid element could not be removed independently");
+        Assert(grid.Elements.Count == 1 && grid.Elements[0].MaterialId == (ushort)VoxelMaterial.Stone,
+            "removing a precision grid element also removed its full-cell neighbor");
+    }
+
     private static void TestFloorContactRotation()
     {
         var blocks = new BlockRegistry();
@@ -2284,6 +2753,7 @@ public static class SelfTests
 
     private static void Run(string name, Action test, List<string> failures)
     {
+        _testsRun++;
         try
         {
             test();
@@ -2301,5 +2771,22 @@ public static class SelfTests
         {
             throw new InvalidOperationException(message);
         }
+    }
+
+    private sealed class TestRenderBackend : IRenderBackend
+    {
+        public TestRenderBackend(RenderBackendKind kind) => Kind = kind;
+
+        public RenderBackendKind Kind { get; }
+        public RenderBackendCapabilities Capabilities => RenderBackendCapabilities.RealTime;
+        public string Name => $"Test {Kind}";
+        public int AccumulatedSamples => 0;
+        public bool Disposed { get; private set; }
+
+        public void Resize(int width, int height, float renderScale) { }
+        public void ResetAccumulation() { }
+        public void Render(Vector3 cameraPosition, Camera camera, VoxelHit? selection, float timeOfDay,
+            RenderQualitySettings quality, float exposure) { }
+        public void Dispose() => Disposed = true;
     }
 }

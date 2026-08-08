@@ -1,0 +1,64 @@
+name: Desktop cross-platform
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Build
+        run: dotnet build RTXSandbox.csproj -c Release
+      - name: Shared core tests
+        run: dotnet run --project RTXSandbox.csproj -c Release --no-build -- --self-test
+
+  publish-rids:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x86, win-x64, win-arm64, linux-x64, linux-arm64, linux-arm, osx-x64, osx-arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Publish ${{ matrix.rid }}
+        shell: pwsh
+        run: >-
+          dotnet publish RTXSandbox.csproj -c Release -r ${{ matrix.rid }}
+          --self-contained false -p:RTXSandboxManagedPublish=true
+          -o artifacts/${{ matrix.rid }}/Managed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtxsandbox-${{ matrix.rid }}
+          path: artifacts/${{ matrix.rid }}
+
+  android:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Install Android workload
+        run: dotnet workload install android
+      - name: Build Android APK for multiple ABIs
+        shell: pwsh
+        run: >-
+          dotnet build RTXSandbox.Android/RTXSandbox.Android.csproj -c Release
+          -p:RuntimeIdentifiers='android-arm64;android-x64;android-arm;android-x86'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtxsandbox-android
+          path: RTXSandbox.Android/bin/Release/net9.0-android/**/*.apk

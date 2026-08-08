@@ -65,9 +65,9 @@ public sealed class WorldSaveService
     private const int ChunkMagic = 0x48435852; // RXCH
     private const int ChunkVersion = 1;
     private const int RegionMagic = 0x47525852; // RXRG
-    private const int RegionVersion = 1;
+    private const int RegionVersion = 2;
     private const int PhysicsMagic = 0x48505852; // RXPH
-    private const int PhysicsVersion = 1;
+    private const int PhysicsVersion = 2;
 
     private readonly BlockRegistry _blocks;
     private readonly bool _singleFileMode;
@@ -480,6 +480,7 @@ public sealed class WorldSaveService
             world.GenerationSettings.Clone(),
             chunks,
             CapturePhysicsGrids(world.PhysicsGrids.Grids),
+            CaptureAnalyticSpheres(world.AnalyticSpheres.Spheres),
             CreatePlayerMetadata(
                 playerPosition, inventory, health, oxygen, hunger, completedObjectives, sawNight),
             playerPosition,
@@ -508,7 +509,8 @@ public sealed class WorldSaveService
         }
 
         string physicsFile = $"{relativeGenerationDirectory}/physics.bin";
-        WritePhysicsFile(ResolveWorldRelativePath(physicsFile), capture.PhysicsGrids);
+        WritePhysicsFile(
+            ResolveWorldRelativePath(physicsFile), capture.PhysicsGrids, capture.AnalyticSpheres);
         string playerFile = $"{relativeGenerationDirectory}/player.json";
         WritePlayerMetadata(ResolveWorldRelativePath(playerFile), capture.Player);
 
@@ -573,6 +575,15 @@ public sealed class WorldSaveService
                     writer.Write(voxel.MaterialId);
                 }
 
+                writer.Write(chunk.FluidLevels.Count);
+                foreach (StoredFluidLevel fluid in chunk.FluidLevels)
+                {
+                    writer.Write((byte)fluid.LocalX);
+                    writer.Write(fluid.Y);
+                    writer.Write((byte)fluid.LocalZ);
+                    writer.Write(fluid.Level);
+                }
+
                 writer.Write(chunk.MicroVoxels.Count);
                 foreach (StoredMicroVoxel micro in chunk.MicroVoxels)
                 {
@@ -602,7 +613,20 @@ public sealed class WorldSaveService
             grid.FractureOnImpact,
             grid.Elements.ToArray())).ToArray();
 
-    private void WritePhysicsFile(string path, IReadOnlyList<SavedPhysicsGrid> grids)
+    private static IReadOnlyList<SavedAnalyticSphere> CaptureAnalyticSpheres(
+        IReadOnlyList<AnalyticSphere> spheres) =>
+        spheres.Select(sphere => new SavedAnalyticSphere(
+            sphere.Center,
+            sphere.Radius,
+            sphere.MaterialId,
+            sphere.LinearVelocity,
+            sphere.AngularVelocity,
+            sphere.IsSleeping)).ToArray();
+
+    private void WritePhysicsFile(
+        string path,
+        IReadOnlyList<SavedPhysicsGrid> grids,
+        IReadOnlyList<SavedAnalyticSphere> spheres)
     {
         WriteNewBinaryFile(path, writer =>
         {
@@ -626,6 +650,16 @@ public sealed class WorldSaveService
                     WriteVector3(writer, element.Maximum);
                     writer.Write(element.MaterialId);
                 }
+            }
+            writer.Write(spheres.Count);
+            foreach (SavedAnalyticSphere sphere in spheres)
+            {
+                WriteVector3(writer, sphere.Center);
+                writer.Write(sphere.Radius);
+                writer.Write(sphere.MaterialId);
+                WriteVector3(writer, sphere.LinearVelocity);
+                WriteVector3(writer, sphere.AngularVelocity);
+                writer.Write(sphere.Sleeping);
             }
         });
     }
@@ -759,14 +793,14 @@ public sealed class WorldSaveService
         string physicsPath = string.IsNullOrWhiteSpace(metadata.PhysicsFile)
             ? throw new InvalidDataException("World manifest has no physics state file.")
             : ResolveWorldRelativePath(metadata.PhysicsFile);
-        IReadOnlyList<SavedPhysicsGrid> physicsGrids = ReadPhysicsFile(physicsPath, remap);
+        SavedPhysicsState physics = ReadPhysicsFile(physicsPath, remap);
         PlayerMetadata player = string.IsNullOrWhiteSpace(metadata.PlayerFile)
             ? throw new InvalidDataException("World manifest has no player state file.")
             : ReadPlayerMetadata(ResolveWorldRelativePath(metadata.PlayerFile));
 
         world.LoadRawData(voxels);
         world.LoadMicroVoxels(microVoxels);
-        RestorePhysicsGrids(world, physicsGrids);
+        RestorePhysicsState(world, physics);
         WorldGenerationSettings generation = metadata.Generation?.Clone()
                                              ?? WorldGenerationSettings.Natural(metadata.Seed);
         generation.Seed = metadata.Seed;
@@ -819,13 +853,13 @@ public sealed class WorldSaveService
         string physicsPath = string.IsNullOrWhiteSpace(metadata.PhysicsFile)
             ? throw new InvalidDataException("World manifest has no physics state file.")
             : ResolveWorldRelativePath(metadata.PhysicsFile);
-        IReadOnlyList<SavedPhysicsGrid> physicsGrids = ReadPhysicsFile(physicsPath, remap);
+        SavedPhysicsState physics = ReadPhysicsFile(physicsPath, remap);
         PlayerMetadata player = string.IsNullOrWhiteSpace(metadata.PlayerFile)
             ? throw new InvalidDataException("World manifest has no player state file.")
             : ReadPlayerMetadata(ResolveWorldRelativePath(metadata.PlayerFile));
 
         world.LoadChunks(chunks);
-        RestorePhysicsGrids(world, physicsGrids);
+        RestorePhysicsState(world, physics);
         WorldGenerationSettings generation = metadata.Generation?.Clone()
                                              ?? WorldGenerationSettings.Natural(metadata.Seed);
         generation.Seed = metadata.Seed;
@@ -858,7 +892,8 @@ public sealed class WorldSaveService
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
         if (reader.ReadInt32() != RegionMagic) throw new InvalidDataException("Invalid region header.");
         int version = reader.ReadInt32();
-        if (version != RegionVersion) throw new InvalidDataException($"Unsupported region version {version}.");
+        if (version is < 1 or > RegionVersion)
+            throw new InvalidDataException($"Unsupported region version {version}.");
         var region = new RegionCoordinate(reader.ReadInt32(), reader.ReadInt32());
         int chunkSize = reader.ReadInt32();
         int regionSize = reader.ReadInt32();
@@ -899,6 +934,29 @@ public sealed class WorldSaveService
                 if (material != 0) voxels.Add(new StoredVoxel(localX, y, localZ, material));
             }
 
+            var fluidLevels = new List<StoredFluidLevel>();
+            if (version >= 2)
+            {
+                int fluidCount = reader.ReadInt32();
+                if (fluidCount < 0 || fluidCount > regularCount)
+                    throw new InvalidDataException("Invalid fluid level count in region chunk.");
+                var fluidCells = new HashSet<(byte X, int Y, byte Z)>();
+                for (int fluidIndex = 0; fluidIndex < fluidCount; fluidIndex++)
+                {
+                    byte localX = reader.ReadByte();
+                    int y = reader.ReadInt32();
+                    byte localZ = reader.ReadByte();
+                    byte level = reader.ReadByte();
+                    var cell = (localX, y, localZ);
+                    if (localX >= ChunkCoordinate.Size || localZ >= ChunkCoordinate.Size ||
+                        y < VoxelWorld.MinimumY || y >= VoxelWorld.MaximumY ||
+                        level is 0 or > VoxelWorld.MaximumFluidLevel ||
+                        !occupied.Contains(cell) || !fluidCells.Add(cell))
+                        throw new InvalidDataException("Region contains an invalid fluid level.");
+                    fluidLevels.Add(new StoredFluidLevel(localX, y, localZ, level));
+                }
+            }
+
             int microCount = reader.ReadInt32();
             if (microCount < 0 || microCount > maximumCells)
                 throw new InvalidDataException("Invalid precision cell count in region chunk.");
@@ -935,7 +993,7 @@ public sealed class WorldSaveService
                     microVoxels.Add(new StoredMicroVoxel(localX, y, localZ, snapshot));
                 }
             }
-            chunks.Add(new VoxelChunkSnapshot(coordinate, voxels, microVoxels));
+            chunks.Add(new VoxelChunkSnapshot(coordinate, voxels, fluidLevels, microVoxels));
         }
         if (stream.Position != stream.Length) throw new InvalidDataException("Region has trailing data.");
         return chunks;
@@ -1030,13 +1088,14 @@ public sealed class WorldSaveService
         return coordinate;
     }
 
-    private IReadOnlyList<SavedPhysicsGrid> ReadPhysicsFile(string path, ushort[] remap)
+    private SavedPhysicsState ReadPhysicsFile(string path, ushort[] remap)
     {
         using FileStream stream = File.OpenRead(path);
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
         if (reader.ReadInt32() != PhysicsMagic) throw new InvalidDataException("Invalid physics state header.");
         int version = reader.ReadInt32();
-        if (version != PhysicsVersion) throw new InvalidDataException($"Unsupported physics state version {version}.");
+        if (version is < 1 or > PhysicsVersion)
+            throw new InvalidDataException($"Unsupported physics state version {version}.");
         int gridCount = reader.ReadInt32();
         if (gridCount < 0 || gridCount > 4096) throw new InvalidDataException("Invalid physics grid count.");
         var grids = new List<SavedPhysicsGrid>(gridCount);
@@ -1071,8 +1130,33 @@ public sealed class WorldSaveService
             grids.Add(new SavedPhysicsGrid(
                 position, orientation, linearVelocity, angularVelocity, sleeping, fractureOnImpact, elements));
         }
+        var spheres = new List<SavedAnalyticSphere>();
+        if (version >= 2)
+        {
+            int sphereCount = reader.ReadInt32();
+            if (sphereCount < 0 || sphereCount > 16_384)
+                throw new InvalidDataException("Invalid analytic sphere count.");
+            spheres.Capacity = sphereCount;
+            for (int sphereIndex = 0; sphereIndex < sphereCount; sphereIndex++)
+            {
+                Vector3 center = ReadVector3(reader);
+                float radius = reader.ReadSingle();
+                ushort savedMaterial = reader.ReadUInt16();
+                if (!float.IsFinite(radius) || radius < 0.2f || radius > 4f)
+                    throw new InvalidDataException("Invalid analytic sphere radius.");
+                if (savedMaterial >= remap.Length)
+                    throw new InvalidDataException("Analytic sphere material exceeds the saved material table.");
+                ushort material = remap[savedMaterial];
+                if (material == 0) material = BlockRegistry.UnknownBlockId;
+                Vector3 linearVelocity = ReadVector3(reader);
+                Vector3 angularVelocity = ReadVector3(reader);
+                bool sleeping = reader.ReadBoolean();
+                spheres.Add(new SavedAnalyticSphere(
+                    center, radius, material, linearVelocity, angularVelocity, sleeping));
+            }
+        }
         if (stream.Position != stream.Length) throw new InvalidDataException("Physics state has trailing data.");
-        return grids;
+        return new SavedPhysicsState(grids, spheres);
     }
 
     private static PlayerMetadata ReadPlayerMetadata(string path)
@@ -1115,15 +1199,23 @@ public sealed class WorldSaveService
         return remap;
     }
 
-    private static void RestorePhysicsGrids(VoxelWorld world, IReadOnlyList<SavedPhysicsGrid> physicsGrids)
+    private static void RestorePhysicsState(VoxelWorld world, SavedPhysicsState physics)
     {
-        foreach (SavedPhysicsGrid savedGrid in physicsGrids)
+        foreach (SavedPhysicsGrid savedGrid in physics.Grids)
         {
             PhysicsGrid grid = world.PhysicsGrids.Create(savedGrid.Elements, Vector3.Zero);
             grid.SetTransformAndVelocity(
                 savedGrid.Position, savedGrid.Orientation, savedGrid.LinearVelocity, savedGrid.AngularVelocity);
             grid.IsSleeping = savedGrid.Sleeping;
             grid.FractureOnImpact = savedGrid.FractureOnImpact;
+        }
+        foreach (SavedAnalyticSphere savedSphere in physics.AnalyticSpheres)
+        {
+            AnalyticSphere sphere = world.AnalyticSpheres.Create(
+                savedSphere.Center, savedSphere.Radius, savedSphere.MaterialId);
+            sphere.LinearVelocity = savedSphere.LinearVelocity;
+            sphere.AngularVelocity = savedSphere.AngularVelocity;
+            sphere.IsSleeping = savedSphere.Sleeping;
         }
     }
 
@@ -1717,6 +1809,7 @@ public sealed class WorldSaveService
         WorldGenerationSettings Generation,
         IReadOnlyList<VoxelChunkSnapshot> Chunks,
         IReadOnlyList<SavedPhysicsGrid> PhysicsGrids,
+        IReadOnlyList<SavedAnalyticSphere> AnalyticSpheres,
         PlayerMetadata Player,
         Vector3 PlayerPosition,
         float TimeOfDay,
@@ -1778,4 +1871,14 @@ public sealed class WorldSaveService
         bool Sleeping,
         bool FractureOnImpact,
         IReadOnlyList<PhysicsGridElement> Elements);
+    private sealed record SavedAnalyticSphere(
+        Vector3 Center,
+        float Radius,
+        ushort MaterialId,
+        Vector3 LinearVelocity,
+        Vector3 AngularVelocity,
+        bool Sleeping);
+    private sealed record SavedPhysicsState(
+        IReadOnlyList<SavedPhysicsGrid> Grids,
+        IReadOnlyList<SavedAnalyticSphere> AnalyticSpheres);
 }

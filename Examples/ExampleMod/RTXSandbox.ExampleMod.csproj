@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
+    <ExampleModTargetFramework Condition="'$(ExampleModTargetFramework)' == ''">net6.0</ExampleModTargetFramework>
+    <RTXSandboxHostTargetFramework Condition="'$(RTXSandboxHostTargetFramework)' == ''">net9.0</RTXSandboxHostTargetFramework>
+    <TargetFramework>$(ExampleModTargetFramework)</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>RTXSandbox.ExampleMod</AssemblyName>
@@ -14,7 +16,8 @@
 
   <Target Name="CopyPluginToGame" AfterTargets="Build">
     <PropertyGroup>
-      <PluginDirectory>$(MSBuildProjectDirectory)\..\..\bin\$(Configuration)\net6.0\BepInEx\plugins</PluginDirectory>
+      <!-- The sample remains net6.0 while following the selected game host output. -->
+      <PluginDirectory>$(MSBuildProjectDirectory)\..\..\bin\$(Configuration)\$(RTXSandboxHostTargetFramework)\BepInEx\plugins</PluginDirectory>
     </PropertyGroup>
     <MakeDir Directories="$(PluginDirectory)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PluginDirectory)" />

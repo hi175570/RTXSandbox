@@ -36,12 +36,8 @@ public static class BepInExBootstrap
             }
             string dataPath = Path.Combine(RuntimePaths.OutputRoot, "Data");
             Directory.CreateDirectory(dataPath);
-            Paths.SetExecutablePath(
-                executablePath,
-                Path.Combine(RuntimePaths.OutputRoot, "BepInEx"),
-                RuntimePaths.ManagedDirectory,
-                gameDataRelativeToManaged: true);
-            ConsoleManager.Initialize(alreadyActive: true, useManagedEncoder: true);
+            InitializePaths(executablePath);
+            InitializeConsoleDriver();
             _chainloader = new NetChainloader();
             _chainloader.Initialize();
             _chainloader.Execute();
@@ -69,6 +65,81 @@ public static class BepInExBootstrap
             FailureMessage = exception.ToString();
             Console.Error.WriteLine($"BepInEx startup failed; the base game will continue without plugins:\n{exception}");
         }
+    }
+
+    // BepInEx build 785 calls MonoMod.Utils.PlatformHelper from Paths and
+    // ConsoleManager. Modern MonoMod (also required by the optional .NET 10 host) removed that type,
+    // so initialize the documented Paths state directly and keep the game's
+    // already-active console instead of invoking the obsolete helpers.
+    private static void InitializePaths(string executablePath)
+    {
+        string gameRoot = Path.GetDirectoryName(executablePath) ?? RuntimePaths.OutputRoot;
+        string bepinRoot = Path.Combine(RuntimePaths.OutputRoot, "BepInEx");
+        string coreDirectory = Path.Combine(bepinRoot, "core");
+        var values = new Dictionary<string, object?>
+        {
+            [nameof(Paths.ExecutablePath)] = executablePath,
+            [nameof(Paths.ProcessName)] = Path.GetFileNameWithoutExtension(executablePath),
+            [nameof(Paths.GameRootPath)] = gameRoot,
+            [nameof(Paths.GameDataPath)] = RuntimePaths.OutputRoot,
+            [nameof(Paths.ManagedPath)] = RuntimePaths.ManagedDirectory,
+            [nameof(Paths.BepInExRootPath)] = bepinRoot,
+            [nameof(Paths.ConfigPath)] = ConfigDirectory,
+            [nameof(Paths.BepInExConfigPath)] = Path.Combine(ConfigDirectory, "BepInEx.cfg"),
+            [nameof(Paths.PluginPath)] = PluginDirectory,
+            [nameof(Paths.PatcherPluginPath)] = Path.Combine(bepinRoot, "patchers"),
+            [nameof(Paths.BepInExAssemblyDirectory)] = coreDirectory,
+            [nameof(Paths.BepInExAssemblyPath)] = Path.Combine(coreDirectory, "BepInEx.Core.dll"),
+            [nameof(Paths.CachePath)] = Path.Combine(bepinRoot, "cache"),
+            [nameof(Paths.DllSearchPaths)] = new[] { RuntimePaths.ManagedDirectory }
+        };
+
+        foreach ((string propertyName, object? value) in values)
+        {
+            PropertyInfo property = typeof(Paths).GetProperty(propertyName, BindingFlags.Public | BindingFlags.Static)
+                ?? throw new MissingMemberException(typeof(Paths).FullName, propertyName);
+            property.SetValue(null, value);
+        }
+    }
+
+    private static void InitializeConsoleDriver()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            // The host already owns a valid stdout/stderr stream on Unix. The
+            // bundled BepInEx Unix console shim is incompatible with modern
+            // MonoMod, so leave the existing terminal untouched and prevent
+            // the chainloader from trying to create a second native console.
+            FieldInfo consoleEnabledField = typeof(ConsoleManager).GetField(
+                "ConfigConsoleEnabled",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                ?? throw new MissingFieldException(typeof(ConsoleManager).FullName, "ConfigConsoleEnabled");
+            object consoleEnabled = consoleEnabledField.GetValue(null)
+                ?? throw new InvalidOperationException("BepInEx console configuration was not initialized.");
+            PropertyInfo valueProperty = consoleEnabled.GetType().GetProperty("Value")
+                ?? throw new MissingMemberException(consoleEnabled.GetType().FullName, "Value");
+            valueProperty.SetValue(consoleEnabled, false);
+            return;
+        }
+
+        Assembly coreAssembly = typeof(ConsoleManager).Assembly;
+        const string driverName = "BepInEx.WindowsConsoleDriver";
+        Type driverType = coreAssembly.GetType(driverName, throwOnError: true)!;
+        object driver = Activator.CreateInstance(driverType, nonPublic: true)
+            ?? throw new InvalidOperationException($"BepInEx console driver '{driverName}' could not be created.");
+        MethodInfo initialize = driverType.GetMethod(
+            "Initialize",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            types: new[] { typeof(bool), typeof(bool) },
+            modifiers: null)
+            ?? throw new MissingMethodException(driverType.FullName, "Initialize");
+        initialize.Invoke(driver, new object[] { true, true });
+        PropertyInfo driverProperty = typeof(ConsoleManager).GetProperty(
+            "Driver",
+            BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(typeof(ConsoleManager).FullName, "Driver");
+        driverProperty.SetValue(null, driver);
     }
 
     private static IEnumerable<string> FindUnloadedPluginErrors(IReadOnlyList<LoadedPluginInfo> loadedPlugins)
@@ -114,7 +185,7 @@ public static class BepInExBootstrap
                 reasons.Add("DLL 不含 BepInPlugin／BasePlugin 插件入口（通常是空專案或 Plugin.cs 未參與編譯）");
             else
                 reasons.Add("BepInEx 找到插件中繼資料但沒有建立插件實例，請檢查缺少的相依 DLL");
-            yield return $"{fileName} 未載入：{string.Join("；", reasons)}。請以 net6.0 重新編譯並確認插件類別有 [BepInPlugin] 且繼承 BasePlugin。";
+            yield return $"{fileName} 未載入：{string.Join("；", reasons)}。請以 netstandard2.1 或不高於遊戲 Runtime 的 .NET 版本重新編譯，並確認插件類別有 [BepInPlugin] 且繼承 BasePlugin。";
         }
     }
 

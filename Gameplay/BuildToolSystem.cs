@@ -19,13 +19,9 @@ public enum EditorToolMode
     Custom,
 }
 
-public readonly record struct VoxelPoint(int X, int Y, int Z)
-{
-    public override string ToString() => $"{X}, {Y}, {Z}";
-}
-
 public sealed class BuildToolSystem
 {
+    private const int DefaultQueuedEditsPerFrame = 16;
     private const int MaximumHistory = 64;
     private readonly VoxelWorld _world;
     private readonly BlockRegistry _blocks;
@@ -33,10 +29,12 @@ public sealed class BuildToolSystem
     private readonly Func<int, int, int, bool>? _wouldOverlapPlayer;
     private readonly Stack<VoxelEditCommand> _undo = new();
     private readonly Stack<VoxelEditCommand> _redo = new();
+    private readonly Queue<PendingEditCommand> _pendingEditCommands = new();
     private ushort[]? _clipboard;
     private int _clipboardWidth;
     private int _clipboardHeight;
     private int _clipboardDepth;
+    private int _queuedEditCount;
 
     public EditorToolMode ToolMode { get; set; } = EditorToolMode.Place;
     public ushort SelectedBlockId { get; set; } = (ushort)VoxelMaterial.Stone;
@@ -49,6 +47,8 @@ public sealed class BuildToolSystem
     public int UndoDepth => _undo.Count;
     public int RedoDepth => _redo.Count;
     public bool HasClipboard => _clipboard is not null;
+    public int PendingEditCount => _queuedEditCount;
+    public bool HasPendingEdits => _queuedEditCount > 0;
 
     public int SelectionVolume
     {
@@ -67,6 +67,7 @@ public sealed class BuildToolSystem
     public string ClipboardDescription => _clipboard is null
         ? "Empty"
         : $"{_clipboardWidth} x {_clipboardHeight} x {_clipboardDepth}";
+    public bool AutoApplyQueuedEdits { get; set; } = true;
 
     public BuildToolSystem(
         VoxelWorld world,
@@ -104,6 +105,67 @@ public sealed class BuildToolSystem
 
     public bool QuickPlace(VoxelHit hit) => Place(hit);
 
+    public bool QueueEdit(int x, int y, int z, ushort newBlockId, string? name = null)
+    {
+        var requested = new Dictionary<VoxelPoint, PendingEdit>();
+        AddPending(requested, x, y, z, newBlockId);
+        return Commit(requested, name ?? "Queued edit");
+    }
+
+    public void ApplyQueuedEdits()
+    {
+        ApplyQueuedEdits(DefaultQueuedEditsPerFrame);
+    }
+
+    public bool ApplyQueuedEdits(int maximumEdits)
+    {
+        if (maximumEdits <= 0 || _pendingEditCommands.Count == 0)
+        {
+            return false;
+        }
+
+        int remaining = maximumEdits;
+        bool changed = false;
+        while (remaining > 0 && _pendingEditCommands.Count > 0)
+        {
+            PendingEditCommand command = _pendingEditCommands.Peek();
+            while (remaining > 0 && command.NextIndex < command.Edits.Length)
+            {
+                VoxelEdit edit = command.Edits[command.NextIndex++];
+                bool editApplied = _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.NewBlockId);
+                _queuedEditCount = Math.Max(0, _queuedEditCount - 1);
+                remaining--;
+                if (!editApplied)
+                {
+                    continue;
+                }
+
+                command.AppliedEdits.Add(edit);
+                changed = true;
+            }
+
+            if (command.NextIndex >= command.Edits.Length)
+            {
+                _pendingEditCommands.Dequeue();
+                IReadOnlyList<VoxelEdit> appliedEdits = command.AppliedEdits;
+                if (appliedEdits.Count > 0)
+                {
+                    PushUndo(new VoxelEditCommand(command.Name, appliedEdits));
+                    _redo.Clear();
+                }
+                Status = appliedEdits.Count == 0
+                    ? $"{command.Name}: no editable voxels"
+                    : $"{command.Name}: {appliedEdits.Count:N0} voxels";
+            }
+            else if (changed)
+            {
+                Status = $"Applying {command.Name}...";
+            }
+        }
+
+        return changed;
+    }
+
     public bool SetSelectionA(int x, int y, int z)
     {
         if (!_world.IsInside(x, y, z)) return false;
@@ -135,6 +197,7 @@ public sealed class BuildToolSystem
         _clipboardWidth = 0;
         _clipboardHeight = 0;
         _clipboardDepth = 0;
+        ClearPendingEditQueue();
         _undo.Clear();
         _redo.Clear();
         Status = "New world ready";
@@ -270,6 +333,7 @@ public sealed class BuildToolSystem
 
     public bool Undo()
     {
+        if (HasPendingEdits) return false;
         if (!_undo.TryPop(out VoxelEditCommand? command))
         {
             Status = "Nothing to undo";
@@ -288,6 +352,7 @@ public sealed class BuildToolSystem
 
     public bool Redo()
     {
+        if (HasPendingEdits) return false;
         if (!_redo.TryPop(out VoxelEditCommand? command))
         {
             Status = "Nothing to redo";
@@ -509,13 +574,14 @@ public sealed class BuildToolSystem
             Status = $"{name}: no editable voxels";
             return false;
         }
-        foreach (VoxelEdit edit in edits)
+
+        _pendingEditCommands.Enqueue(new PendingEditCommand(name, edits));
+        _queuedEditCount += edits.Count;
+        if (AutoApplyQueuedEdits)
         {
-            _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.NewBlockId);
+            ApplyQueuedEdits();
         }
-        PushUndo(new VoxelEditCommand(name, edits));
-        _redo.Clear();
-        Status = $"{name}: {edits.Count:N0} voxels";
+        Status = $"Queued {name}: {edits.Count:N0} voxels";
         return true;
     }
 
@@ -537,7 +603,21 @@ public sealed class BuildToolSystem
         ExplosionRadius = Math.Clamp(ExplosionRadius, 1, 12);
     }
 
+    private void ClearPendingEditQueue()
+    {
+        _pendingEditCommands.Clear();
+        _queuedEditCount = 0;
+    }
+
     private readonly record struct PendingEdit(int X, int Y, int Z, ushort NewBlockId);
     private readonly record struct VoxelEdit(int X, int Y, int Z, ushort OldBlockId, ushort NewBlockId);
     private sealed record VoxelEditCommand(string Name, IReadOnlyList<VoxelEdit> Edits);
+
+    private sealed class PendingEditCommand(string name, List<VoxelEdit> edits)
+    {
+        public string Name { get; } = name;
+        public VoxelEdit[] Edits { get; } = edits.ToArray();
+        public List<VoxelEdit> AppliedEdits { get; } = new();
+        public int NextIndex { get; set; }
+    }
 }

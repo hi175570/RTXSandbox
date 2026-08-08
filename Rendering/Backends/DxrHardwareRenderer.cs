@@ -29,8 +29,8 @@ namespace RTXSandbox.Rendering.Backends;
 public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPreviewSource
 {
     private const float CullingFrustumScale = 1.6f;
-    private const int DescriptorCount = 4;
-    private const int CameraConstantCount = 28;
+    private const int DescriptorCount = 6;
+    private const int CameraConstantCount = 52;
     // D3D12 permits a maximum TraceRay recursion depth of 31. One level is the
     // primary ray and one is reserved for the deepest shadow ray.
     private const int MaximumReflectionBounces = 29;
@@ -45,12 +45,18 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private readonly ID3D12CommandAllocator _allocator;
     private readonly ID3D12GraphicsCommandList4 _commands;
     private readonly ID3D12Fence _fence;
+    private readonly ID3D12QueryHeap _timestampQueryHeap;
+    private readonly ID3D12Resource _timestampReadback;
+    private readonly ulong _timestampFrequency;
     private readonly AutoResetEvent _fenceEvent = new(false);
     private readonly ID3D12DescriptorHeap _descriptorHeap;
     private readonly ID3D12RootSignature _rootSignature;
     private readonly ID3D12StateObject _pipeline;
     private readonly ID3D12StateObjectProperties _pipelineProperties;
     private readonly ID3D12Resource _shaderTable;
+    private readonly ID3D12Resource _analyticSphereAabbBuffer;
+    private readonly ID3D12Resource _analyticSphereBlas;
+    private readonly ulong _analyticSphereBlasBytes;
     private readonly uint _shaderRecordSize;
     private readonly uint _shaderTableSectionSize;
     private readonly ShaderProgram _display;
@@ -72,8 +78,23 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private ID3D12Resource? _readback;
     private ID3D12Resource? _atlasColor;
     private ID3D12Resource? _atlasDetail;
+    private readonly ID3D12Resource?[] _reflectionTailAtlases = new ID3D12Resource?[2];
+    private readonly bool[] _reflectionTailAtlasReadable = new bool[2];
     private ID3D12Resource? _emissiveLightBuffer;
+    private ID3D12Resource? _analyticSphereDataBuffer;
+    private int _analyticSphereDataCapacity;
     private int _emissiveLightCapacity;
+    private int _reflectionTailWriteIndex;
+    private bool _reflectionTailHistoryValid;
+    private bool _reflectionTailEnabled;
+    private int _reflectionTailWidth;
+    private int _reflectionTailHeight;
+    private Vector3 _previousTailCameraPosition;
+    private Vector3 _previousTailCameraForward = -Vector3.UnitZ;
+    private Vector3 _previousTailCameraRight = Vector3.UnitX;
+    private Vector3 _previousTailCameraUp = Vector3.UnitY;
+    private float _previousTailTanHalfFov;
+    private float _previousTailAspect = 1f;
     private PlacedSubresourceFootPrint _readbackFootprint;
     private byte[] _pixels = Array.Empty<byte>();
     private ulong _fenceValue;
@@ -103,6 +124,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private ulong _tlasBytes;
     private int _emissiveLightCount;
     private int _lastLoadedChunkCount;
+    private int _instanceCount;
+    private int _lastAnalyticSphereCount;
+    private bool _analyticSphereTopologyDirty;
     private readonly Dictionary<ulong, CachedGridGeometry> _gridGeometryCache = new();
     private readonly Dictionary<ChunkCoordinate, CachedStaticChunkGeometry> _staticChunkGeometryCache = new();
     private readonly HashSet<ChunkCoordinate> _dirtyStaticGeometryChunks = new();
@@ -121,7 +145,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public string AdapterName { get; }
     public RaytracingTier RaytracingTier => _device.Options5.RaytracingTier;
     public int TracedTriangleCount => (_staticVertexCount + _dynamicVertexCount) / 3;
-    public ulong AccelerationStructureMemoryBytes => _staticBlasBytes + _dynamicBlasBytes + _tlasBytes;
+    public ulong AccelerationStructureMemoryBytes =>
+        _staticBlasBytes + _dynamicBlasBytes + _analyticSphereBlasBytes + _tlasBytes;
+    public int TracedAnalyticSphereCount => _world.AnalyticSpheres.Count;
     public int LastHitPixelCount { get; private set; }
     public int LastShadowRayPixelCount { get; private set; }
     public int LastShadowOccludedPixelCount { get; private set; }
@@ -132,6 +158,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public float ViewCullingExpansion => CullingFrustumScale;
     public bool GlobalRayGeometryRetained => _retainGlobalRayGeometry;
     public int LastTransparentHitPixelCount { get; private set; }
+    public int LastChromaticTransparentPixelCount { get; private set; }
     public int EmissiveLightCount => _emissiveLightCount;
     public int VisibleDxrChunkCount => _visibleChunks.Count;
     public int ShadowCasterDxrChunkCount { get; private set; }
@@ -152,6 +179,15 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public double LastStaticGeometryBuildMilliseconds { get; private set; }
     public double MaximumStaticGeometryBuildMilliseconds { get; private set; }
     public int PendingStaticGeometryBuildCount => _staticGeometryBuildTask is null ? 0 : 1;
+    public int ActualRealReflectionLayers { get; private set; }
+    public int ApproximateReflectionLayers { get; private set; }
+    public ulong ReflectionTailAtlasMemoryBytes { get; private set; }
+    public double LastSynchronizedTraceMilliseconds { get; private set; }
+    public double MaximumSynchronizedTraceMilliseconds { get; private set; }
+    public double LastReflectionTailCpuMilliseconds { get; private set; }
+    public double MaximumReflectionTailCpuMilliseconds { get; private set; }
+    public double LastGpuTraceMilliseconds { get; private set; }
+    public double MaximumGpuTraceMilliseconds { get; private set; }
 
     public static bool IsSupported(out string reason)
     {
@@ -178,6 +214,11 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _commands = _device.CreateCommandList<ID3D12GraphicsCommandList4>(0, CommandListType.Direct, _allocator);
         _commands.Close();
         _fence = _device.CreateFence(0);
+        _queue.GetTimestampFrequency(out _timestampFrequency).CheckError();
+        _timestampQueryHeap = _device.CreateQueryHeap<ID3D12QueryHeap>(
+            new QueryHeapDescription(QueryHeapType.Timestamp, 2, 0));
+        _timestampReadback = _device.CreateCommittedResource(
+            HeapType.Readback, ResourceDescription.Buffer(sizeof(ulong) * 2), ResourceStates.CopyDest);
         Console.WriteLine($"DXR device ready: {AdapterName}, tier {_device.Options5.RaytracingTier}; queue/list/fence created.");
 
         _descriptorHeap = _device.CreateDescriptorHeap(new DescriptorHeapDescription(
@@ -190,6 +231,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         Console.WriteLine("DXR ray generation/miss/closest-hit pipeline created.");
         (_shaderTable, _shaderRecordSize, _shaderTableSectionSize) = CreateShaderTable();
         Console.WriteLine("DXR shader table created.");
+        (_analyticSphereAabbBuffer, _analyticSphereBlas, _analyticSphereBlasBytes) =
+            CreateAnalyticSphereBottomLevel();
+        Console.WriteLine("DXR analytic sphere procedural BLAS created.");
 
         string shaderRoot = Path.Combine(RuntimePaths.OutputRoot, "Shaders");
         _display = new ShaderProgram(
@@ -216,11 +260,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         MarkStaticGeometryDirty(forceImmediate: true);
         Resize(width, height, renderScale);
         _world.VoxelChanged += OnVoxelChanged;
+        _world.FluidLevelChanged += OnFluidLevelChanged;
         _world.WorldReloaded += OnWorldReloaded;
         _world.MicroVoxelCellChanged += OnMicroVoxelCellChanged;
         _world.MicroVoxelsReloaded += OnMicroVoxelsReloaded;
         _world.ChunkGenerated += OnChunkGenerated;
         _world.PhysicsGrids.Changed += OnPhysicsGridsChanged;
+        _world.AnalyticSpheres.Changed += OnAnalyticSpheresChanged;
         Console.WriteLine($"DXR initialized: {AdapterName}, tier {RaytracingTier}, BLAS triangles {TracedTriangleCount:N0}.");
     }
 
@@ -239,11 +285,18 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         CreateOutputResources();
     }
 
-    public void ResetAccumulation() { }
+    public void ResetAccumulation() => _reflectionTailHistoryValid = false;
 
     public void Render(Vector3 cameraPosition, Camera camera, VoxelHit? selection, float timeOfDay,
         RenderQualitySettings quality, float exposure)
     {
+        long tailCpuStarted = Stopwatch.GetTimestamp();
+        EnsureReflectionTailResources(quality.InfiniteMirrorQuality != InfiniteMirrorQuality.Off);
+        LastReflectionTailCpuMilliseconds = quality.InfiniteMirrorQuality == InfiniteMirrorQuality.Off
+            ? 0
+            : ElapsedMilliseconds(tailCpuStarted);
+        MaximumReflectionTailCpuMilliseconds = Math.Max(
+            MaximumReflectionTailCpuMilliseconds, LastReflectionTailCpuMilliseconds);
         UpdateVisibleChunkMask(cameraPosition, camera, timeOfDay, quality);
         long now = Environment.TickCount64;
         bool staticGeometryReady = _forceImmediateStaticRebuild || _tlas is null ||
@@ -251,9 +304,10 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
              (_world.PendingChunkGenerationCount == 0 || now - _staticGeometryDirtySinceMs >= 1500));
         if (_geometryDirty && staticGeometryReady)
             ProcessStaticGeometryBuild();
-        else if (_physicsGeometryDirty && now - _lastAccelerationStructureBuildMs >= 120)
+        else if (_physicsGeometryDirty && now - _lastAccelerationStructureBuildMs >=
+                 (_world.AnalyticSpheres.Count > 0 ? 16 : 120))
             RebuildDynamicAccelerationStructures();
-        Trace(cameraPosition, camera, timeOfDay, quality);
+        Trace(cameraPosition, camera, selection, timeOfDay, quality);
 
         GL.Disable(EnableCap.DepthTest);
         GL.Viewport(0, 0, _viewportWidth, _viewportHeight);
@@ -277,7 +331,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         RenderQualitySettings quality)
     {
         IReadOnlyList<ChunkCoordinate> loadedChunks = _world.SnapshotLoadedChunks();
-        Vector3 lightDirection = PrimaryLightDirection(timeOfDay);
+        Vector3 lightDirection = PrimaryLighting(timeOfDay).Direction;
         bool retainGlobalRayGeometry = quality.HardwareRayTracingQuality > 0;
         bool positionStable = Vector3.DistanceSquared(cameraPosition, _cullingCameraPosition) < 16f * 16f;
         bool viewStable = retainGlobalRayGeometry ||
@@ -361,11 +415,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         return false;
     }
 
-    private static Vector3 PrimaryLightDirection(float timeOfDay)
+    private static (Vector3 Direction, float Daylight) PrimaryLighting(float timeOfDay)
     {
         float angle = (timeOfDay - 6f) * (2f * MathF.PI / 24f);
         Vector3 sun = Vector3.Normalize(new Vector3(MathF.Cos(angle), MathF.Sin(angle), 0.28f));
-        return sun.Y >= 0f ? sun : -sun;
+        float daylight = Math.Clamp((sun.Y + 0.12f) / 0.30f, 0f, 1f);
+        daylight = daylight * daylight * (3f - 2f * daylight);
+        return (daylight > 0.08f ? sun : -sun, daylight);
     }
 
     public MaterialTileUv GetMaterialTileUv(ushort materialId, MaterialFace face) =>
@@ -425,11 +481,16 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 new RootParameter1(new RootDescriptorTable1(
                     new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, 0, 0, 0),
                     new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 0, 0, 1),
-                    new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, 2, 0, 2)), ShaderVisibility.All),
+                    new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, 2, 0, 2),
+                    new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, 1, 0, 4,
+                        DescriptorRangeFlags.DescriptorsVolatile | DescriptorRangeFlags.DataVolatile),
+                    new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 6, 0, 5,
+                        DescriptorRangeFlags.DescriptorsVolatile | DescriptorRangeFlags.DataVolatile)), ShaderVisibility.All),
                 new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All),
                 new RootParameter1(new RootConstants(0, 0, CameraConstantCount), ShaderVisibility.All),
                 new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All),
                 new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All),
+                new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All),
             },
         };
         return _device.CreateRootSignature(description);
@@ -446,13 +507,19 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         var dxilLibrary = new StateSubObject(new DxilLibraryDescription(library,
             new ExportDescription("RayGen"), new ExportDescription("Miss"),
             new ExportDescription("ShadowMiss"), new ExportDescription("AnyHit"),
-            new ExportDescription("ClosestHit")));
+            new ExportDescription("ClosestHit"), new ExportDescription("SphereIntersection"),
+            new ExportDescription("SphereAnyHit"), new ExportDescription("SphereClosestHit")));
         var hitGroup = new StateSubObject(new HitGroupDescription(
             "HitGroup", HitGroupType.Triangles,
             anyHitShaderImport: "AnyHit", closestHitShaderImport: "ClosestHit"));
-        var shaderConfig = new StateSubObject(new RaytracingShaderConfig(6 * sizeof(float), 2 * sizeof(float)));
+        var sphereHitGroup = new StateSubObject(new HitGroupDescription(
+            "SphereHitGroup", HitGroupType.ProceduralPrimitive,
+            anyHitShaderImport: "SphereAnyHit", closestHitShaderImport: "SphereClosestHit",
+            intersectionShaderImport: "SphereIntersection"));
+        var shaderConfig = new StateSubObject(new RaytracingShaderConfig(16 * sizeof(float), 3 * sizeof(float)));
         var shaderAssociation = new StateSubObject(new SubObjectToExportsAssociation(
-            shaderConfig, "RayGen", "Miss", "ShadowMiss", "AnyHit", "ClosestHit"));
+            shaderConfig, "RayGen", "Miss", "ShadowMiss", "AnyHit", "ClosestHit",
+            "SphereIntersection", "SphereAnyHit", "SphereClosestHit"));
         // Primary ray + 29 reflected rays + the deepest shadow ray. D3D12's hard
         // maximum declaration is 31, so this must never be raised without changing
         // to a non-recursive/wavefront DXR architecture.
@@ -463,7 +530,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         {
             pipeline = _device.CreateStateObject(new StateObjectDescription(
                 StateObjectType.RaytracingPipeline,
-                dxilLibrary, hitGroup, shaderConfig, shaderAssociation, pipelineConfig, globalRoot));
+                dxilLibrary, hitGroup, sphereHitGroup, shaderConfig, shaderAssociation, pipelineConfig, globalRoot));
         }
         catch
         {
@@ -476,13 +543,14 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private (ID3D12Resource Table, uint RecordSize, uint SectionSize) CreateShaderTable()
     {
         uint recordSize = Align(ShaderIdentifierSizeInBytes, RaytracingShaderRecordByteAlignment);
-        uint sectionSize = Align(recordSize, RaytracingShaderTableByteAlignment);
+        uint sectionSize = Align(recordSize * 2, RaytracingShaderTableByteAlignment);
         ID3D12Resource table = _device.CreateCommittedResource(HeapType.Upload,
             ResourceDescription.Buffer(sectionSize * 3UL), ResourceStates.GenericRead);
         byte* destination;
         table.Map(0, &destination).CheckError();
         CopyShaderIdentifier(destination + sectionSize * 0, "RayGen");
         CopyShaderIdentifier(destination + sectionSize * 1, "HitGroup");
+        CopyShaderIdentifier(destination + sectionSize * 1 + recordSize, "SphereHitGroup");
         CopyShaderIdentifier(destination + sectionSize * 2, "Miss");
         CopyShaderIdentifier(destination + sectionSize * 2 + recordSize, "ShadowMiss");
         table.Unmap(0);
@@ -491,6 +559,37 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
     private void CopyShaderIdentifier(byte* destination, string exportName) =>
         Unsafe.CopyBlockUnaligned(destination, (void*)_pipelineProperties.GetShaderIdentifier(exportName), ShaderIdentifierSizeInBytes);
+
+    private (ID3D12Resource AabbBuffer, ID3D12Resource Blas, ulong Bytes)
+        CreateAnalyticSphereBottomLevel()
+    {
+        int stride = Marshal.SizeOf<AnalyticSphereAabb>();
+        ID3D12Resource aabbBuffer = _device.CreateCommittedResource(
+            HeapType.Upload, ResourceDescription.Buffer((ulong)stride), ResourceStates.GenericRead);
+        aabbBuffer.Map<AnalyticSphereAabb>(0, 1)[0] = new AnalyticSphereAabb(
+            -1f, -1f, -1f, 1f, 1f, 1f);
+        aabbBuffer.Unmap(0);
+
+        BuildRaytracingAccelerationStructureInputs inputs =
+            CreateAnalyticSphereBottomLevelInputs(aabbBuffer, stride);
+        RaytracingAccelerationStructurePrebuildInfo info =
+            _device.GetRaytracingAccelerationStructurePrebuildInfo(inputs);
+        ID3D12Resource blas = CreateAccelerationStructure(info.ResultDataMaxSizeInBytes);
+        using ID3D12Resource scratch = _device.CreateCommittedResource(
+            HeapType.Default,
+            ResourceDescription.Buffer(info.ScratchDataSizeInBytes, ResourceFlags.AllowUnorderedAccess),
+            ResourceStates.Common);
+        BeginCommands();
+        _commands.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
+        {
+            Inputs = inputs,
+            ScratchAccelerationStructureData = scratch.GPUVirtualAddress,
+            DestinationAccelerationStructureData = blas.GPUVirtualAddress,
+        });
+        _commands.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(blas)));
+        ExecuteCommands();
+        return (aabbBuffer, blas, info.ResultDataMaxSizeInBytes);
+    }
 
     private void ProcessStaticGeometryBuild()
     {
@@ -584,7 +683,14 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private void RebuildDynamicAccelerationStructures()
     {
         WorldVertex[] dynamicVertices = BuildPhysicsGridVertices();
-        if (_dynamicBlas is not null && _dynamicVertexBuffer is not null &&
+        if (!_analyticSphereTopologyDirty && _tlas is not null &&
+            dynamicVertices.Length == _dynamicVertexCount &&
+            dynamicVertices.Length == 0)
+        {
+            RefitTopLevelForAnalyticSpheres();
+            return;
+        }
+        if (!_analyticSphereTopologyDirty && _dynamicBlas is not null && _dynamicVertexBuffer is not null &&
             dynamicVertices.Length > 0 && dynamicVertices.Length == _dynamicVertexCount)
         {
             RefitDynamicAccelerationStructures(dynamicVertices);
@@ -610,7 +716,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         if (!preserveStatic)
         {
             _staticVertexCount = staticVertices.Length;
-            if (staticVertices.Length == 0 && dynamicVertices.Length == 0)
+            if (staticVertices.Length == 0 && dynamicVertices.Length == 0 && _world.AnalyticSpheres.Count == 0)
                 throw new InvalidOperationException("DXR world contains no traceable geometry.");
             _staticVertexBuffer = CreateVertexBuffer(
                 staticVertices.Length > 0 ? staticVertices : new WorldVertex[1], stride);
@@ -647,13 +753,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _dynamicBlasBytes = 0;
         }
 
-        var instances = new List<RaytracingInstanceDescription>(2);
-        if (_staticBlas is not null)
-            instances.Add(CreateInstance(_staticBlas, instanceId: 0));
-        if (_dynamicBlas is not null)
-            instances.Add(CreateInstance(_dynamicBlas, instanceId: 1));
+        List<RaytracingInstanceDescription> instances = CreateSceneInstances();
         if (instances.Count == 0)
             throw new InvalidOperationException("DXR acceleration structure has no instances.");
+        _instanceCount = instances.Count;
+        _lastAnalyticSphereCount = _world.AnalyticSpheres.Count;
+        _analyticSphereTopologyDirty = false;
+        UpdateAnalyticSphereDataBuffer();
 
         var topInputs = new BuildRaytracingAccelerationStructureInputs
         {
@@ -757,6 +863,15 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _device.GetRaytracingAccelerationStructurePrebuildInfo(dynamicInputs);
 
         int instanceCount = _staticBlas is null ? 1 : 2;
+        List<RaytracingInstanceDescription> instances = CreateSceneInstances();
+        if (instances.Count != _instanceCount)
+            throw new InvalidOperationException("DXR instance topology changed during a TLAS refit.");
+        RaytracingInstanceDescription* mappedInstances =
+            _instanceBuffer.Map<RaytracingInstanceDescription>(0);
+        for (int index = 0; index < instances.Count; index++) mappedInstances[index] = instances[index];
+        _instanceBuffer.Unmap(0);
+        UpdateAnalyticSphereDataBuffer();
+        instanceCount = instances.Count;
         var topInputs = new BuildRaytracingAccelerationStructureInputs
         {
             Type = RaytracingAccelerationStructureType.TopLevel,
@@ -809,6 +924,68 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         LastAccelerationStructureBuildMilliseconds = elapsed;
         RecordAccelerationStructureTiming(elapsed);
         LastDynamicAccelerationStructureBuildMilliseconds = elapsed;
+        DynamicAccelerationStructureBuildCount++;
+        TlasUpdateCount++;
+        AccelerationStructureBuildCount++;
+    }
+
+    private void RefitTopLevelForAnalyticSpheres()
+    {
+        if (_instanceBuffer is null || _tlas is null) return;
+        long buildStarted = Stopwatch.GetTimestamp();
+        List<RaytracingInstanceDescription> instances = CreateSceneInstances();
+        if (instances.Count != _instanceCount)
+        {
+            _analyticSphereTopologyDirty = true;
+            RebuildAccelerationStructures(
+                Array.Empty<WorldVertex>(), Array.Empty<WorldVertex>(), preserveStatic: true);
+            return;
+        }
+        RaytracingInstanceDescription* mappedInstances =
+            _instanceBuffer.Map<RaytracingInstanceDescription>(0);
+        for (int index = 0; index < instances.Count; index++) mappedInstances[index] = instances[index];
+        _instanceBuffer.Unmap(0);
+        UpdateAnalyticSphereDataBuffer();
+
+        var topInputs = new BuildRaytracingAccelerationStructureInputs
+        {
+            Type = RaytracingAccelerationStructureType.TopLevel,
+            Flags = RaytracingAccelerationStructureBuildFlags.PreferFastTrace |
+                    RaytracingAccelerationStructureBuildFlags.AllowUpdate |
+                    RaytracingAccelerationStructureBuildFlags.PerformUpdate,
+            Layout = ElementsLayout.Array,
+            DescriptorsCount = instances.Count,
+            InstanceDescriptions = _instanceBuffer.GPUVirtualAddress,
+        };
+        RaytracingAccelerationStructurePrebuildInfo topInfo =
+            _device.GetRaytracingAccelerationStructurePrebuildInfo(topInputs);
+        ulong scratchSize = topInfo.UpdateScratchDataSizeInBytes;
+        if (_dynamicUpdateScratch is null || _dynamicUpdateScratchBytes < scratchSize)
+        {
+            _dynamicUpdateScratch?.Dispose();
+            _dynamicUpdateScratchBytes = scratchSize;
+            _dynamicUpdateScratch = _device.CreateCommittedResource(
+                HeapType.Default,
+                ResourceDescription.Buffer(scratchSize, ResourceFlags.AllowUnorderedAccess),
+                ResourceStates.Common);
+        }
+
+        BeginCommands();
+        _commands.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
+        {
+            Inputs = topInputs,
+            ScratchAccelerationStructureData = _dynamicUpdateScratch.GPUVirtualAddress,
+            SourceAccelerationStructureData = _tlas.GPUVirtualAddress,
+            DestinationAccelerationStructureData = _tlas.GPUVirtualAddress,
+        });
+        _commands.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_tlas)));
+        ExecuteCommands();
+        _physicsGeometryDirty = false;
+        _lastAccelerationStructureBuildMs = Environment.TickCount64;
+        double elapsed = ElapsedMilliseconds(buildStarted);
+        LastAccelerationStructureBuildMilliseconds = elapsed;
+        LastDynamicAccelerationStructureBuildMilliseconds = elapsed;
+        RecordAccelerationStructureTiming(elapsed);
         DynamicAccelerationStructureBuildCount++;
         TlasUpdateCount++;
         AccelerationStructureBuildCount++;
@@ -871,6 +1048,90 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             DescriptorsCount = 1,
             GeometryDescriptions = new[] { geometry },
         };
+    }
+
+    private static BuildRaytracingAccelerationStructureInputs CreateAnalyticSphereBottomLevelInputs(
+        ID3D12Resource aabbBuffer,
+        int stride)
+    {
+        var geometry = new RaytracingGeometryDescription(
+            new RaytracingGeometryAabbsDescription(
+                1,
+                new GpuVirtualAddressAndStride(aabbBuffer.GPUVirtualAddress, (ulong)stride)),
+            RaytracingGeometryFlags.None);
+        return new BuildRaytracingAccelerationStructureInputs
+        {
+            Type = RaytracingAccelerationStructureType.BottomLevel,
+            Flags = RaytracingAccelerationStructureBuildFlags.PreferFastTrace,
+            Layout = ElementsLayout.Array,
+            DescriptorsCount = 1,
+            GeometryDescriptions = new[] { geometry },
+        };
+    }
+
+    private List<RaytracingInstanceDescription> CreateSceneInstances()
+    {
+        var instances = new List<RaytracingInstanceDescription>(
+            2 + _world.AnalyticSpheres.Count);
+        if (_staticBlas is not null)
+            instances.Add(CreateInstance(_staticBlas, instanceId: 0));
+        if (_dynamicBlas is not null)
+            instances.Add(CreateInstance(_dynamicBlas, instanceId: 1));
+        for (int index = 0; index < _world.AnalyticSpheres.Spheres.Count; index++)
+            instances.Add(CreateAnalyticSphereInstance(
+                _analyticSphereBlas,
+                _world.AnalyticSpheres.Spheres[index],
+                (uint)index));
+        return instances;
+    }
+
+    private static RaytracingInstanceDescription CreateAnalyticSphereInstance(
+        ID3D12Resource blas,
+        AnalyticSphere sphere,
+        uint sphereIndex) => new()
+    {
+        Transform = new Matrix3x4(
+            sphere.Radius, 0, 0, sphere.Center.X,
+            0, sphere.Radius, 0, sphere.Center.Y,
+            0, 0, sphere.Radius, sphere.Center.Z),
+        InstanceMask = 0xff,
+        InstanceID = (UInt24)sphereIndex,
+        InstanceContributionToHitGroupIndex = (UInt24)1,
+        Flags = RaytracingInstanceFlags.None,
+        AccelerationStructure = blas.GPUVirtualAddress,
+    };
+
+    private void UpdateAnalyticSphereDataBuffer()
+    {
+        AnalyticSphereGpuData[] data = _world.AnalyticSpheres.Spheres
+            .Select(sphere =>
+            {
+                BlockDefinition material = _blocks.Get(sphere.MaterialId);
+                return new AnalyticSphereGpuData(
+                    new Vector4(material.Albedo, material.Roughness),
+                    new Vector4(material.Metallic, sphere.MaterialId, 0f, 0f),
+                    new Vector4(sphere.Center, sphere.Radius));
+            })
+            .ToArray();
+        if (data.Length == 0)
+            data = new[]
+            {
+                new AnalyticSphereGpuData(
+                    new Vector4(0.5f, 0.5f, 0.5f, 0.2f), Vector4.Zero, new Vector4(0f, 0f, 0f, 1f)),
+            };
+        if (_analyticSphereDataBuffer is null || _analyticSphereDataCapacity < data.Length)
+        {
+            _analyticSphereDataBuffer?.Dispose();
+            _analyticSphereDataCapacity = 1;
+            while (_analyticSphereDataCapacity < data.Length) _analyticSphereDataCapacity *= 2;
+            _analyticSphereDataBuffer = _device.CreateCommittedResource(
+                HeapType.Upload,
+                ResourceDescription.Buffer((ulong)(_analyticSphereDataCapacity *
+                    Marshal.SizeOf<AnalyticSphereGpuData>())),
+                ResourceStates.GenericRead);
+        }
+        data.AsSpan().CopyTo(_analyticSphereDataBuffer.Map<AnalyticSphereGpuData>(0, data.Length));
+        _analyticSphereDataBuffer.Unmap(0);
     }
 
     private static RaytracingInstanceDescription CreateInstance(ID3D12Resource blas, uint instanceId) => new()
@@ -959,6 +1220,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
     private void CreateOutputResources()
     {
+        bool recreateTail = _reflectionTailEnabled;
+        DisposeReflectionTailResources();
         _output?.Dispose();
         _readback?.Dispose();
         var description = new ResourceDescription
@@ -991,6 +1254,74 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
         UpdateDescriptors();
+        if (recreateTail) EnsureReflectionTailResources(enabled: true);
+    }
+
+    private void EnsureReflectionTailResources(bool enabled)
+    {
+        if (!enabled)
+        {
+            DisposeReflectionTailResources();
+            return;
+        }
+        int wantedWidth = Math.Max(1, (_width + 3) / 4);
+        int wantedHeight = Math.Max(1, (_height + 3) / 4);
+        if (_reflectionTailAtlases[0] is not null &&
+            _reflectionTailWidth == wantedWidth && _reflectionTailHeight == wantedHeight)
+        {
+            _reflectionTailEnabled = true;
+            return;
+        }
+
+        DisposeReflectionTailResources();
+        var description = new ResourceDescription
+        {
+            Dimension = ResourceDimension.Texture2D,
+            Width = (ulong)wantedWidth,
+            Height = wantedHeight,
+            DepthOrArraySize = 1,
+            MipLevels = 1,
+            Format = DxgiFormat.R16G16B16A16_Float,
+            SampleDescription = new SampleDescription(1, 0),
+            Layout = Vortice.Direct3D12.TextureLayout.Unknown,
+            Flags = ResourceFlags.AllowUnorderedAccess,
+        };
+        _reflectionTailAtlases[0] = _device.CreateCommittedResource(
+            HeapType.Default, description, ResourceStates.UnorderedAccess);
+        _reflectionTailAtlases[1] = _device.CreateCommittedResource(
+            HeapType.Default, description, ResourceStates.UnorderedAccess);
+        _reflectionTailWidth = wantedWidth;
+        _reflectionTailHeight = wantedHeight;
+        _reflectionTailWriteIndex = 0;
+        _reflectionTailAtlasReadable[0] = false;
+        _reflectionTailAtlasReadable[1] = false;
+        _reflectionTailHistoryValid = false;
+        _reflectionTailEnabled = true;
+        ReflectionTailAtlasMemoryBytes = (ulong)wantedWidth * (ulong)wantedHeight * 8UL * 2UL;
+        UpdateDescriptors();
+    }
+
+    private void DisposeReflectionTailResources()
+    {
+        if (_reflectionTailAtlases[0] is null && _reflectionTailAtlases[1] is null)
+        {
+            _reflectionTailEnabled = false;
+            ReflectionTailAtlasMemoryBytes = 0;
+            return;
+        }
+        WaitIdle();
+        _reflectionTailAtlases[0]?.Dispose();
+        _reflectionTailAtlases[1]?.Dispose();
+        _reflectionTailAtlases[0] = null;
+        _reflectionTailAtlases[1] = null;
+        _reflectionTailEnabled = false;
+        _reflectionTailHistoryValid = false;
+        _reflectionTailWriteIndex = 0;
+        _reflectionTailAtlasReadable[0] = false;
+        _reflectionTailAtlasReadable[1] = false;
+        _reflectionTailWidth = 0;
+        _reflectionTailHeight = 0;
+        ReflectionTailAtlasMemoryBytes = 0;
     }
 
     private void UpdateDescriptors()
@@ -1027,31 +1358,113 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
             }, handle + increment * 3);
+        if (_reflectionTailEnabled &&
+            _reflectionTailAtlases[_reflectionTailWriteIndex] is ID3D12Resource tailWrite &&
+            _reflectionTailAtlases[1 - _reflectionTailWriteIndex] is ID3D12Resource tailHistory)
+        {
+            _device.CreateUnorderedAccessView(tailWrite, null,
+                new UnorderedAccessViewDescription { ViewDimension = UnorderedAccessViewDimension.Texture2D },
+                handle + increment * 4);
+            _device.CreateShaderResourceView(tailHistory, new ShaderResourceViewDescription
+            {
+                Format = DxgiFormat.R16G16B16A16_Float,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+            }, handle + increment * 5);
+        }
+        else if (_output is not null)
+        {
+            // Keep the static root table fully initialized while the extension is Off.
+            // No tail shader access occurs in this mode and no temporary atlas exists.
+            _device.CreateUnorderedAccessView(_output, null,
+                new UnorderedAccessViewDescription { ViewDimension = UnorderedAccessViewDimension.Texture2D },
+                handle + increment * 4);
+            _device.CreateShaderResourceView(_output, new ShaderResourceViewDescription
+            {
+                Format = DxgiFormat.R8G8B8A8_UNorm,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+            }, handle + increment * 5);
+        }
     }
 
-    private void Trace(Vector3 cameraPosition, Camera camera, float timeOfDay, RenderQualitySettings quality)
+    private void Trace(Vector3 cameraPosition, Camera camera, VoxelHit? selection, float timeOfDay,
+        RenderQualitySettings quality)
     {
         if (_output is null || _readback is null || _staticVertexBuffer is null || _tlas is null) return;
+        long traceStarted = Stopwatch.GetTimestamp();
         Vector3 forward = camera.Forward;
         Vector3 right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
         Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
-        Vector3 primaryLightDirection = PrimaryLightDirection(timeOfDay);
+        if (_reflectionTailHistoryValid &&
+            (Vector3.DistanceSquared(cameraPosition, _previousTailCameraPosition) > 24f * 24f ||
+             Vector3.Dot(forward, _previousTailCameraForward) < 0.45f))
+            _reflectionTailHistoryValid = false;
+        (Vector3 primaryLightDirection, float daylight) = PrimaryLighting(timeOfDay);
         int cameraX = (int)MathF.Floor(cameraPosition.X);
         int cameraY = (int)MathF.Floor(cameraPosition.Y);
         int cameraZ = (int)MathF.Floor(cameraPosition.Z);
         bool cameraUnderwater = _world.IsFluid(cameraX, cameraY, cameraZ) &&
-                                cameraPosition.Y - cameraY < VoxelWorld.FluidSurfaceHeight;
+                                (cameraPosition.Y - cameraY < VoxelWorld.GetFluidSurfaceHeight(
+                                     _world.GetFluidLevel(cameraX, cameraY, cameraZ)) ||
+                                 _world.IsFluid(cameraX, cameraY + 1, cameraZ));
         LastHardwareQuality = Math.Clamp(quality.HardwareRayTracingQuality, 0, 3);
+        int infiniteMirrorMode = (int)quality.InfiniteMirrorQuality;
+        int targetMirrorLayers = quality.InfiniteMirrorQuality switch
+        {
+            InfiniteMirrorQuality.Balanced => 128,
+            InfiniteMirrorQuality.Quality => 512,
+            InfiniteMirrorQuality.Extreme => 1000,
+            _ => 0,
+        };
+        int realReflectionLayers = infiniteMirrorMode > 0
+            ? MaximumReflectionBounces
+            : Math.Clamp(quality.HardwareRayTracingReflectionBounces, 1, MaximumReflectionBounces);
+        ActualRealReflectionLayers = realReflectionLayers;
+        ApproximateReflectionLayers = Math.Max(0, targetMirrorLayers - realReflectionLayers);
+        if (!_reflectionTailHistoryValid)
+        {
+            _previousTailCameraPosition = cameraPosition;
+            _previousTailCameraForward = forward;
+            _previousTailCameraRight = right;
+            _previousTailCameraUp = up;
+            _previousTailTanHalfFov = MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f);
+            _previousTailAspect = _width / (float)_height;
+        }
         var constants = new CameraConstants(
             new Vector4(cameraPosition, MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f)),
             new Vector4(forward, _width / (float)_height),
             new Vector4(right, 0), new Vector4(up, 0),
-            new Vector4(primaryLightDirection, 0),
+            new Vector4(primaryLightDirection, daylight),
             new Vector4(LastHardwareQuality, (int)quality.HardwareRayTracingRenderStyle,
                 _emissiveLightCount, cameraUnderwater ? 1f : 0f),
-            new Vector4(Math.Clamp(quality.HardwareRayTracingReflectionBounces, 1, MaximumReflectionBounces), 0, 0, 0));
+            new Vector4(realReflectionLayers, infiniteMirrorMode,
+                selection.HasValue ? 1f : 0f, quality.SelectionOutlineReflections ? 1f : 0f),
+            new Vector4(infiniteMirrorMode, targetMirrorLayers,
+                _reflectionTailHistoryValid ? 1f : 0f, 4f),
+            new Vector4(quality.HardwareRayTracingRayDistance,
+                quality.HardwareRayTracingShadowStrength,
+                quality.HardwareRayTracingEmissionStrength,
+                quality.HardwareRayTracingReflectionStrength),
+            new Vector4(_previousTailCameraPosition, _previousTailTanHalfFov),
+            new Vector4(_previousTailCameraForward, _previousTailAspect),
+            new Vector4(_previousTailCameraRight, 0),
+            new Vector4(_previousTailCameraUp, 0),
+            new Vector4(selection?.X ?? -1, selection?.Y ?? -1, selection?.Z ?? -1,
+                selection.HasValue ? (float)Math.Min(selection.Value.GridId, 16_777_215UL) : 0f));
+
+        if (_reflectionTailEnabled) UpdateDescriptors();
 
         BeginCommands();
+        if (_reflectionTailEnabled && _reflectionTailAtlasReadable[_reflectionTailWriteIndex] &&
+            _reflectionTailAtlases[_reflectionTailWriteIndex] is ID3D12Resource writableTail)
+        {
+            _commands.ResourceBarrierTransition(
+                writableTail, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            _reflectionTailAtlasReadable[_reflectionTailWriteIndex] = false;
+        }
         _commands.ResourceBarrierTransition(_output, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
         _commands.SetDescriptorHeaps(1, new[] { _descriptorHeap });
         _commands.SetComputeRootSignature(_rootSignature);
@@ -1063,6 +1476,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _commands.SetComputeRootShaderResourceView(3, _emissiveLightBuffer.GPUVirtualAddress);
         _commands.SetComputeRootShaderResourceView(4,
             (_dynamicVertexBuffer ?? _staticVertexBuffer).GPUVirtualAddress);
+        if (_analyticSphereDataBuffer is not null)
+            _commands.SetComputeRootShaderResourceView(5, _analyticSphereDataBuffer.GPUVirtualAddress);
+        _commands.EndQuery(_timestampQueryHeap, QueryType.Timestamp, 0);
         _commands.DispatchRays(new DispatchRaysDescription
         {
             Width = _width,
@@ -1076,7 +1492,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             HitGroupTable = new GpuVirtualAddressRangeAndStride
             {
                 StartAddress = _shaderTable.GPUVirtualAddress + _shaderTableSectionSize,
-                SizeInBytes = _shaderRecordSize,
+                SizeInBytes = _shaderRecordSize * 2UL,
                 StrideInBytes = _shaderRecordSize,
             },
             MissShaderTable = new GpuVirtualAddressRangeAndStride
@@ -1086,13 +1502,59 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 StrideInBytes = _shaderRecordSize,
             },
         });
+        _commands.EndQuery(_timestampQueryHeap, QueryType.Timestamp, 1);
+        _commands.ResolveQueryData(
+            _timestampQueryHeap, QueryType.Timestamp, 0, 2, _timestampReadback, 0);
+        if (_reflectionTailEnabled &&
+            _reflectionTailAtlases[_reflectionTailWriteIndex] is ID3D12Resource tailWrite)
+        {
+            _commands.ResourceBarrierTransition(
+                tailWrite, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            _reflectionTailAtlasReadable[_reflectionTailWriteIndex] = true;
+            if (_reflectionTailHistoryValid &&
+                _reflectionTailAtlasReadable[1 - _reflectionTailWriteIndex] &&
+                _reflectionTailAtlases[1 - _reflectionTailWriteIndex] is ID3D12Resource previousTail)
+            {
+                _commands.ResourceBarrierTransition(
+                    previousTail, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+                _reflectionTailAtlasReadable[1 - _reflectionTailWriteIndex] = false;
+            }
+        }
         _commands.ResourceBarrierTransition(_output, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
         _commands.CopyTextureRegion(new TextureCopyLocation(_readback, _readbackFootprint), 0, 0, 0,
             new TextureCopyLocation(_output, 0), null);
         ExecuteCommands();
+        ReadGpuTraceTimestamp();
         if (_collectDiagnostics)
             WriteDebugMessages(throwOnError: true);
         CopyReadbackPixels();
+        if (_reflectionTailEnabled)
+        {
+            _reflectionTailHistoryValid = true;
+            _reflectionTailWriteIndex = 1 - _reflectionTailWriteIndex;
+        }
+        _previousTailCameraPosition = cameraPosition;
+        _previousTailCameraForward = forward;
+        _previousTailCameraRight = right;
+        _previousTailCameraUp = up;
+        _previousTailTanHalfFov = MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f);
+        _previousTailAspect = _width / (float)_height;
+        LastSynchronizedTraceMilliseconds = ElapsedMilliseconds(traceStarted);
+        MaximumSynchronizedTraceMilliseconds = Math.Max(
+            MaximumSynchronizedTraceMilliseconds, LastSynchronizedTraceMilliseconds);
+    }
+
+    private void ReadGpuTraceTimestamp()
+    {
+        ulong* timestamps;
+        _timestampReadback.Map(0, (void**)&timestamps).CheckError();
+        ulong start = timestamps[0];
+        ulong end = timestamps[1];
+        _timestampReadback.Unmap(0);
+        LastGpuTraceMilliseconds = _timestampFrequency > 0 && end >= start
+            ? (end - start) * 1000.0 / _timestampFrequency
+            : 0;
+        MaximumGpuTraceMilliseconds = Math.Max(MaximumGpuTraceMilliseconds, LastGpuTraceMilliseconds);
     }
 
     private void CopyReadbackPixels()
@@ -1111,6 +1573,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             int texturedHitPixels = 0;
             int waxReflectionPixels = 0;
             int transparentHitPixels = 0;
+            int chromaticTransparentPixels = 0;
             for (int y = 0; y < _height; y++)
             {
                 System.Buffer.MemoryCopy(source + y * sourcePitch,
@@ -1127,7 +1590,15 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                     if ((diagnostics & 16) != 0) physicsGridHitPixels++;
                     if ((diagnostics & 32) != 0) texturedHitPixels++;
                     if ((diagnostics & 64) != 0) waxReflectionPixels++;
-                    if ((diagnostics & 128) != 0) transparentHitPixels++;
+                    if ((diagnostics & 128) != 0)
+                    {
+                        transparentHitPixels++;
+                        int red = source[y * sourcePitch + x * 4 + 0];
+                        int green = source[y * sourcePitch + x * 4 + 1];
+                        int blue = source[y * sourcePitch + x * 4 + 2];
+                        if (Math.Max(red, Math.Max(green, blue)) - Math.Min(red, Math.Min(green, blue)) >= 18)
+                            chromaticTransparentPixels++;
+                    }
                 }
             }
             if (_collectDiagnostics)
@@ -1140,6 +1611,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 LastTexturedHitPixelCount = texturedHitPixels;
                 LastWaxReflectionPixelCount = waxReflectionPixels;
                 LastTransparentHitPixelCount = transparentHitPixels;
+                LastChromaticTransparentPixelCount = chromaticTransparentPixels;
             }
         }
         _readback.Unmap(0);
@@ -1197,6 +1669,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             int x = chunk.MinimumX + voxel.LocalX;
             int z = chunk.MinimumZ + voxel.LocalZ;
             BlockDefinition material = definitions[voxel.MaterialId];
+            if (material.IsFluid)
+                AddFluidFlowGeometry(vertices, meshingSnapshot, definitions, material, x, voxel.Y, z);
             if (TryCreateEmissiveLight(
                     new Vector3(x + 0.5f, voxel.Y + 0.5f, z + 0.5f), material, out EmissiveLight light))
                 emissiveLights.Add(light);
@@ -1226,6 +1700,52 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             vertices.ToArray(), emissiveLights.ToArray(), microVoxelTriangles);
     }
 
+    private static void AddFluidFlowGeometry(
+        List<WorldVertex> vertices,
+        ChunkMeshingSnapshot snapshot,
+        IReadOnlyList<BlockDefinition> definitions,
+        BlockDefinition material,
+        int x,
+        int y,
+        int z)
+    {
+        ushort above = snapshot.GetBlock(x, y + 1, z);
+        bool fluidAbove = above != 0 && definitions[above].IsFluid;
+        byte level = snapshot.GetFluidLevel(x, y, z);
+        float maximumY = fluidAbove ? y + 1f : y + VoxelWorld.GetFluidSurfaceHeight(level);
+        if (!fluidAbove && level > 0)
+            AddBoxFaces(vertices, new Vector3(x, y, z), new Vector3(x + 1f, maximumY, z + 1f),
+                material, 1 << 0, null, cell: (x, y, z));
+
+        ReadOnlySpan<(int X, int Z, int Face)> neighbors = stackalloc (int, int, int)[]
+        {
+            (x - 1, z, 1), (x + 1, z, 2), (x, z - 1, 3), (x, z + 1, 4),
+        };
+        foreach ((int neighborX, int neighborZ, int face) in neighbors)
+        {
+            ushort neighbor = snapshot.GetBlock(neighborX, y, neighborZ);
+            float minimumSideY = y;
+            if (neighbor != 0 && definitions[neighbor].IsFluid)
+            {
+                ushort neighborAbove = snapshot.GetBlock(neighborX, y + 1, neighborZ);
+                bool neighborHasFluidAbove = neighborAbove != 0 && definitions[neighborAbove].IsFluid;
+                float neighborMaximumY = neighborHasFluidAbove
+                    ? y + 1f
+                    : y + VoxelWorld.GetFluidSurfaceHeight(snapshot.GetFluidLevel(neighborX, y, neighborZ));
+                if (neighborMaximumY >= maximumY - 0.0001f) continue;
+                minimumSideY = neighborMaximumY;
+            }
+            else if (neighbor != 0 && !definitions[neighbor].IsTransparent &&
+                     definitions[neighbor].Transmission <= 0f)
+            {
+                continue;
+            }
+            AddBoxFaces(vertices,
+                new Vector3(x, minimumSideY, z), new Vector3(x + 1f, maximumY, z + 1f),
+                material, (byte)(1 << face), null, cell: (x, y, z));
+        }
+    }
+
     private WorldVertex[] BuildPhysicsGridVertices()
     {
         var vertices = new List<WorldVertex>(16_000);
@@ -1252,7 +1772,6 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 {
                     Position = grid.LocalToWorld(vertex.Position),
                     Normal = Vector3.Normalize(grid.LocalDirectionToWorld(vertex.Normal)),
-                    GridMarker = 1u,
                 });
             }
             int triangles = (vertices.Count - before) / 3;
@@ -1285,7 +1804,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             byte faceMask = 0;
             for (int face = 0; face < 6; face++)
                 if (ShouldRenderGridFace(grid, element, material, face, definitions)) faceMask |= (byte)(1 << face);
-            AddBoxFaces(vertices, element.Minimum, element.Maximum, material, faceMask, null);
+            uint gridId = grid.Id > 16_777_215UL ? 16_777_215u : (uint)grid.Id;
+            AddBoxFaces(vertices, element.Minimum, element.Maximum, material, faceMask, null,
+                cell: (element.CellX, element.CellY, element.CellZ), gridId: gridId);
             if (TryCreateEmissiveLight(
                     (element.Minimum + element.Maximum) * 0.5f, material, out EmissiveLight light))
                 lights.Add(new LocalEmissiveLight(light.Position, light.Radius, light.Color, light.Intensity));
@@ -1305,11 +1826,18 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             light = default;
             return false;
         }
+        float peak = Math.Max(emission.X, Math.Max(emission.Y, emission.Z));
+        Vector3 normalized = Vector3.Clamp(
+            emission / Math.Max(peak, 0.001f), Vector3.Zero, Vector3.One);
+        Vector3 pureColor = new(
+            MathF.Pow(normalized.X, 1.65f),
+            MathF.Pow(normalized.Y, 1.65f),
+            MathF.Pow(normalized.Z, 1.65f));
         light = new EmissiveLight(
             position,
-            Math.Clamp(4f + energy * 2.5f, 5f, 18f),
-            Vector3.Normalize(emission + new Vector3(0.001f)),
-            Math.Clamp(energy, 0.25f, 8f));
+            Math.Clamp(3.2f + MathF.Sqrt(energy) * 1.45f, 4f, 12f),
+            pureColor,
+            Math.Clamp(MathF.Sqrt(energy) * 0.55f, 0.2f, 2.5f));
         return true;
     }
 
@@ -1371,6 +1899,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                     if (materialId == 0) continue;
                     BlockDefinition material = definitions[materialId];
                     if (material.IsFluid && face != 0) continue;
+                    if (material.IsFluid && snapshot.GetFluidLevel(x, y, z) > 0) continue;
                     (int offsetX, int offsetY, int offsetZ) = FaceNeighborOffset(face);
                     ushort neighborId = snapshot.GetBlock(x + offsetX, y + offsetY, z + offsetZ);
                     if (ShouldIncludeGreedyFace(face, materialId, neighborId, definitions))
@@ -1495,7 +2024,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         BlockDefinition material,
         byte faceMask,
         PhysicsGrid? grid,
-        Vector2 uvScale = default)
+        Vector2 uvScale = default,
+        (int X, int Y, int Z)? cell = null,
+        uint gridId = 0)
     {
         if (uvScale.X <= 0f || uvScale.Y <= 0f) uvScale = Vector2.One;
         for (int face = 0; face < 6; face++)
@@ -1530,10 +2061,11 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 };
                 uv *= uvScale;
                 vertices.Add(new WorldVertex(position, transformedNormal, uv, material.Id,
-                    atlasFace, material.Roughness, material.Metallic, grid is null ? 0u : 1u,
+                    atlasFace, material.Roughness, material.Metallic, gridId,
                     material.Transmission,
                     (material.IsFluid ? 1u : 0u) | (material.IsTransparent ? 2u : 0u) |
                     ((uint)Math.Clamp((int)MathF.Round(material.IndexOfRefraction * 100f), 100, 255) << 8),
+                    cell?.X ?? 0, cell?.Y ?? 0, cell?.Z ?? 0,
                     material.Emission));
             }
         }
@@ -1596,6 +2128,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _dirtyStaticGeometryChunks.Add(chunk);
         MarkStaticGeometryDirty();
     }
+    private void OnFluidLevelChanged(int x, int y, int z) =>
+        OnVoxelChanged(x, y, z, VoxelMaterial.Water);
     private void OnWorldReloaded()
     {
         _gridGeometryCache.Clear();
@@ -1642,6 +2176,12 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         // and transforms only invalidate the small dynamic BLAS plus the TLAS.
         _physicsGeometryDirty = true;
     }
+    private void OnAnalyticSpheresChanged()
+    {
+        if (_world.AnalyticSpheres.Count != _lastAnalyticSphereCount)
+            _analyticSphereTopologyDirty = true;
+        _physicsGeometryDirty = true;
+    }
 
     private void DisposeGeometryResources()
     {
@@ -1654,6 +2194,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _dynamicUpdateScratchBytes = 0;
         _staticVertexBuffer?.Dispose(); _staticVertexBuffer = null;
         _emissiveLightBuffer?.Dispose(); _emissiveLightBuffer = null;
+        _analyticSphereDataBuffer?.Dispose(); _analyticSphereDataBuffer = null;
+        _analyticSphereDataCapacity = 0;
         _emissiveLightCapacity = 0;
         _staticBlasBytes = 0;
         _dynamicBlasBytes = 0;
@@ -1667,6 +2209,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _dynamicBlas?.Dispose(); _dynamicBlas = null;
         _dynamicVertexBuffer?.Dispose(); _dynamicVertexBuffer = null;
         _emissiveLightBuffer?.Dispose(); _emissiveLightBuffer = null;
+        _analyticSphereDataBuffer?.Dispose(); _analyticSphereDataBuffer = null;
+        _analyticSphereDataCapacity = 0;
         _emissiveLightCapacity = 0;
         _dynamicBlasBytes = 0;
         _tlasBytes = 0;
@@ -1693,19 +2237,24 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         if (_disposed) return;
         _disposed = true;
         _world.VoxelChanged -= OnVoxelChanged;
+        _world.FluidLevelChanged -= OnFluidLevelChanged;
         _world.WorldReloaded -= OnWorldReloaded;
         _world.MicroVoxelCellChanged -= OnMicroVoxelCellChanged;
         _world.MicroVoxelsReloaded -= OnMicroVoxelsReloaded;
         _world.ChunkGenerated -= OnChunkGenerated;
         _world.PhysicsGrids.Changed -= OnPhysicsGridsChanged;
+        _world.AnalyticSpheres.Changed -= OnAnalyticSpheresChanged;
         _staticGeometryBuildCancellation?.Cancel();
         _staticGeometryBuildCancellation?.Dispose();
         _staticGeometryBuildCancellation = null;
         _staticGeometryBuildTask = null;
         WaitIdle();
         DisposeGeometryResources();
+        _analyticSphereBlas.Dispose();
+        _analyticSphereAabbBuffer.Dispose();
         _readback?.Dispose();
         _output?.Dispose();
+        DisposeReflectionTailResources();
         _atlasDetail?.Dispose();
         _atlasColor?.Dispose();
         _shaderTable.Dispose();
@@ -1715,6 +2264,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _descriptorHeap.Dispose();
         _commands.Dispose();
         _allocator.Dispose();
+        _timestampReadback.Dispose();
+        _timestampQueryHeap.Dispose();
         _fence.Dispose();
         _queue.Dispose();
         _infoQueue?.Dispose();
@@ -1728,6 +2279,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
     private static uint Align(uint value, uint alignment) => ((value + alignment - 1) / alignment) * alignment;
 
+    private static double ElapsedMilliseconds(long started) =>
+        (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct WorldVertex(
         Vector3 Position,
@@ -1740,10 +2294,26 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         uint GridMarker,
         float Transmission,
         uint MaterialFlags,
+        int CellX,
+        int CellY,
+        int CellZ,
         Vector3 Emission);
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct EmissiveLight(Vector3 Position, float Radius, Vector3 Color, float Intensity);
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly record struct AnalyticSphereGpuData(
+        Vector4 AlbedoAndRoughness,
+        Vector4 MetallicAndMaterial,
+        Vector4 CenterAndRadius);
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly record struct AnalyticSphereAabb(
+        float MinimumX,
+        float MinimumY,
+        float MinimumZ,
+        float MaximumX,
+        float MaximumY,
+        float MaximumZ);
     private readonly record struct LocalEmissiveLight(
         Vector3 LocalPosition, float Radius, Vector3 Color, float Intensity);
     private sealed record CachedGridGeometry(
@@ -1771,5 +2341,12 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         Vector4 CameraUp,
         Vector4 SunDirection,
         Vector4 RenderOptions,
-        Vector4 TraceOptions);
+        Vector4 TraceOptions,
+        Vector4 TailOptions,
+        Vector4 HardwareOptions,
+        Vector4 PreviousCameraPositionAndTanHalfFov,
+        Vector4 PreviousCameraForwardAndAspect,
+        Vector4 PreviousCameraRight,
+        Vector4 PreviousCameraUp,
+        Vector4 SelectedCellAndGrid);
 }

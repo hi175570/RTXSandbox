@@ -1,5 +1,6 @@
 namespace RTXSandbox.Rendering;
 
+using System.Diagnostics.CodeAnalysis;
 using RTXSandbox.Rendering.Backends;
 
 public enum RenderBackendKind
@@ -36,6 +37,7 @@ public sealed record RenderBackendDescriptor(
 public static class RenderBackendCatalog
 {
     private static readonly (bool Supported, string Status) HardwareRayTracing = ProbeHardwareRayTracing();
+    private static readonly bool DesktopComputeSupported = !OperatingSystem.IsMacOS();
     public static string HardwareRayTracingStatus => HardwareRayTracing.Status;
 
     public static IReadOnlyList<RenderBackendDescriptor> All { get; } = new[]
@@ -51,8 +53,8 @@ public static class RenderBackendCatalog
         new RenderBackendDescriptor(
             RenderBackendKind.PbrForward,
             "PBR Forward",
-            "PBR 前向光柵",
-            "Real-time raster backend with procedural textures, sunlight, Fresnel sky reflections and transparency.",
+            "PBR 高品質前向光影",
+            "High-quality forward PBR with dynamic shadows, emissive lights, HDR atmosphere, screen-space reflections and water.",
             true,
             RenderBackendCapabilities.RealTime | RenderBackendCapabilities.Reflections |
             RenderBackendCapabilities.Transmission | RenderBackendCapabilities.MicroVoxels),
@@ -76,8 +78,10 @@ public static class RenderBackendCatalog
             RenderBackendKind.SoftwareRayTracing,
             "Compute Path Tracing",
             "Compute 路徑追蹤",
-            "OpenGL compute-shader path tracer. It does not require fixed-function RTX ray-tracing hardware.",
-            true,
+            DesktopComputeSupported
+                ? "OpenGL compute-shader path tracer. It does not require fixed-function RTX ray-tracing hardware."
+                : "Unavailable: macOS exposes OpenGL 4.1, while this compute path requires OpenGL 4.3.",
+            DesktopComputeSupported,
             RenderBackendCapabilities.ProgressiveAccumulation | RenderBackendCapabilities.GlobalIllumination |
             RenderBackendCapabilities.Reflections | RenderBackendCapabilities.Transmission |
             RenderBackendCapabilities.MicroVoxels),
@@ -95,10 +99,20 @@ public static class RenderBackendCatalog
         All.Where(descriptor => descriptor.Implemented).ToArray();
 
     public static bool IsImplemented(RenderBackendKind kind) =>
-        All.FirstOrDefault(descriptor => descriptor.Kind == kind)?.Implemented == true;
+        TryGet(kind, out RenderBackendDescriptor? descriptor) && descriptor.Implemented;
+
+    public static bool TryGet(
+        RenderBackendKind kind,
+        [NotNullWhen(true)] out RenderBackendDescriptor? descriptor)
+    {
+        descriptor = All.FirstOrDefault(candidate => candidate.Kind == kind);
+        return descriptor is not null;
+    }
 
     public static RenderBackendDescriptor Get(RenderBackendKind kind) =>
-        All.First(descriptor => descriptor.Kind == kind);
+        TryGet(kind, out RenderBackendDescriptor? descriptor)
+            ? descriptor
+            : throw new ArgumentOutOfRangeException(nameof(kind), kind, "未知的 Renderer ID。");
 
     private static (bool Supported, string Status) ProbeHardwareRayTracing()
     {

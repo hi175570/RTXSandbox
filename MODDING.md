@@ -6,7 +6,7 @@ RTX Sandbox hosts the BepInEx 6 CoreCLR chainloader itself. No Unity injection f
 <game directory>/BepInEx/plugins/
 ```
 
-The game currently uses BepInEx `6.0.0-be.785` on .NET 6. HarmonyX patching, plugin dependency ordering, logging and per-plugin `.cfg` files are included with the game. The in-game Mods page lists loaded plugins and dependency failures, opens both plugin folders, and can edit/save/reload common configuration values.
+The game currently uses BepInEx `6.0.0-be.785` on a Visual Studio-compatible .NET 9 host by default. An optional .NET 10 host can be built with `-p:RTXSandboxHostTargetFramework=net10.0`. HarmonyX patching, plugin dependency ordering, logging and per-plugin `.cfg` files are included with the game. The in-game Mods page lists loaded plugins and dependency failures, opens both plugin folders, and can edit/save/reload common configuration values.
 
 ## In-game manual workspace
 
@@ -38,7 +38,7 @@ The diagnostic command loads plugins without opening the game window. A successf
 
 ## Minimal plugin
 
-Create a class library targeting `net6.0` (or a compatible `netstandard2.1` API-only library), reference `RTXSandbox.ModAPI`, and reference `BepInEx.NET.CoreCLR` from `https://nuget.bepinex.dev/v3/index.json`.
+Create a class library targeting `netstandard2.1` or `net6.0` when its APIs are sufficient; `net7.0`, `net8.0`, and `net9.0` plugins can also be loaded by the default .NET 9 host when their own dependencies are compatible. A plugin that specifically targets `net10.0` requires the optional net10 Host. Reference `RTXSandbox.ModAPI` and `BepInEx.NET.CoreCLR` from `https://nuget.bepinex.dev/v3/index.json`.
 
 ```csharp
 using System.Numerics;

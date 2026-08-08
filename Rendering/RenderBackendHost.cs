@@ -20,6 +20,7 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
     private bool _disposed;
     private IRenderBackend _active;
     private IRenderBackend? _cachedHardwareRayTracing;
+    private readonly Func<RenderBackendKind, IRenderBackend> _backendFactory;
 
     public IRenderBackend ActiveBackend => _active;
     public RenderBackendKind Kind => _active.Kind;
@@ -51,26 +52,44 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
         int height,
         float renderScale,
         RenderBackendKind initialKind)
+        : this(world, blocks, width, height, renderScale, initialKind, backendFactory: null)
+    {
+    }
+
+    internal RenderBackendHost(
+        VoxelWorld world,
+        BlockRegistry blocks,
+        int width,
+        int height,
+        float renderScale,
+        RenderBackendKind initialKind,
+        Func<RenderBackendKind, IRenderBackend>? backendFactory)
     {
         _world = world ?? throw new ArgumentNullException(nameof(world));
         _blocks = blocks ?? throw new ArgumentNullException(nameof(blocks));
         _width = Math.Max(1, width);
         _height = Math.Max(1, height);
         _renderScale = Math.Clamp(renderScale, 0.35f, 1f);
+        _backendFactory = backendFactory ?? Create;
+        string? fallbackReason = null;
         if (!RenderBackendCatalog.IsImplemented(initialKind))
         {
-            initialKind = RenderBackendKind.SoftwareRayTracing;
+            fallbackReason = $"Renderer ID '{initialKind}' 不存在或目前不可用";
+            initialKind = RenderBackendKind.Classic;
         }
 
         try
         {
-            _active = Create(initialKind);
-            Status = $"Active renderer: {_active.Name}";
+            _active = _backendFactory(initialKind);
+            Status = fallbackReason is null
+                ? $"目前 Renderer：{_active.Name}"
+                : $"{fallbackReason}；已安全回退至 {_active.Name}。";
         }
-        catch (Exception exception) when (initialKind == RenderBackendKind.HardwareRayTracing)
+        catch (Exception exception) when (initialKind != RenderBackendKind.Classic)
         {
-            _active = Create(RenderBackendKind.SoftwareRayTracing);
-            Status = $"Hardware Ray Tracing initialization failed; using {_active.Name}: {exception.Message}";
+            _active = _backendFactory(RenderBackendKind.Classic);
+            Status = $"{RenderBackendCatalog.Get(initialKind).ChineseDisplayName} 初始化失敗；" +
+                     $"已安全回退至 {_active.Name}：{exception.Message}";
             Console.Error.WriteLine(Status);
         }
     }
@@ -78,7 +97,11 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
     public bool Switch(RenderBackendKind kind)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(RenderBackendHost));
-        RenderBackendDescriptor descriptor = RenderBackendCatalog.Get(kind);
+        if (!RenderBackendCatalog.TryGet(kind, out RenderBackendDescriptor? descriptor))
+        {
+            Status = $"未知的 Renderer ID：{kind}。目前仍使用 {Name}。";
+            return false;
+        }
         if (!descriptor.Implemented)
         {
             Status = descriptor.Description;
@@ -87,7 +110,7 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
 
         if (kind == Kind)
         {
-            Status = $"Active renderer: {Name}";
+            Status = $"目前 Renderer：{Name}";
             return true;
         }
 
@@ -104,12 +127,12 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
             }
             else
             {
-                replacement = Create(kind);
+                replacement = _backendFactory(kind);
             }
         }
         catch (Exception exception)
         {
-            Status = $"Could not start {descriptor.DisplayName}: {exception.Message}";
+            Status = $"無法啟動 {descriptor.ChineseDisplayName}：{exception.Message}。目前仍使用 {Name}。";
             return false;
         }
 
@@ -119,7 +142,7 @@ public sealed class RenderBackendHost : IRenderBackend, IMaterialPreviewSource, 
             _cachedHardwareRayTracing = previous;
         else
             previous.Dispose();
-        Status = $"Active renderer: {_active.Name}";
+        Status = $"目前 Renderer：{_active.Name}";
         return true;
     }
 

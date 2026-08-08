@@ -18,6 +18,7 @@ internal sealed unsafe class ImGuiController : IDisposable
     private readonly int _fontTexture;
     private bool _disposed;
     private static IntPtr s_imeWindowHandle;
+    private static IntPtr s_englishKeyboardLayout;
     private static int s_imePositionUpdateCount;
 
     internal bool ImePositionUpdated =>
@@ -332,6 +333,35 @@ internal sealed unsafe class ImGuiController : IDisposable
         ConfigureIme(nativeWindowHandle);
     }
 
+    /// <summary>
+    /// Gameplay owns Shift as an action key. Close the active IME and activate an
+    /// English keyboard layout while the mouse is captured so a Chinese IME cannot
+    /// consume Shift as its Chinese/English toggle. Text fields keep the existing
+    /// full IME composition path; players can switch languages normally after a UI
+    /// releases the mouse.
+    /// </summary>
+    public void EnforceGameplayEnglishInput(bool gameplayActive)
+    {
+        if (!gameplayActive || !OperatingSystem.IsWindows() || s_imeWindowHandle == IntPtr.Zero) return;
+        IntPtr english = s_englishKeyboardLayout;
+        if (english == IntPtr.Zero)
+        {
+            english = LoadKeyboardLayoutW("00000409", KeyboardLayoutActivate);
+            if (english != IntPtr.Zero) s_englishKeyboardLayout = english;
+        }
+        if (english != IntPtr.Zero) ActivateKeyboardLayout(english, 0);
+        IntPtr inputContext = ImmGetContext(s_imeWindowHandle);
+        if (inputContext == IntPtr.Zero) return;
+        try
+        {
+            ImmSetOpenStatus(inputContext, false);
+        }
+        finally
+        {
+            ImmReleaseContext(s_imeWindowHandle, inputContext);
+        }
+    }
+
     private static bool IsImeComposing()
     {
         if (!OperatingSystem.IsWindows() || s_imeWindowHandle == IntPtr.Zero) return false;
@@ -389,6 +419,7 @@ internal sealed unsafe class ImGuiController : IDisposable
     private const int CandidateFormExclude = 0x0080;
     private const uint CompositionString = 0x0008;
     private const uint IaceDefault = 0x0010;
+    private const uint KeyboardLayoutActivate = 0x00000001;
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct NativePoint(int X, int Y);
@@ -434,6 +465,15 @@ internal sealed unsafe class ImGuiController : IDisposable
 
     [DllImport("imm32.dll")]
     private static extern bool ImmAssociateContextEx(IntPtr windowHandle, IntPtr inputContext, uint flags);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmSetOpenStatus(IntPtr inputContext, bool open);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadKeyboardLayoutW(string keyboardLayoutId, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr ActivateKeyboardLayout(IntPtr keyboardLayout, uint flags);
 
     private const string VertexShaderSource = """
         #version 430 core

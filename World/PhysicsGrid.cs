@@ -136,15 +136,77 @@ public sealed class PhysicsGrid
         return true;
     }
 
+    public bool TryRemoveElementAtHit(PhysicsGridRayHit hit)
+    {
+        if (hit.GridId != Id) return false;
+        Vector3 localNormal = Vector3.Normalize(Vector3.Transform(
+            hit.Normal, Quaternion.Inverse(Orientation)));
+        Vector3 localPoint = WorldToLocal(hit.Position) - localNormal * 0.0025f;
+        int bestIndex = -1;
+        float bestVolume = float.PositiveInfinity;
+        for (int index = 0; index < _elements.Count; index++)
+        {
+            PhysicsGridElement element = _elements[index];
+            if (element.CellX != hit.CellX || element.CellY != hit.CellY || element.CellZ != hit.CellZ ||
+                localPoint.X < element.Minimum.X - 0.0001f || localPoint.X > element.Maximum.X + 0.0001f ||
+                localPoint.Y < element.Minimum.Y - 0.0001f || localPoint.Y > element.Maximum.Y + 0.0001f ||
+                localPoint.Z < element.Minimum.Z - 0.0001f || localPoint.Z > element.Maximum.Z + 0.0001f ||
+                element.Volume >= bestVolume) continue;
+            bestIndex = index;
+            bestVolume = element.Volume;
+        }
+        if (bestIndex < 0) return false;
+
+        Vector3 oldCenter = CenterOfMassLocal;
+        _elements.RemoveAt(bestIndex);
+        TopologyVersion++;
+        if (_elements.Count == 0)
+        {
+            _cellElements.Clear();
+            _collisionElements.Clear();
+            return true;
+        }
+        RebuildCellIndex();
+        RecalculateMass();
+        Position += Vector3.Transform(CenterOfMassLocal - oldCenter, Orientation);
+        Wake();
+        return true;
+    }
+
     public bool TryAddFullCell(int x, int y, int z, ushort materialId)
     {
         if (ContainsCell(x, y, z) || materialId == 0) return false;
+        return TryAddBox(x, y, z, new Vector3(x, y, z), new Vector3(x + 1f, y + 1f, z + 1f), materialId);
+    }
+
+    public bool TryAddBox(
+        int cellX,
+        int cellY,
+        int cellZ,
+        Vector3 minimum,
+        Vector3 maximum,
+        ushort materialId)
+    {
+        if (materialId == 0 || !IsFinite(minimum) || !IsFinite(maximum) ||
+            minimum.X < cellX - 0.00001f || minimum.Y < cellY - 0.00001f || minimum.Z < cellZ - 0.00001f ||
+            maximum.X > cellX + 1.00001f || maximum.Y > cellY + 1.00001f || maximum.Z > cellZ + 1.00001f ||
+            maximum.X - minimum.X <= 0.00001f || maximum.Y - minimum.Y <= 0.00001f ||
+            maximum.Z - minimum.Z <= 0.00001f) return false;
+
+        const float separationEpsilon = 0.00001f;
+        foreach (PhysicsGridElement existing in _elements)
+        {
+            bool separated = maximum.X <= existing.Minimum.X + separationEpsilon ||
+                             minimum.X >= existing.Maximum.X - separationEpsilon ||
+                             maximum.Y <= existing.Minimum.Y + separationEpsilon ||
+                             minimum.Y >= existing.Maximum.Y - separationEpsilon ||
+                             maximum.Z <= existing.Minimum.Z + separationEpsilon ||
+                             minimum.Z >= existing.Maximum.Z - separationEpsilon;
+            if (!separated) return false;
+        }
+
         Vector3 oldCenter = CenterOfMassLocal;
-        _elements.Add(new PhysicsGridElement(
-            x, y, z,
-            new Vector3(x, y, z),
-            new Vector3(x + 1f, y + 1f, z + 1f),
-            materialId));
+        _elements.Add(new PhysicsGridElement(cellX, cellY, cellZ, minimum, maximum, materialId));
         TopologyVersion++;
         RebuildCellIndex();
         RecalculateMass();
@@ -152,6 +214,9 @@ public sealed class PhysicsGrid
         Wake();
         return true;
     }
+
+    private static bool IsFinite(Vector3 value) =>
+        float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z);
 
     public void Wake()
     {
