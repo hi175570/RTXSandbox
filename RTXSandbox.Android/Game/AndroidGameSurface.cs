@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Numerics;
 using Android.Content;
@@ -226,8 +226,8 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             _meshDirty = true;
         };
         _status(loaded
-            ? $"已載入共用世界：{Path.GetFileName(_worldSaves.LastLoadSource)}"
-            : error is null ? "已建立共用格式世界" : $"舊存檔載入失敗，已安全建立世界：{error}");
+            ? $"撌脰??亙?其???{Path.GetFileName(_worldSaves.LastLoadSource)}"
+            : error is null ? "撌脣遣蝡?冽撘??? : $"??瑼??亙仃??撌脣??典遣蝡???{error}");
         RefreshWorldList();
     }
 
@@ -237,15 +237,15 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     public IReadOnlyList<AndroidRendererChoice> RendererChoices =>
     [
-        new("Classic", "經典光柵", true, "OpenGL ES raster"),
-        new("PbrForward", "PBR 前向光照", true, "OpenGL ES forward material lighting"),
-        new("Deferred", "延遲渲染", _supportsEs3,
-            _supportsEs3 ? "OpenGL ES 3 MRT G-buffer" : "需要 OpenGL ES 3.0 MRT"),
-        new("Hybrid", "混合式 PBR", _supportsEs3,
-            _supportsEs3 ? "Deferred geometry + screen-space environment pass" : "需要 OpenGL ES 3.0 MRT"),
-        new("ComputePathTracing", "Compute 路徑追蹤", _supportsCompute,
-            _supportsCompute ? "OpenGL ES 3.1 compute voxel ray tracing" : "需要 OpenGL ES 3.1 compute shader"),
-        new("HardwareRayTracing", "硬體光線追蹤", false, "DXR 僅支援 Windows Direct3D 12"),
+        new("Classic", "蝬?", true, "OpenGL ES raster"),
+        new("PbrForward", "PBR ???", true, "OpenGL ES forward material lighting"),
+        new("Deferred", "撱園皜脫?", _supportsEs3,
+            _supportsEs3 ? "OpenGL ES 3 MRT G-buffer" : "?閬?OpenGL ES 3.0 MRT"),
+        new("Hybrid", "瘛瑕?撘?PBR", _supportsEs3,
+            _supportsEs3 ? "Deferred geometry + screen-space environment pass" : "?閬?OpenGL ES 3.0 MRT"),
+        new("ComputePathTracing", "Compute 頝臬?餈質馱", _supportsCompute,
+            _supportsCompute ? "OpenGL ES 3.1 compute voxel ray tracing" : "?閬?OpenGL ES 3.1 compute shader"),
+        new("HardwareRayTracing", "蝖祇???餈質馱", false, "DXR ???Windows Direct3D 12"),
     ];
 
     public void RequestUiMode(AndroidGameUiMode mode) => _requests.Enqueue(() => SetUiMode(mode));
@@ -353,7 +353,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES20.GlCullFace(GLES20.GlBack);
         _lastTicks = _clock.ElapsedTicks;
         _fpsWindowStart = _clock.Elapsed.TotalSeconds;
-        _status($"Classic · 共用世界／存檔 · {_glVersion}");
+        _status($"Classic 繚 ?梁銝?嚗?瑼?繚 {_glVersion}");
         try
         {
             _imgui = new AndroidImGuiController(
@@ -362,7 +362,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         }
         catch (Exception exception)
         {
-            _status($"Android ImGui 初始化失敗：{exception.Message}");
+            _status($"Android ImGui ???仃??{exception.Message}");
         }
         PublishUiState();
     }
@@ -694,7 +694,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             ImGui.SameLine();
             ImGui.Text(block.DisplayName);
             ImGui.TextDisabled($"ID {block.Id}  |  {block.Key}");
-            ImGui.Text($"金屬度 {block.Metallic:0.00}  |  粗糙度 {block.Roughness:0.00}");
+            ImGui.Text($"?惇摨?{block.Metallic:0.00}  |  蝎?摨?{block.Roughness:0.00}");
             ImGui.End();
         }
 
@@ -793,7 +793,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             float width = ImGui.GetContentRegionAvail().X;
             if (ImGui.Button($"{T("continue")} - {_worldSaves.DisplayName}", new Vector2(width, 42f)))
                 SetUiMode(AndroidGameUiMode.Gameplay);
-            ImGui.SeparatorText(_language == UiLanguage.English ? "Worlds" : _language == UiLanguage.SimplifiedChinese ? "世界" : "世界");
+            ImGui.SeparatorText(_language == UiLanguage.English ? "Worlds" : _language == UiLanguage.SimplifiedChinese ? "銝?" : "銝?");
             if (ImGui.BeginChild("SavedWorlds", new Vector2(0f, Math.Max(120f, menuHeight - 580f)), ImGuiChildFlags.Borders))
             {
                 foreach (WorldSaveSummary world in _knownWorlds)
@@ -801,7 +801,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                     bool current = string.Equals(world.StorageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase);
                     bool selected = string.Equals(world.StorageName, _selectedWorldStorage, StringComparison.OrdinalIgnoreCase);
                     string currentPrefix = current
-                        ? (_language == UiLanguage.English ? "[Current] " : "[目前] ")
+                        ? (_language == UiLanguage.English ? "[Current] " : "[?桀?] ")
                         : string.Empty;
                     if (ImGui.Selectable($"{currentPrefix}{world.DisplayName}##world-{world.StorageName}",
                             selected, ImGuiSelectableFlags.None, new Vector2(0f, 34f)))
@@ -811,7 +811,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                         _worldMenuStatus = string.Empty;
                     }
                     ImGui.SameLine(Math.Max(205f, width * 0.48f));
-                    ImGui.TextDisabled($"{world.Preset} · Seed {world.Seed}");
+                    ImGui.TextDisabled($"{world.Preset} 繚 Seed {world.Seed}");
                 }
             }
             ImGui.EndChild();
@@ -822,21 +822,21 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                 bool current = string.Equals(selectedWorld.StorageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase);
                 float quarter = (width - ImGui.GetStyle().ItemSpacing.X * 3f) * 0.25f;
                 if (current) ImGui.BeginDisabled();
-                if (ImGui.Button("載入", new Vector2(quarter, 34f))) OpenWorld(selectedWorld.StorageName);
+                if (ImGui.Button("頛", new Vector2(quarter, 34f))) OpenWorld(selectedWorld.StorageName);
                 if (current) ImGui.EndDisabled();
                 ImGui.SameLine();
-                if (ImGui.Button("重新生成", new Vector2(quarter, 34f))) RebuildWorld(selectedWorld.StorageName);
+                if (ImGui.Button("???", new Vector2(quarter, 34f))) RebuildWorld(selectedWorld.StorageName);
                 ImGui.SameLine();
-                if (ImGui.Button("重新命名", new Vector2(quarter, 34f))) RenameWorld(selectedWorld.StorageName);
+                if (ImGui.Button("??賢?", new Vector2(quarter, 34f))) RenameWorld(selectedWorld.StorageName);
                 ImGui.SameLine();
                 if (current) ImGui.BeginDisabled();
-                if (ImGui.Button("刪除", new Vector2(quarter, 34f))) DeleteWorld(selectedWorld.StorageName);
+                if (ImGui.Button("?芷", new Vector2(quarter, 34f))) DeleteWorld(selectedWorld.StorageName);
                 if (current) ImGui.EndDisabled();
                 ImGui.SetNextItemWidth(width);
                 ImGui.InputText("##world-rename", ref _worldRenameDraft, 64);
             }
             if (!string.IsNullOrWhiteSpace(_worldMenuStatus)) ImGui.TextWrapped(_worldMenuStatus);
-            if (ImGui.Button("建立世界", new Vector2(width, 38f)))
+            if (ImGui.Button("撱箇?銝?", new Vector2(width, 38f)))
             {
                 _worldNameDraft = "New World";
                 _worldSeedDraft = Random.Shared.Next(int.MinValue, int.MaxValue);
@@ -866,22 +866,22 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         ImGui.SetNextWindowSize(new Vector2(MathF.Min(_width - 24f, 620f), MathF.Min(_height - 24f, 460f)),
             ImGuiCond.FirstUseEver);
         bool open = true;
-        if (ImGui.Begin("建立世界", ref open, ImGuiWindowFlags.NoCollapse))
+        if (ImGui.Begin("撱箇?銝?", ref open, ImGuiWindowFlags.NoCollapse))
         {
-            ImGui.InputText("世界名稱", ref _worldNameDraft, 64);
+            ImGui.InputText("銝??迂", ref _worldNameDraft, 64);
             ImGui.InputInt("Seed", ref _worldSeedDraft);
-            ImGui.TextDisabled("Natural · Auto Biome · Lakes · Vegetation");
+            ImGui.TextDisabled("Natural 繚 Auto Biome 繚 Lakes 繚 Vegetation");
             ImGui.Separator();
             bool valid = !string.IsNullOrWhiteSpace(_worldNameDraft);
             if (!valid) ImGui.BeginDisabled();
-            if (ImGui.Button("建立", new Vector2(180f, 42f)))
+            if (ImGui.Button("撱箇?", new Vector2(180f, 42f)))
             {
                 CreateWorld(_worldNameDraft, _worldSeedDraft);
                 open = false;
             }
             if (!valid) ImGui.EndDisabled();
             ImGui.SameLine();
-            if (ImGui.Button("取消", new Vector2(180f, 42f))) open = false;
+            if (ImGui.Button("??", new Vector2(180f, 42f))) open = false;
         }
         ImGui.End();
         if (!open && _uiMode == AndroidGameUiMode.CreateWorld)
@@ -913,7 +913,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         var service = new WorldSaveService(_blocks, preferredSeed: 1337, worldName: storageName, saveRoot: _saveRoot);
         if (!service.TryLoad(_world, out SavedWorldState state, out string? error))
         {
-            _worldMenuStatus = $"載入失敗：{error}";
+            _worldMenuStatus = $"Failed to load world: {error}";
             return;
         }
         _worldSaves = service;
@@ -923,7 +923,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         MarkAllChunkMeshesDirty();
         _gridMeshDirty = true;
         RefreshWorldList();
-        _worldMenuStatus = $"已載入：{service.DisplayName}";
+        _worldMenuStatus = $"Loaded: {service.DisplayName}";
         SetUiMode(AndroidGameUiMode.Gameplay);
     }
 
@@ -932,7 +932,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         if (_knownWorlds.Any(world => string.Equals(world.StorageName, name, StringComparison.OrdinalIgnoreCase) ||
                                       string.Equals(world.DisplayName, name, StringComparison.OrdinalIgnoreCase)))
         {
-            _worldMenuStatus = "同名世界已存在。";
+            _worldMenuStatus = "A world with this name already exists.";
             return;
         }
         SaveWorld();
@@ -945,7 +945,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         MarkAllChunkMeshesDirty();
         _gridMeshDirty = true;
         RefreshWorldList();
-        _worldMenuStatus = $"已建立：{service.DisplayName}";
+        _worldMenuStatus = $"Created: {service.DisplayName}";
         SetUiMode(AndroidGameUiMode.Gameplay);
     }
 
@@ -954,7 +954,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         SaveWorld();
         if (!_worldSaves.TryGetWorldGeneration(storageName, out WorldGenerationSettings settings, out string? error))
         {
-            _worldMenuStatus = $"重新生成失敗：{error}";
+            _worldMenuStatus = $"Rebuild failed: {error}";
             return;
         }
         _worldSaves = new WorldSaveService(_blocks, preferredSeed: settings.Seed,
@@ -966,27 +966,27 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         MarkAllChunkMeshesDirty();
         _gridMeshDirty = true;
         RefreshWorldList();
-        _worldMenuStatus = "已使用原 Seed 重新生成世界。";
+        _worldMenuStatus = "World regenerated using original seed.";
     }
 
     private void RenameWorld(string storageName)
     {
         if (_worldSaves.TryRenameWorld(storageName, _worldRenameDraft, out string? error))
         {
-            _worldMenuStatus = "世界已重新命名。";
+            _worldMenuStatus = "World renamed.";
             RefreshWorldList();
         }
-        else _worldMenuStatus = $"重新命名失敗：{error}";
+        else _worldMenuStatus = $"Failed to rename world: {error}";
     }
 
     private void DeleteWorld(string storageName)
     {
         if (_worldSaves.TryDeleteWorld(storageName, out string? error))
         {
-            _worldMenuStatus = "世界已刪除。";
+            _worldMenuStatus = "World deleted.";
             RefreshWorldList();
         }
-        else _worldMenuStatus = $"刪除失敗：{error}";
+        else _worldMenuStatus = $"Failed to delete world: {error}";
     }
 
     private void TeleportToSpawn()
@@ -1085,8 +1085,102 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         if (!open) SetUiMode(AndroidGameUiMode.Gameplay);
     }
 
-    private static string ShortBlockName(string value) => value.Length <= 12 ? value : value[..11] + "…";
+    private static string ShortBlockName(string value) => ShortName(value, 12);
+    private static string ShortName(string value, int maxLength)
+    {
+        if (maxLength <= 0) return string.Empty;
+        if (string.IsNullOrWhiteSpace(value)) return value ?? string.Empty;
+        return value.Length <= maxLength ? value : value[..(maxLength - 1)] + "??;
+    }
 
+    private bool DrawBlockCard(
+        BlockDefinition block,
+        Vector2 size,
+        string id,
+        bool selected,
+        string? label = null,
+        bool interactive = true,
+        bool compact = false)
+    {
+        Vector2 position = ImGui.GetCursorScreenPos();
+        ImGui.InvisibleButton($"##{id}", size);
+        bool hovered = interactive && ImGui.IsItemHovered();
+        bool clicked = interactive && ImGui.IsItemClicked(ImGuiMouseButton.Left);
+        ImDrawListPtr drawList = ImGui.GetWindowDrawList();
+
+        Vector4 background = selected
+            ? new Vector4(0.62f, 0.62f, 0.62f, 1f)
+            : hovered
+                ? new Vector4(0.34f, 0.34f, 0.34f, 1f)
+                : new Vector4(0.20f, 0.20f, 0.20f, 1f);
+        uint backgroundColor = ImGui.ColorConvertFloat4ToU32(background);
+        uint borderColor = ImGui.ColorConvertFloat4ToU32(selected
+            ? new Vector4(0.96f, 0.96f, 0.96f, 1f)
+            : new Vector4(0.06f, 0.06f, 0.06f, 1f));
+        drawList.AddRectFilled(position, position + size, backgroundColor, 1f);
+        drawList.AddRect(position, position + size, borderColor, 1f, ImDrawFlags.None, selected ? 3f : 2f);
+
+        float labelHeight = compact ? 13f : 23f;
+        DrawMaterialCube(
+            drawList,
+            position + new Vector2(4f, 3f),
+            new Vector2(size.X - 8f, size.Y - labelHeight - 4f),
+            block);
+
+        string text = label ?? (compact ? ShortName(block.DisplayName, 8) : ShortBlockName(block.DisplayName));
+        Vector2 textSize = ImGui.CalcTextSize(text);
+        Vector2 textPosition = new(
+            position.X + Math.Max(3f, (size.X - textSize.X) * 0.5f),
+            position.Y + size.Y - textSize.Y - (compact ? 2f : 5f));
+        uint textColor = ImGui.ColorConvertFloat4ToU32(new Vector4(0.94f, 0.97f, 1f, 1f));
+        drawList.AddText(textPosition, textColor, text);
+
+        if (_favoriteBlocks.Contains(block.Key) && !compact)
+        {
+            uint star = ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.78f, 0.18f, 1f));
+            drawList.AddText(position + new Vector2(size.X - 17f, 4f), star, "*");
+        }
+
+        if (interactive && ImGui.IsItemClicked(ImGuiMouseButton.Right))
+        {
+            if (!_favoriteBlocks.Add(block.Key)) _favoriteBlocks.Remove(block.Key);
+        }
+
+        if (hovered)
+            DrawBlockTooltip(block);
+
+        return clicked;
+    }
+
+    private static void DrawMaterialCube(ImDrawListPtr drawList, Vector2 position, Vector2 size, BlockDefinition block)
+    {
+        Vector2 rightTop = position + new Vector2(size.X * 0.64f, 0f);
+        Vector2 bottomRight = position + size;
+        drawList.AddRectFilled(
+            position,
+            bottomRight,
+            ImGui.ColorConvertFloat4ToU32(new Vector4(0.18f, 0.18f, 0.18f, 1f)),
+            0.0f);
+        drawList.AddRectFilled(
+            position + new Vector2(3f, 3f),
+            rightTop + new Vector2(2f, 2f),
+            ImGui.ColorConvertFloat4ToU32(new Vector4(block.Albedo * 0.78f + new Vector3(0.05f), 1f)),
+            0.0f);
+        drawList.AddRectFilled(
+            rightTop,
+            bottomRight - new Vector2(3f, 3f),
+            ImGui.ColorConvertFloat4ToU32(new Vector4(block.Albedo * 0.58f + new Vector3(0.05f), 1f)),
+            0.0f);
+    }
+
+    private static void DrawBlockTooltip(BlockDefinition block)
+    {
+        ImGui.BeginTooltip();
+        ImGui.Text(block.DisplayName);
+        ImGui.TextDisabled($"ID {block.Id}  |  {block.Key}");
+        ImGui.Text($"Metallic {block.Metallic:0.00}  |  Roughness {block.Roughness:0.00}");
+        ImGui.EndTooltip();
+    }
     private void DrawRendererImGui()
     {
         ImGui.SetNextWindowPos(new Vector2(_width * 0.5f, _height * 0.5f),
@@ -1094,14 +1188,14 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         ImGui.SetNextWindowSize(new Vector2(
             MathF.Min(_width - 24f, 680f), MathF.Min(_height - 24f, 640f)), ImGuiCond.FirstUseEver);
         bool open = true;
-        if (ImGui.Begin("RTX Sandbox 設定", ref open,
+        if (ImGui.Begin("RTX Sandbox 閮剖?", ref open,
                 ImGuiWindowFlags.NoCollapse))
         {
-            ImGui.TextDisabled("變更會立即生效，正常關閉遊戲時會自動保存。");
+            ImGui.TextDisabled("霈???喟???甇?虜??????芸?靽???);
             ImGui.Spacing();
             if (ImGui.BeginTabBar("SettingsTabs"))
             {
-                if (ImGui.BeginTabItem("畫面"))
+                if (ImGui.BeginTabItem("?恍"))
                 {
                     ImGui.SeparatorText(T("renderer"));
                     foreach (AndroidRendererChoice choice in RendererChoices)
@@ -1119,19 +1213,19 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                         ImGui.TextDisabled(choice.Reason);
                         if (!choice.Available) ImGui.EndDisabled();
                     }
-                    ImGui.SeparatorText("顯示");
-                    ImGui.Text($"解析度：{_width} × {_height}");
-                    ImGui.TextDisabled("Android 的解析度與 VSync 由系統 Surface 管理。未支援的 Renderer 不會偽裝成可用。");
+                    ImGui.SeparatorText("憿舐內");
+                    ImGui.Text($"閫??摨佗?{_width} ? {_height}");
+                    ImGui.TextDisabled("Android ?圾?漲??VSync ?梁頂蝯?Surface 蝞∠???舀??Renderer 銝??質???具?);
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("時間與光照"))
+                if (ImGui.BeginTabItem("??????))
                 {
-                    ImGui.TextDisabled("行動版目前使用與世界一致的日光資料；進階光照選項會隨對應 Renderer 接入。 ");
+                    ImGui.TextDisabled("銵???蝙?刻?銝?銝?渡??亙?鞈?嚗脤???賊??撠? Renderer ?亙??");
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("控制與介面"))
+                if (ImGui.BeginTabItem("?批????))
                 {
-                    ImGui.TextWrapped("外接鍵盤使用 PC 按鍵；Android 另外提供可編輯的觸控覆蓋層。");
+                    ImGui.TextWrapped("憭?萇雿輻 PC ?嚗ndroid ?血????舐楊頛舐?閫豢閬?撅扎?);
                     if (ImGui.Button(T("controls"), new Vector2(210f, 42f)))
                     {
                         _uiReturnMode = AndroidGameUiMode.Settings;
@@ -1139,10 +1233,10 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                     }
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("觸控"))
+                if (ImGui.BeginTabItem("閫豢"))
                 {
                     ImGui.Dummy(new Vector2(0f, 12f));
-                    if (ImGui.Button("開啟觸控編輯器", new Vector2(240f, 48f)))
+                    if (ImGui.Button("??閫豢蝺刻摩??, new Vector2(240f, 48f)))
                         SetUiMode(AndroidGameUiMode.TouchEditor);
                     ImGui.EndTabItem();
                 }
@@ -1186,11 +1280,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             ImGui.TextWrapped(_language == UiLanguage.English
                 ? "External keyboard controls share the PC defaults. Select a key, then press its replacement. Touch controls remain an Android-only input layer."
                 : _language == UiLanguage.SimplifiedChinese
-                    ? "外接键盘使用与 PC 相同的默认按键。触控按键只是 Android 专用输入层。"
-                    : "外接鍵盤使用與 PC 相同的預設按鍵。觸控按鍵只是 Android 專用輸入層。");
+                    ? "憭?桃?雿輻銝?PC ?詨???霈斗??柴圻?扳??桀??Android 銝颲撅?
+                    : "憭?萇雿輻??PC ?詨???閮剜??萸孛?扳??萄??Android 撠頛詨撅扎?);
             if (_input.HardwareRebindTarget is not null)
                 ImGui.TextColored(new Vector4(0.25f, 0.86f, 1f, 1f),
-                    _language == UiLanguage.English ? "Press a key..." : "請按下新的按鍵…");
+                    _language == UiLanguage.English ? "Press a key..." : "隢?銝???菊?);
             ImGui.Separator();
             DrawEditableBinding("move_forward", VirtualBindingKind.Keyboard, "W", "W");
             DrawEditableBinding("move_backward", VirtualBindingKind.Keyboard, "S", "S");
@@ -1203,7 +1297,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             DrawEditableBinding("build_tools", VirtualBindingKind.Keyboard, "B", "B");
             DrawEditableBinding("precision", VirtualBindingKind.Keyboard, "V", "V");
             ImGui.Separator();
-            if (ImGui.Button(_language == UiLanguage.English ? "Reset defaults" : "重設預設",
+            if (ImGui.Button(_language == UiLanguage.English ? "Reset defaults" : "?身?身",
                     new Vector2(180f, 42f)))
                 _input.ResetHardwareBindings();
             ImGui.SameLine();
@@ -1232,12 +1326,12 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private static readonly string[] AndroidUiGlyphText =
     {
         UiText.GlyphCorpus,
-        "經典光柵前向光照延遲渲染混合式路徑追蹤硬體光線需要桌面僅支援尚未接入",
-        "變更會立即生效正常關閉遊戲時自動保存畫面時間與光照控制介面解析度系統管理",
-        "行動版目前使用世界一致日光資料進階選項對應外接鍵盤預設按鍵觸控專用輸入層",
-        "物品欄建造工具方塊材質搜尋快捷欄精密微方塊模式格線完成世界設定成就統計模組語言離開",
-        "繁體中文簡體中文英文繼續遊戲編輯觸控成就名稱介紹尚未解鎖",
-        "建立世界世界名稱取消載入重新生成重新命名刪除失敗同名已存在自然群系湖泊植被金屬度粗糙度",
+        "蝬????撱園皜脫?瘛瑕?撘楝敺蕭頩斤′擃?蝺?閬??Ｗ??舀撠?亙",
+        "霈???喟??迤撣賊????脫??芸?靽??恍?????扳?嗡??Ｚ圾?漲蝟餌絞蝞∠?",
+        "銵???蝙?其????湔???脤??賊?撠?憭?萇?身?閫豢撠頛詨撅?,
+        "?拙?甈遣?極?瑟憛?鞈芣?撠翰?瑟?蝎曉?敺格憛芋撘蝺????身摰?撠梁絞閮芋蝯?閮?ａ?",
+        "蝜?銝剜?蝪⊿?銝剜??望?蝜潛??蝺刻摩閫豢?停?迂隞晶撠閫??",
+        "撱箇?銝?銝??迂??頛?????賢??芷憭望???撌脣??刻?嗥黎蝟餅?瘜?鋡恍?撅砍漲蝎?摨?,
     };
 
     private void HandleBlockActions()
@@ -2078,10 +2172,10 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             AndroidRendererMode.HardwareRayTracing => "Hardware RT",
             _ => "Classic",
         };
-        string precision = _precisionMode ? " · V 精密" : string.Empty;
-        _status($"{renderer} · {fps} FPS · {_vertexCount:N0} vertices · UI max {_maximumUiMilliseconds:0.0} ms{precision}");
+        string precision = _precisionMode ? " 繚 V 蝎曉?" : string.Empty;
+        _status($"{renderer} 繚 {fps} FPS 繚 {_vertexCount:N0} vertices 繚 UI max {_maximumUiMilliseconds:0.0} ms{precision}");
         if (_physics.ActiveGridCount > 0)
-            _status($"Physics Grid · {_physics.ActiveGridCount} active · {_physics.Status}");
+            _status($"Physics Grid 繚 {_physics.ActiveGridCount} active 繚 {_physics.Status}");
         _fpsFrames = 0;
         _fpsWindowStart = now;
         _maximumUiMilliseconds = 0;

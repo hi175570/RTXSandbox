@@ -749,6 +749,9 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _forwardPostGpuTimer!.Begin();
         int historyWriteIndex = _forwardHistoryIndex;
         int historyReadIndex = 1 - historyWriteIndex;
+        bool useFrameGeneration = quality.UpscalingMode != UpscalingMode.None;
+        bool useTemporalReprojection = quality.UpscalingMode == UpscalingMode.Dlss ||
+                                       (quality.ForwardTemporalAntiAliasing && quality.UpscalingMode != UpscalingMode.Fsr);
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, _forwardHistoryBuffers[historyWriteIndex]);
         GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
         GL.Viewport(0, 0, _width, _height);
@@ -776,9 +779,10 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(post.Uniform("uPostQuality"), quality.ForwardPostProcessingQuality);
         GL.Uniform1(post.Uniform("uBloomEnabled"), quality.ForwardBloom ? 1 : 0);
         GL.Uniform1(post.Uniform("uToneMapping"), quality.ForwardToneMapping);
-        GL.Uniform1(post.Uniform("uTaaEnabled"), quality.ForwardTemporalAntiAliasing ? 1 : 0);
+        GL.Uniform1(post.Uniform("uUpscalingMode"), (int)quality.UpscalingMode);
+        GL.Uniform1(post.Uniform("uTaaEnabled"), useTemporalReprojection ? 1 : 0);
         GL.Uniform1(post.Uniform("uHasHistory"),
-            quality.ForwardTemporalAntiAliasing && _forwardHistoryValid ? 1 : 0);
+            _forwardHistoryValid && (quality.ForwardTemporalAntiAliasing || useFrameGeneration) ? 1 : 0);
         GL.Uniform1(post.Uniform("uDebugView"), (int)quality.ForwardDebugView);
         GL.BindVertexArray(_fullscreenVertexArray);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
@@ -791,7 +795,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         _forwardPostGpuTimer.End();
         ForwardPostCpuMilliseconds = ElapsedMilliseconds(postStarted);
         _forwardHistoryIndex = historyReadIndex;
-        _forwardHistoryValid = quality.ForwardTemporalAntiAliasing &&
+        _forwardHistoryValid = (quality.ForwardTemporalAntiAliasing || quality.UpscalingMode != UpscalingMode.None) &&
             quality.ForwardDebugView == ForwardDebugView.FinalImage;
         _previousView = view;
         _previousProjection = projection;

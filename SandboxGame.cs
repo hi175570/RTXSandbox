@@ -946,7 +946,8 @@ public sealed partial class SandboxGame : GameWindow
                     _settings.HardwareRayTracingReflectionStrength,
                     _settings.HardwareRayTracingRenderStyle,
                     _settings.InfiniteMirrorQuality,
-                    _settings.SelectionOutlineReflections),
+                    _settings.SelectionOutlineReflections,
+                    _settings.UpscalingMode),
                 _settings.Exposure);
         }
         if (_gpuSmoke && Environment.GetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT") == "1")

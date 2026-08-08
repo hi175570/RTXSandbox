@@ -20,6 +20,7 @@ uniform int uToneMapping;
 uniform int uTaaEnabled;
 uniform int uHasHistory;
 uniform int uDebugView;
+uniform int uUpscalingMode;
 
 in vec2 vUv;
 layout(location = 0) out vec4 outColor;
@@ -213,6 +214,28 @@ vec3 toneMap(vec3 color)
         max(color * (2.43 * color + 0.59) + 0.14, vec3(1e-5)), 0.0, 1.0);
 }
 
+vec3 applyFsrSharpen(vec3 source, vec2 uv)
+{
+    vec2 texel = uTexelSize;
+    vec3 c = source;
+    vec3 sampleCenter = pow(max(toneMap(texture(uHdrColor, clamp(uv, vec2(0.001), vec2(0.999))).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleUp = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(-1.0, 0.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleDown = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(1.0, 0.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleLeft = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(0.0, -1.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleRight = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(0.0, 1.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleDiagA = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(-1.0, -1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleDiagB = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(1.0, -1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleDiagC = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(-1.0, 1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleDiagD = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(1.0, 1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleUpLeft = sampleUp + sampleDown + sampleLeft + sampleRight;
+    vec3 sampleDownRight = sampleDiagA + sampleDiagB + sampleDiagC + sampleDiagD;
+    vec3 n = sampleUpLeft;
+    vec3 nw = sampleDownRight;
+    vec3 avg = (sampleCenter * 4.0 + n + nw * 0.5) / 9.5;
+    float sharpness = 0.18;
+    return clamp(c + (c - avg) * sharpness, vec3(0.0), vec3(1.0));
+}
+
 void main()
 {
     float depth = texture(uDepth, vUv).r;
@@ -276,10 +299,14 @@ void main()
         color += (color - neighborhood * 0.25) * (uPostQuality >= 3 ? 0.10 : 0.055);
     }
     vec3 mapped = pow(max(toneMap(color), vec3(0.0)), vec3(1.0 / 2.2));
+    if (uUpscalingMode == 1)
+    {
+        mapped = applyFsrSharpen(mapped, vUv);
+    }
 
     // Reproject the previous resolved image. A current-frame neighborhood clamp
     // prevents stale geometry or edited blocks from leaving a visible trail.
-    if (uTaaEnabled != 0 && uHasHistory != 0 && depth < 0.99999)
+    if (uUpscalingMode == 2 && uTaaEnabled != 0 && uHasHistory != 0 && depth < 0.99999)
     {
         vec4 previousClip = uPreviousViewProjection * vec4(worldPosition, 1.0);
         if (previousClip.w > 1e-5)
@@ -303,6 +330,11 @@ void main()
                 mapped = mix(mapped, history, uPostQuality >= 3 ? 0.82 : 0.72);
             }
         }
+    }
+    else if (uUpscalingMode == 1 && uHasHistory != 0 && depth < 0.99999)
+    {
+        vec3 history = pow(max(toneMap(texture(uHistory, vUv).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+        mapped = mix(mapped, history, 0.10);
     }
 
     if (any(isnan(mapped)) || any(isinf(mapped))) mapped = vec3(0.0);

@@ -46,19 +46,63 @@ jobs:
 
   android:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid:
+          - android-arm64
+          - android-arm
+          - android-x64
+          - android-x86
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 9.0.x
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
       - name: Install Android workload
         run: dotnet workload install android
+      - name: Detect Android SDK
+        id: android-sdk
+        shell: pwsh
+        run: |
+          $candidates = @(
+            $env:ANDROID_HOME,
+            $env:ANDROID_SDK_ROOT,
+            "$env:LOCALAPPDATA\Android\Sdk",
+            "$env:USERPROFILE\AppData\Local\Android\Sdk",
+            "C:\Android\android-sdk",
+            "C:\Users\runneradmin\AppData\Local\Android\Sdk"
+          )
+          $sdkRoot = $candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } | Select-Object -First 1
+          if ($null -eq $sdkRoot) {
+            Write-Warning "Android SDK not detected; Android build will be skipped."
+            "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "path=$sdkRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ANDROID_SDK_ROOT=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
       - name: Build Android APK for multiple ABIs
+        if: steps.android-sdk.outputs.found == 'true'
         shell: pwsh
         run: >-
-          dotnet build RTXSandbox.Android/RTXSandbox.Android.csproj -c Release
-          -p:RuntimeIdentifiers='android-arm64;android-x64;android-arm;android-x86'
+          dotnet publish RTXSandbox.Android/RTXSandbox.Android.csproj -c Release
+          -f net9.0-android -r ${{ matrix.rid }} --self-contained false
+          -p:AndroidPackageFormat=apk
+          -p:AndroidSdkDirectory=$env:ANDROID_SDK_ROOT
+          -p:JAVASdkDirectory=$env:JAVA_HOME
+          -o artifacts/${{ matrix.rid }}
       - uses: actions/upload-artifact@v4
+        if: steps.android-sdk.outputs.found == 'true'
         with:
-          name: rtxsandbox-android
-          path: RTXSandbox.Android/bin/Release/net9.0-android/**/*.apk
+          name: rtxsandbox-android-${{ matrix.rid }}
+          path: artifacts/${{ matrix.rid }}
+      - name: Skip Android publish (SDK missing)
+        if: steps.android-sdk.outputs.found != 'true'
+        shell: pwsh
+        run: Write-Output "Android SDK was not detected in this runner; Android APK generation was skipped."

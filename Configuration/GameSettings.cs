@@ -9,7 +9,7 @@ using RTXSandbox.Infrastructure;
 
 public sealed class GameSettings
 {
-    public const int CurrentVersion = 12;
+    public const int CurrentVersion = 13;
 
     public int Version { get; set; } = CurrentVersion;
     public int WindowWidth { get; set; } = 960;
@@ -17,6 +17,7 @@ public sealed class GameSettings
     public bool VSync { get; set; } = true;
     public int FpsLimit { get; set; } = 120;
     public float RenderScale { get; set; } = 1.0f;
+    public UpscalingMode UpscalingMode { get; set; } = UpscalingMode.None;
     public RenderBackendKind Renderer { get; set; } = RenderBackendKind.SoftwareRayTracing;
     public int PathBounces { get; set; } = 3;
     public int PathSamplesPerFrame { get; set; } = 1;
@@ -333,6 +334,8 @@ public sealed class GameSettings
         FpsLimit = Math.Clamp(FpsLimit, 30, 360);
         RenderScale = Math.Clamp(RenderScale, 0.35f, 1f);
         if (!RenderBackendCatalog.IsImplemented(Renderer)) Renderer = RenderBackendKind.SoftwareRayTracing;
+        if (!Enum.IsDefined(typeof(UpscalingMode), UpscalingMode))
+            UpscalingMode = UpscalingMode.None;
         PathBounces = Math.Clamp(PathBounces, 1, 50);
         PathSamplesPerFrame = Math.Clamp(PathSamplesPerFrame, 1, 8);
         PathMaxAccumulatedSamples = Math.Clamp(PathMaxAccumulatedSamples, 64, 16384);

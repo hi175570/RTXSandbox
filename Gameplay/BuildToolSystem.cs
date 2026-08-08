@@ -132,7 +132,9 @@ public sealed class BuildToolSystem
             while (remaining > 0 && command.NextIndex < command.Edits.Length)
             {
                 VoxelEdit edit = command.Edits[command.NextIndex++];
-                bool editApplied = _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.NewBlockId);
+                bool editApplied = edit.IsFluidEdit
+                    ? _world.SetFluidAmount(edit.X, edit.Y, edit.Z, edit.NewFluidAmount)
+                    : _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.NewBlockId);
                 _queuedEditCount = Math.Max(0, _queuedEditCount - 1);
                 remaining--;
                 if (!editApplied)
@@ -343,7 +345,14 @@ public sealed class BuildToolSystem
         for (int i = command.Edits.Count - 1; i >= 0; i--)
         {
             VoxelEdit edit = command.Edits[i];
-            _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.OldBlockId);
+            if (edit.IsFluidEdit)
+            {
+                _world.SetFluidAmount(edit.X, edit.Y, edit.Z, edit.OldFluidAmount);
+            }
+            else
+            {
+                _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.OldBlockId);
+            }
         }
         _redo.Push(command);
         Status = $"Undo: {command.Name} ({command.Edits.Count:N0} voxels)";
@@ -361,7 +370,14 @@ public sealed class BuildToolSystem
 
         foreach (VoxelEdit edit in command.Edits)
         {
-            _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.NewBlockId);
+            if (edit.IsFluidEdit)
+            {
+                _world.SetFluidAmount(edit.X, edit.Y, edit.Z, edit.NewFluidAmount);
+            }
+            else
+            {
+                _world.SetBlockId(edit.X, edit.Y, edit.Z, edit.NewBlockId);
+            }
         }
         PushUndo(command);
         Status = $"Redo: {command.Name} ({command.Edits.Count:N0} voxels)";
@@ -392,6 +408,11 @@ public sealed class BuildToolSystem
         (int x, int y, int z) = hitBlock.IsReplaceable && hit.MaterialId != SelectedBlockId
             ? (hit.X, hit.Y, hit.Z)
             : hit.Adjacent;
+        BlockDefinition selectedBlock = _blocks.Get(SelectedBlockId);
+        if (selectedBlock.IsFluid && _world.IsFluid(hit.X, hit.Y, hit.Z))
+        {
+            (x, y, z) = (hit.X, hit.Y, hit.Z);
+        }
         var requested = new Dictionary<VoxelPoint, PendingEdit>();
         AddPending(requested, x, y, z, SelectedBlockId);
         return Commit(requested, "Place voxel");
@@ -504,7 +525,15 @@ public sealed class BuildToolSystem
             }
             else
             {
-                changes[key] = new VoxelEdit(change.X, change.Y, change.Z, change.OldBlockId, change.NewBlockId);
+                changes[key] = new VoxelEdit(
+                    change.X,
+                    change.Y,
+                    change.Z,
+                    change.OldBlockId,
+                    change.NewBlockId,
+                    0,
+                    0,
+                    false);
             }
         }
 
@@ -553,11 +582,32 @@ public sealed class BuildToolSystem
         foreach (PendingEdit pending in requested.Values)
         {
             ushort old = _world.GetBlockId(pending.X, pending.Y, pending.Z);
+            BlockDefinition newDefinition = _blocks.Get(pending.NewBlockId);
             bool hasMicro = _world.TryGetMicroVoxels(
                 pending.X,
                 pending.Y,
                 pending.Z,
                 out MicroVoxelContainer? micro);
+            if (old == pending.NewBlockId && newDefinition.IsFluid && _world.IsFluid(pending.X, pending.Y, pending.Z))
+            {
+                byte oldFluidAmount = _world.GetFluidAmount(pending.X, pending.Y, pending.Z);
+                byte newFluidAmount = (byte)Math.Min(
+                    (int)VoxelWorld.FluidCapacity,
+                    oldFluidAmount + 1);
+                if (newFluidAmount != oldFluidAmount)
+                {
+                    edits.Add(new VoxelEdit(
+                        pending.X,
+                        pending.Y,
+                        pending.Z,
+                        old,
+                        pending.NewBlockId,
+                        oldFluidAmount,
+                        newFluidAmount,
+                        true));
+                }
+                continue;
+            }
             if (old == pending.NewBlockId && !hasMicro) continue;
             BlockDefinition oldDefinition = _blocks.Get(old);
             if (old != 0 && oldDefinition.IsUnbreakable && !oldDefinition.IsFluid) continue;
@@ -565,8 +615,16 @@ public sealed class BuildToolSystem
                     _blocks.Get(box.MaterialId).IsUnbreakable && !_blocks.Get(box.MaterialId).IsFluid)) continue;
             if (pending.NewBlockId != 0 &&
                 _wouldOverlapPlayer?.Invoke(pending.X, pending.Y, pending.Z) == true) continue;
-            if (pending.NewBlockId != 0 && !_blocks.Get(pending.NewBlockId).IsPlaceable) continue;
-            edits.Add(new VoxelEdit(pending.X, pending.Y, pending.Z, old, pending.NewBlockId));
+            if (pending.NewBlockId != 0 && !newDefinition.IsPlaceable) continue;
+            edits.Add(new VoxelEdit(
+                pending.X,
+                pending.Y,
+                pending.Z,
+                old,
+                pending.NewBlockId,
+                0,
+                0,
+                false));
         }
 
         if (edits.Count == 0)
@@ -610,7 +668,15 @@ public sealed class BuildToolSystem
     }
 
     private readonly record struct PendingEdit(int X, int Y, int Z, ushort NewBlockId);
-    private readonly record struct VoxelEdit(int X, int Y, int Z, ushort OldBlockId, ushort NewBlockId);
+    private readonly record struct VoxelEdit(
+        int X,
+        int Y,
+        int Z,
+        ushort OldBlockId,
+        ushort NewBlockId,
+        byte OldFluidAmount,
+        byte NewFluidAmount,
+        bool IsFluidEdit);
     private sealed record VoxelEditCommand(string Name, IReadOnlyList<VoxelEdit> Edits);
 
     private sealed class PendingEditCommand(string name, List<VoxelEdit> edits)

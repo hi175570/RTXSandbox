@@ -74,6 +74,13 @@ public enum InfiniteMirrorQuality
     Extreme,
 }
 
+public enum UpscalingMode
+{
+    None,
+    Fsr,
+    Dlss,
+}
+
 public readonly record struct RenderQualitySettings(
     int PathBounces,
     int PathSamplesPerFrame,
@@ -155,4 +162,5 @@ public readonly record struct RenderQualitySettings(
     float HardwareRayTracingReflectionStrength,
     HardwareRayTracingRenderStyle HardwareRayTracingRenderStyle,
     InfiniteMirrorQuality InfiniteMirrorQuality,
-    bool SelectionOutlineReflections);
+    bool SelectionOutlineReflections,
+    UpscalingMode UpscalingMode);
