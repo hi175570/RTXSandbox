@@ -2172,16 +2172,18 @@ public static class SelfTests
         RenderBackendKind[] implemented = RenderBackendCatalog.Implemented
             .Select(descriptor => descriptor.Kind)
             .ToArray();
-        RenderBackendKind[] requiredRasterAndCompute =
+        RenderBackendKind[] requiredRaster =
         {
-            RenderBackendKind.SoftwareRayTracing,
             RenderBackendKind.DeferredLighting,
             RenderBackendKind.HybridPbrRaster,
             RenderBackendKind.PbrForward,
             RenderBackendKind.Classic,
         };
-        Assert(requiredRasterAndCompute.All(implemented.Contains),
-            "implemented renderer list lost an existing raster or compute backend");
+        Assert(requiredRaster.All(implemented.Contains),
+            "implemented renderer list lost an existing raster backend");
+        Assert(RenderBackendCatalog.IsImplemented(RenderBackendKind.SoftwareRayTracing) ==
+               !OperatingSystem.IsMacOS(),
+            "compute path tracing availability disagrees with the OpenGL 4.3 platform requirement");
         Assert(RenderBackendCatalog.IsImplemented(RenderBackendKind.HardwareRayTracing) ==
                DxrHardwareRenderer.IsSupported(out _),
             "hardware ray tracing catalog availability disagrees with the DXR capability probe");
