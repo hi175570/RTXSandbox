@@ -29,6 +29,9 @@
     <Compile Remove="RTXSandbox.ModAPI\**\*.cs" />
     <Compile Remove="Examples\**\*.cs" />
     <Compile Remove="RTXSandbox.Android\**\*.cs" />
+    <!-- Local screenshots, APK inspection and validation harnesses live here;
+         they are artifacts, never part of the desktop game's source set. -->
+    <Compile Remove="build\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -13,9 +13,14 @@
 | 已有水格再次倒水 | ✅ **【已完成並自測】** | 桌面、Build Tool 與 Android 都允許以水對準已有水格再次倒入；每桶增加 16 單位，滿格溢出會交給既有守恆流水向鄰格分配。91/91 self-tests 驗證第二桶可接受且總量 32 不消失。 |
 | Physics 模擬開關 | ✅ **【已完成並操作驗證】** | 桌面與 Android 均可暫停／恢復物理模擬；關閉只凍結既有 Physics Grid，不刪除或重設位置。91/91 self-tests 覆蓋停用後位置保持與恢復後繼續下落；VM 設定頁已實際切換並恢復預設開啟。 |
 | Android 中文字形 | ✅ **【已完成並在 VM 顯示】** | 設定頁使用的繁中／簡中完整句子與標點已納入 glyph corpus；`build/validation/emulator-gameplay-settings-final2.png` 未再出現缺字 `?`。 |
+| 語言名稱自稱 | ✅ **【已完成並在 VM 顯示】** | 共用語言頁固定以該語言自己的文字顯示 `繁體中文`、`简体中文`、`English`，不受目前介面語言影響；`build/validation/android-language-autonyms.png` 已在 API 30 VM 顯示三項。 |
+| Android 104 鍵與長按破壞 | ✅ **【已完成－VM 操作驗證】** | 觸控按鈕可綁定標準 104 鍵 PC 鍵盤命名空間；右側空白視角區停留 360 ms 會開始 LMB 長按破壞，移動超過 28 px 則取消以保留視角拖曳。原 LMB／RMB 按鈕沒有移除；同視角 ADB 長按前後截圖確認準星前草方塊被移除。 |
+| Android Mod runtime V1 | 🟡 **【正式可執行／非桌面完全等價】** | APK 內啟動 BepInEx 6 CoreCLR；因 BepInEx Cecil 掃描無法解析 APK 組件，Android managed-plugin adapter 以 `BasePlugin`／`BepInPlugin` 正式建立插件、Log、Config 與 Harmony。Android 主要插件根目錄改為公開的 `Documents/RTXSandbox/Mods/`；玩家授予一次資料夾權限後可直接放入模組資料夾及相依 DLL，遊戲不搬移或刪除原始檔，SAF 單 DLL 匯入僅是可選入口。Release x64 已從該公開目錄實際載入 `RTXSandbox.ExampleMod.dll`，註冊 `examplemod:signal_block` 並收到 `WorldReady`。依賴拓撲排序、隔離式 AssemblyLoadContext、Hot Reload 與 RuntimeDetour 相容性仍未完成。 |
+| Android 共用材質／Renderer 區分 | ✅ **【V1 已在同一 VM 世界逐條出圖】** | Classic、PBR Forward、Deferred、Hybrid 都讀取共用 color/detail atlas、top／side／bottom face 與 emission。Classic 是貼圖 Lambert；PBR Forward 是 GGX；Deferred 建 MRT G-buffer 後做深度 AO／PBR lighting；Hybrid 加強環境反射；Compute PT 仍走 GLES 3.1 compute voxel ray tracing。`android-deferred-final.png`、`android-hybrid-final.png`、`android-compute-final.png` 均無 shader／FBO／FATAL。完整桌面效果仍見下方限制。 |
+| Android 設定核心頁籤 | ✅ **【已恢復並在 VM 操作】** | Android 設定改回與 PC 同名的「畫面／時間與光照／控制與介面」，另保留平台專用「觸控」。顯示距離、FOV、日夜循環、日長、視角靈敏度、建造距離、飛行／穿牆、物理開關、按鍵入口與立即保存均接到實際狀態並持久化適用項目；時間亦會影響 Classic／PBR／Deferred／Hybrid／Compute 的亮度並寫入世界存檔。VM 截圖 `android-settings-tabs.png` 與 `android-settings-time-lighting-final2.png` 證明頁籤和內容實際顯示；完整桌面 Renderer 進階設定仍是後續項。 |
 | Android 局部更新延遲 | 🟡 **【已改善／未達效能目標】** | 互動 mesh 更新由固定 80 ms 節流改為 60 Hz 排程；直接放置／挖除可立即要求更新，初次可見 Chunk 也改為最近一個同步、其餘逐個背景建立。VM 1920×1080 實測約 46–57 FPS，仍未達 100／120 FPS，不能標示為效能完成。 |
 | Android 四 ABI | ✅ **【封裝完成／x86 實際執行】** | `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 均有同版本 `libcimgui.so`，ELF LOAD alignment 為 0x4000 且不依賴 `libc++_shared.so`。已修正 32 位 `ImTextureID` ABI 錯位；x86 signed APK 在 `emulator-5554` 實際載入共用 ImGui、世界與 Classic，穩態約 57–61 FPS且無 FATAL／OverflowException。ARMv7 只標記建置與封裝驗證。 |
-| 建置與執行 | ✅ **【本輪已驗證】** | Android x64 Debug／Release 與四 ABI Release publish 均可產生 APK；x86 signed APK 已用 `adb -s emulator-5554 install -r` 覆蓋安裝並啟動。Release UI、物品欄、設定、物理開關及五條非 DXR Renderer 均在 VM 操作。 |
+| 建置與執行 | ✅ **【本輪已驗證】** | Android x64 Debug／Release 及 x86／ARM64／ARMv7 Release 均產生 signed APK；x64 signed APK 已用 `adb -s emulator-5554 install -r` 覆蓋安裝並啟動。x64／x86 為 0 warnings／0 errors；ARM64／ARMv7 各保留 1 個真實 MonoMod／RuntimeDetour 不支援警告而非隱藏。Release UI、Mod、長按破壞及五條非 DXR Renderer 已在 VM 操作。 |
 | 完整 Android／桌面畫質一致 | 🟡 **【部分完成】** | 主選單、暫停、設定、物品欄、世界與輸入使用共用資料與同款 ImGui；Hardware DXR 維持 Windows-only。Android 尚缺桌面完整點／聚光陰影、反射、體積霧／煙霧、完整水材質與全部 Renderer 高階設定，不能宣稱 100% 一致。 |
 | 遠端 GitHub Actions | 🟡 **【已取得新失敗證據並續修】** | Run 31294267313 的 Ubuntu／macOS build 成功，但 `dotnet run --no-build` 立即失敗；WSL 重現證明專案把跨平台 `RunCommand` 硬編成 `RTXSandbox.exe`。現已依 Windows／Unix 選擇根目錄 apphost，並保留 .NET 9＋6、Node 24 官方 Actions、Android SDK 明確失敗與四 ABI publish；最終狀態仍以修正 push 後的新 run 為準。 |
 | DLSS／FSR 補幀 | ⛔ **【未假實作】** | 目前最終呈現仍是 OpenGL；DXR 的 D3D12 結果會 readback 再上傳 OpenGL。正式 DLSS Frame Generation／FSR Frame Generation 需要 D3D12 或 Vulkan presentation、motion vectors、depth 與 UI-less color 等輸入，不能用一個 OpenGL 設定開關冒充。需先建立共用 D3D12／Vulkan present 路徑，本輪只記錄阻塞，不標完成。 |
@@ -27,13 +32,13 @@
 | 項目 | 狀態 | 驗證證據／限制 |
 |---|---|---|
 | 共用 UI 畫面層 | ✅ **【已完成－第一階段】** | 新增 `SharedImGuiScreens`；Windows 與 Android 的暫停選單、成就列表、語言頁直接呼叫同一份 ImGui 程式碼，不再各維護一份相似畫面。平台 Host 只處理 callback、保存與輸入。 |
-| Android 暫停選單 | ✅ **【已完成並實際顯示】** | 與 PC 共用 8 鍵排列、尺寸、色彩與返回流程；Android 只在獨立分隔區增加「編輯觸控」。BepInEx Mod runtime 尚未接入，因此同位置 Mod 按鈕明確停用。API 30 x64 VM 截圖確認繁中正常且無 FATAL。 |
-| Android 物品欄／建造工具 | ✅ **【可運作版】** | 改為 PC 同款 `RTX Sandbox Editor`、`Blocks / Tools` 頁籤、九格快捷欄、搜尋、排序後材質卡片與精密格線選項；ADB `E` 實際開啟並顯示 199 個材質。Android 卡片目前以材質 Albedo 顯示，桌面程序材質縮圖仍待 GLES atlas UI texture 接入。 |
+| Android 暫停選單 | ✅ **【已完成並實際顯示】** | 與 PC 共用 8 鍵排列、尺寸、色彩與返回流程；Android 只在獨立分隔區增加「編輯觸控」。Mod 按鈕已啟用並開啟實際 BepInEx 插件頁；API 30 x64 VM 截圖確認繁中正常且無 FATAL。 |
+| Android 物品欄／建造工具 | ✅ **【可運作版】** | 改為 PC 同款 `RTX Sandbox Editor`、`Blocks / Tools` 頁籤、九格快捷欄、搜尋、排序後材質卡片與精密格線選項；ADB `E` 實際開啟並顯示 199 個材質。卡片與遊戲場景均已綁定共用程序材質 atlas；更複雜的桌面後處理縮圖仍未逐效果對等。 |
 | Android 設定 | 🟡 **【版面一致／Renderer V1 已接入】** | 使用 PC 的 `RTX Sandbox 設定` 視窗、三頁籤及同一藍色 ImGui style。Classic／PBR 可用；Deferred／Hybrid 是 GLES 3 MRT／multi-pass；Compute 是 GLES 3.1 compute voxel ray tracing。Hardware DXR 明確維持 Windows-only。Android 系統 Surface 控制的解析度／VSync與全部桌面高階細項尚未接入。 |
 | 主選單與世界管理 | ✅ **【可運作版並實際驗證】** | Android 已採 PC 的置中主選單，並接入世界建立、載入、同 Seed 重建、重新命名、刪除及設定／語言入口。API 30 VM 實際建立 `New World`、切回 `world1`、刪除測試世界；最後只剩原 `world1`，沒有留下垃圾世界。 |
 | 外接鍵盤改鍵 | ✅ **【已完成並實際重啟驗證】** | Android 按鍵頁可點選動作後捕捉下一個實體鍵，支援重設與持久化。VM 把前進從 W 改成 Q，UI 即時顯示 Q，SharedPreferences 為 `Keyboard:W -> Q`；強制停止／重啟後資料仍保留。 |
 | 背景／離開保存 | ✅ **【已完成並實際驗證】** | `OnPause` 不再在 Activity 主執行緒同步寫 Region；改為可合併的背景保存工作，避免已復現的 5 秒 ANR。舊世界 `level.json` 時間戳由 `1786154324 → 1786154582`，程序存活且無 ANR／FATAL。離開世界仍在切回主選單前完成保存。 |
-| 建置與回歸 | ✅ **【已完成】** | Windows Debug／Release、Android x64 Debug／Release、Android ARM64 Release 均 `0 warnings / 0 errors`；Windows 91/91 self-tests 通過。x64 APK 覆蓋安裝保留資料，共用 UI／世界管理／五條 Android Renderer 無 `AndroidRuntime` FATAL。 |
+| 建置與回歸 | ✅ **【已完成／ARM 警告已揭露】** | Windows Debug／Release與 Android x64 Debug／Release 均 `0 warnings / 0 errors`；Windows 91/91 self-tests 通過。Android ARM64／ARMv7 Release 可產生 signed APK，但加入 BepInEx 後各有 1 個 MonoMod／RuntimeDetour 平台不支援警告，不能再寫成零警告。x64 APK 覆蓋安裝保留資料，共用 UI／Mod／世界管理／五條 Android Renderer 無 `AndroidRuntime` FATAL。 |
 
 ## 本輪：Android 共用世界內容、物理與局部串流（2026-08-08）
 

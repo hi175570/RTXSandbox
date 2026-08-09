@@ -292,7 +292,7 @@ Emission 不只改變方塊自身顏色。Raster 管線建立有限數量的發�
 
 設定畫面的完成按鈕會回到上一層暫停選單；Mod 不再混在設定頁。再次按 ESC 會儲存並關閉暫停選單，視窗失去焦點時會自動開啟暫停選單。桌面中文輸入使用 IME composition，避免組字跑到左上角或中文輸入造成操作焦點卡住。
 
-Android 已有觸控虛擬按鍵、八方向 D-pad／搖桿配置、跳躍、蹲下、左右鍵、快捷列、物品庫，以及可在遊戲內重新綁定並保存的外接鍵盤輸入。桌面與 Android 直接共用 `SharedImGuiScreens` 的暫停、成就與語言畫面；Android Editor 使用與 PC 相同的 `Blocks / Tools`、九格快捷欄、搜尋與材質卡片排列，設定使用相同三頁籤與配色。觸控編輯是 Android 唯一額外的暫停選單區塊。Android 也已接入世界建立、載入、重新命名、同 Seed 重建與刪除；Mod runtime 與所有桌面進階 Renderer 細項仍待接入，詳見「[Android](#android)」。
+Android 已有觸控虛擬按鍵、八方向 D-pad／搖桿配置、跳躍、蹲下、左右鍵、長按畫面破壞、快捷列、物品庫，以及可在遊戲內重新綁定並保存的外接鍵盤輸入；觸控按鈕可選完整標準 104 鍵名稱。桌面與 Android 直接共用 `SharedImGuiScreens` 的暫停、成就與語言畫面，語言清單以 `繁體中文／简体中文／English` 自稱顯示；Android Editor 使用與 PC 相同的 `Blocks / Tools`、九格快捷欄、搜尋與材質卡片排列。Android 設定恢復 PC 的「畫面／時間與光照／控制與介面」核心頁籤，另加「觸控」；顯示距離、FOV、日夜循環、日長、靈敏度、建造距離、飛行／穿牆、物理開關與保存均接入實際狀態。Android 也已接入世界管理與可實際執行 `BasePlugin` 的 Mod runtime V1；完整桌面 BepInEx 等價能力與所有 Renderer 進階細項仍待接入，詳見「[Android](#android)」。
 
 ## 存檔與世界管理
 
@@ -355,7 +355,7 @@ BepInEx/plugins/
 | Linux（Ubuntu／WSL） | x64 | 87/87 self-tests；Mesa／Xvfb GL 4.3 下 Classic、PBR、Deferred、Hybrid、Compute smoke；BepInEx `Started: True` | 五條 OpenGL Renderer；無 D3D12 DXR | **實際驗證** |
 | Linux | ARM64 | self-contained 發行檔在 QEMU AArch64 通過 87/87 self-tests | 尚無 ARM64 GPU 畫面；Mod hook 有限制 | **核心驗證** |
 | macOS | x64／ARM64 | 兩種 RID 可跨編譯，已有 OpenGL 4.1／GLSL 410 fallback | 沒有 Apple 實機；Compute PT 需要 GL 4.3 因而停用；無 DXR | **跨編譯** |
-| Android 11+ | x64／x86 | API 30 Emulator 實際覆蓋安裝、舊世界存讀、完整世界管理、流水、Micro Voxel、Physics Grid、觸控／可編輯外接輸入、共用 UI，以及 Classic／PBR／Deferred／Hybrid／Compute；x86 也已實際載入 ImGui 與世界 | host-GPU GLES 3.1 VM 中 Classic 約 58–60 FPS，Compute 可持續出圖；Hardware DXR 不可用；Mod runtime 與完整桌面 Renderer 細項尚未接入 | **V1 可玩／持續接入** |
+| Android 11+ | x64／x86 | API 30 Emulator 實際覆蓋安裝、舊世界存讀、完整世界管理、流水、Micro Voxel、Physics Grid、觸控／可編輯外接輸入、共用 UI，以及 Classic／PBR／Deferred／Hybrid／Compute；x64 Debug／Release 亦實際執行 Example Mod | Hardware DXR 不可用；Mod runtime V1 可載入 `BasePlugin`，但依賴隔離／Hot Reload 與完整桌面 Renderer 細項尚未接入；本輪雙 VM 下量測不沿用早期 58–60 FPS 作新結論 | **V1 可玩／持續接入** |
 | Android 8+ | ARM64／ARMv7 | 兩種 Release APK 都封裝共用世界、流水、Micro Voxel、BEPU Physics Grid、輸入及 16 KB 對齊 ImGui native library | 本輪遵照要求只使用模擬器；ARM64／ARMv7 尚無新的實機執行證據，不能宣稱真機畫面、效能及多點觸控完成 | **建置封裝完成／真機待驗證** |
 | iOS／iPadOS | ARM64 | 無正式 target | 尚未處理 Metal、簽名、觸控 Host 與發佈 | **未支援** |
 
@@ -379,19 +379,21 @@ Android 專案不是獨立世界 Demo：它直接 link／重用 `World`、`Playe
 - 相同世界生成、Region save、玩家與快捷列資料。
 - Classic GLES、PBR Forward GLES、GLES 3 MRT Deferred、Hybrid PBR Raster，以及 GLES 3.1 Compute Path Tracing V1。
 - 可編輯虛擬按鍵 Profile、八方向 D-pad 或搖桿。
-- 跳躍、Shift 蹲下、Ctrl＋前進／連按兩次前進衝刺、移動、左右鍵、V／B、物品庫與快捷列。
+- 跳躍、Shift 蹲下、Ctrl＋前進／連按兩次前進衝刺、移動、左右鍵、右側畫面長按破壞、V／B、物品庫與快捷列；獨立 LMB／RMB 鍵仍保留。
 - 外接鍵盤、滑鼠與 Gamepad 事件映射；外接鍵盤綁定可在 ImGui 頁面捕捉、重設並跨重啟保存。
+- 觸控按鈕綁定選單提供標準 104 鍵 PC 鍵盤名稱；按鍵標籤使用 `ESC／SHF／SPC／LMB／RMB` 等原始名稱或短寫。
 - App 失去焦點時釋放輸入、開啟暫停，並以合併式背景工作保存目前世界，避免在 Activity 主執行緒等待 Region I/O。
-- GLES 上的 Dear ImGui 暫停、物品欄、建造工具、Renderer、繁中／簡中／英文語言與成就列表；觸控編輯器只由暫停選單開啟。
+- GLES 上的 Dear ImGui 暫停、物品欄、建造工具、Renderer、繁中／簡中／英文語言與成就列表；語言名稱固定以各自語言顯示，觸控編輯器只由暫停選單開啟。
 - Android 主選單可建立、載入、同 Seed 重建、重新命名及刪除世界；離開世界會先保存再返回主選單。
+- BepInEx 6 CoreCLR 與 Android managed-plugin adapter；授予一次模組資料夾權限後，玩家可把模組及相依 DLL 直接放入公開的 `Documents/RTXSandbox/Mods/`，重新啟動後由該目錄載入。Mod 頁會顯示實際路徑與已載入插件；系統檔案選擇器僅保留為可選的單 DLL 匯入方式。Release x64 已用直接放置流程實際載入 Example Mod、註冊方塊並接收 `WorldReady`。
 
 尚未完成：
 
-- 將桌面的 Mod 管理與所有進階 Renderer 設定接到 Android GLES Host。
+- 將全部桌面 Renderer 進階設定接到 Android GLES Host。
 - Hardware DXR 是 Windows D3D12 專用，不在 Android 以其他 API 冒充。Android Compute V1 尚未包含 Micro Voxel／Physics Grid 的解析求交與完整透明折射語意。
 - Micro Voxel／Physics Grid 的 V1 顯示、放置、刪除與 BEPU 模擬已接入；仍需真機多點觸控、長時間壓測與所有桌面編輯工具的一致性複驗。
 - ARM64 實機效能、記憶體與所有 ABI 的最終驗證。
-- Android Mod runtime 與桌面 BepInEx 等價能力。
+- Android Mod runtime 尚未達桌面 BepInEx 完整等價：依賴拓撲排序、隔離式 AssemblyLoadContext、Hot Reload 與 RuntimeDetour 類 Mod 仍需逐項驗證。
 `libcimgui.so` 的 x64、x86、ARM64 與 ARMv7 版本已以靜態 C++ runtime 重新連結，ELF `LOAD` alignment 均為 `0x4000`，符合 16 KB page-size；32 位版本另固定使用與 ImGui.NET 相同的 pointer-sized `ImTextureID` ABI。四種 Release APK 都能產生，x86 已在 API 30 VM 實際顯示共用 ImGui；ARMv7 目前只有建置／封裝證據。這代表核心 ImGui 已正式接入，但不代表所有桌面頁面都已移植。Android 專用建置說明見 [RTXSandbox.Android/README.md](RTXSandbox.Android/README.md)。
 
 ### macOS、Linux 與 ARM64
@@ -658,7 +660,7 @@ RTXsandbox/
 
 以下內容不是「名稱已有所以完成」，而是目前仍需後續工作的明確邊界：
 
-- Android 的流水、Micro Voxel、Physics Grid、世界管理、共用核心 ImGui 與五條非 DXR Renderer V1 已接入；尚未具備 Windows-only Hardware DXR、BepInEx Mod runtime、全部桌面進階設定與 Compute 的完整透明／精密幾何一致性。
+- Android 的流水、Micro Voxel、Physics Grid、世界管理、共用核心 ImGui、五條非 DXR Renderer V1 與可執行 BasePlugin 的 Mod runtime V1 已接入；尚未具備 Windows-only Hardware DXR、桌面 BepInEx 的完整依賴隔離／Hot Reload 對等、全部桌面進階設定與 Compute 的完整透明／精密幾何一致性。
 - macOS 只有跨編譯與 fallback 程式碼，尚無 Apple 實機啟動證據。
 - Windows／Linux ARM64 的 GPU 與 Mod hook 尚未完整實機驗證。
 - DXR 只有 Windows D3D12；其他平台不會以 Compute PT 冒充 Hardware RT。

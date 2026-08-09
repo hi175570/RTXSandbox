@@ -1,6 +1,9 @@
 using System.Reflection;
 using BepInEx;
 using BepInEx.NET.Common;
+using BepInEx.Configuration;
+using BepInEx.Logging;
+using HarmonyLib;
 using RTXSandbox.Infrastructure;
 
 namespace RTXSandbox.Modding;
@@ -11,7 +14,16 @@ public static class BepInExBootstrap
 
     public static bool Started { get; private set; }
     public static string? FailureMessage { get; private set; }
-    public static string PluginDirectory => Path.Combine(RuntimePaths.OutputRoot, "BepInEx", "plugins");
+    public static string PluginDirectory
+    {
+        get
+        {
+            string? explicitRoot = Environment.GetEnvironmentVariable("RTX_SANDBOX_PLUGIN_ROOT");
+            return string.IsNullOrWhiteSpace(explicitRoot)
+                ? Path.Combine(RuntimePaths.OutputRoot, "BepInEx", "plugins")
+                : Path.GetFullPath(explicitRoot);
+        }
+    }
     public static string ConfigDirectory => Path.Combine(RuntimePaths.OutputRoot, "BepInEx", "config");
     public static IReadOnlyList<LoadedPluginInfo> LoadedPlugins { get; private set; } = Array.Empty<LoadedPluginInfo>();
     public static IReadOnlyList<string> DependencyErrors { get; private set; } = Array.Empty<string>();
@@ -27,8 +39,8 @@ public static class BepInExBootstrap
         {
             Directory.CreateDirectory(PluginDirectory);
             Directory.CreateDirectory(ConfigDirectory);
-            string gameAssemblyPath = Assembly.GetEntryAssembly()?.Location
-                ?? throw new InvalidOperationException("The game entry assembly path is unavailable.");
+            string entryName = Assembly.GetEntryAssembly()?.GetName().Name ?? "RTXSandbox";
+            string gameAssemblyPath = Path.Combine(AppContext.BaseDirectory, $"{entryName}.dll");
             string executablePath = Path.ChangeExtension(gameAssemblyPath, ".exe");
             if (!File.Exists(executablePath))
             {
@@ -51,6 +63,8 @@ public static class BepInExBootstrap
                     plugin.Dependencies.Select(dependency => dependency.DependencyGUID).ToArray(),
                     plugin.Instance as BasePlugin))
                 .ToArray();
+            if (OperatingSystem.IsAndroid())
+                LoadedPlugins = LoadAndroidPlugins(LoadedPlugins);
             DependencyErrors = _chainloader.DependencyErrors
                 .Concat(FindUnloadedPluginErrors(LoadedPlugins))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -65,6 +79,66 @@ public static class BepInExBootstrap
             FailureMessage = exception.ToString();
             Console.Error.WriteLine($"BepInEx startup failed; the base game will continue without plugins:\n{exception}");
         }
+    }
+
+    private static IReadOnlyList<LoadedPluginInfo> LoadAndroidPlugins(
+        IReadOnlyList<LoadedPluginInfo> chainloaderPlugins)
+    {
+        var loaded = chainloaderPlugins.ToList();
+        var loadedPaths = loaded.Select(plugin => Path.GetFullPath(plugin.Location))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        FieldInfo logField = typeof(BasePlugin).GetField("<Log>k__BackingField",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(typeof(BasePlugin).FullName, "Log");
+        FieldInfo configField = typeof(BasePlugin).GetField("<Config>k__BackingField",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(typeof(BasePlugin).FullName, "Config");
+
+        foreach (string pluginPath in Directory.EnumerateFiles(PluginDirectory, "*.dll", SearchOption.AllDirectories))
+        {
+            string fullPath = Path.GetFullPath(pluginPath);
+            if (loadedPaths.Contains(fullPath)) continue;
+            try
+            {
+                Assembly assembly = Assembly.LoadFrom(fullPath);
+                foreach (Type pluginType in assembly.GetTypes()
+                             .Where(type => !type.IsAbstract && typeof(BasePlugin).IsAssignableFrom(type)))
+                {
+                    BepInPlugin metadata = pluginType.GetCustomAttribute<BepInPlugin>()
+                        ?? throw new InvalidOperationException(
+                            $"{pluginType.FullName} inherits BasePlugin but has no BepInPlugin attribute.");
+                    if (loaded.Any(plugin => plugin.Guid.Equals(metadata.GUID, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+
+                    BasePlugin instance = (BasePlugin)(Activator.CreateInstance(pluginType)
+                        ?? throw new InvalidOperationException($"Could not create {pluginType.FullName}."));
+                    ManualLogSource log = Logger.CreateLogSource(metadata.Name);
+                    string configPath = Path.Combine(ConfigDirectory, $"{metadata.GUID}.cfg");
+                    var config = new ConfigFile(configPath, saveOnInit: true, metadata);
+                    logField.SetValue(instance, log);
+                    configField.SetValue(instance, config);
+                    instance.HarmonyInstance = new Harmony(metadata.GUID);
+                    instance.Load();
+                    string[] dependencies = pluginType.GetCustomAttributes<BepInDependency>()
+                        .Select(dependency => dependency.DependencyGUID)
+                        .ToArray();
+                    loaded.Add(new LoadedPluginInfo(
+                        metadata.GUID,
+                        metadata.Name,
+                        metadata.Version.ToString(),
+                        fullPath,
+                        dependencies,
+                        instance));
+                    loadedPaths.Add(fullPath);
+                    log.LogInfo("Loaded through the Android managed-plugin adapter.");
+                }
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"[Android mod load error] {Path.GetFileName(fullPath)}: {exception}");
+            }
+        }
+        return loaded.OrderBy(plugin => plugin.Name, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
     // BepInEx build 785 calls MonoMod.Utils.PlatformHelper from Paths and

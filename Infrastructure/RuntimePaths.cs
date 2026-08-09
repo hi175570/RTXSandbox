@@ -9,6 +9,9 @@ public static class RuntimePaths
 
     private static string ResolveOutputRoot()
     {
+        string? explicitRoot = Environment.GetEnvironmentVariable("RTX_SANDBOX_OUTPUT_ROOT");
+        if (!string.IsNullOrWhiteSpace(explicitRoot))
+            return Path.GetFullPath(explicitRoot);
         var managed = new DirectoryInfo(ManagedDirectory);
         return managed.Name.Equals("Managed", StringComparison.OrdinalIgnoreCase) && managed.Parent is not null
             ? managed.Parent.FullName

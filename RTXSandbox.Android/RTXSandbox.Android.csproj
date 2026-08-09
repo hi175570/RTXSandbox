@@ -23,13 +23,18 @@
   <ItemGroup>
     <ProjectReference Include="..\RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj" />
     <PackageReference Include="BepuPhysics" Version="2.4.0" />
+    <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" />
+    <PackageReference Include="HarmonyX" Version="2.16.1" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" ExcludeAssets="native;build" />
     <Compile Include="..\World\*.cs" Link="Shared\World\%(Filename)%(Extension)" />
     <Compile Include="..\Gameplay\PlayerController.cs" Link="Shared\Gameplay\PlayerController.cs" />
     <Compile Include="..\Gameplay\Camera.cs" Link="Shared\Gameplay\Camera.cs" />
+    <Compile Include="..\Gameplay\WorldClock.cs" Link="Shared\Gameplay\WorldClock.cs" />
     <Compile Include="..\Gameplay\CreativeHotbar.cs" Link="Shared\Gameplay\CreativeHotbar.cs" />
     <Compile Include="..\Gameplay\CreativePaletteOrdering.cs" Link="Shared\Gameplay\CreativePaletteOrdering.cs" />
     <Compile Include="..\Gameplay\ItemRegistry.cs" Link="Shared\Gameplay\ItemRegistry.cs" />
+    <Compile Include="..\Gameplay\RecipeRegistry.cs" Link="Shared\Gameplay\RecipeRegistry.cs" />
+    <Compile Include="..\Gameplay\BuildToolRegistry.cs" Link="Shared\Gameplay\BuildToolRegistry.cs" />
     <Compile Include="..\Gameplay\PlayerInventory.cs" Link="Shared\Gameplay\PlayerInventory.cs" />
     <Compile Include="..\Gameplay\GameActions.cs" Link="Shared\Gameplay\GameActions.cs" />
     <Compile Include="..\Gameplay\MicroBuildSystem.cs" Link="Shared\Gameplay\MicroBuildSystem.cs" />
@@ -43,6 +48,8 @@
     <Compile Include="..\Infrastructure\RuntimePaths.cs" Link="Shared\Infrastructure\RuntimePaths.cs" />
     <Compile Include="..\Infrastructure\FrameWorkBudget.cs" Link="Shared\Infrastructure\FrameWorkBudget.cs" />
     <Compile Include="..\Infrastructure\Platform\PlatformServices.cs" Link="Shared\Infrastructure\PlatformServices.cs" />
+    <Compile Include="..\Modding\BepInExBootstrap.cs" Link="Shared\Modding\BepInExBootstrap.cs" />
+    <Compile Include="..\Modding\ModHost.cs" Link="Shared\Modding\ModHost.cs" />
     <Compile Include="..\Persistence\WorldSaveService.cs" Link="Shared\Persistence\WorldSaveService.cs" />
     <Compile Include="..\Rendering\ProceduralMaterialAtlas.cs" Link="Shared\Rendering\ProceduralMaterialAtlas.cs" />
     <AndroidAsset Include="..\Content\Base\**\*.json">

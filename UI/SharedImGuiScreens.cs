@@ -133,9 +133,11 @@ public static class SharedImGuiScreens
         if (ImGui.Begin(text("language_title"), ref open,
                 ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
         {
-            changed |= LanguageChoice(UiLanguage.TraditionalChinese, text("traditional_chinese"), ref language);
-            changed |= LanguageChoice(UiLanguage.SimplifiedChinese, text("simplified_chinese"), ref language);
-            changed |= LanguageChoice(UiLanguage.English, text("english"), ref language);
+            // Language names are autonyms so this recovery screen remains
+            // understandable even when the current UI language is unfamiliar.
+            changed |= LanguageChoice(UiLanguage.TraditionalChinese, "繁體中文", ref language);
+            changed |= LanguageChoice(UiLanguage.SimplifiedChinese, "简体中文", ref language);
+            changed |= LanguageChoice(UiLanguage.English, "English", ref language);
             ImGui.Spacing();
             ImGui.TextWrapped(language switch
             {

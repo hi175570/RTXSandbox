@@ -13,6 +13,7 @@ public enum AndroidGameUiMode
     Achievements,
     Language,
     Controls,
+    Mods,
     TouchEditor,
 }
 

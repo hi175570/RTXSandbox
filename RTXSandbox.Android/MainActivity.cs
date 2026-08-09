@@ -10,6 +10,11 @@ using System.Text.Json;
 using RTXSandbox.Android.Game;
 using RTXSandbox.Android.TouchControls;
 using RTXSandbox.Infrastructure.Platform;
+using RTXSandbox.Modding;
+
+[assembly: UsesPermission(Name = global::Android.Manifest.Permission.ReadExternalStorage, MaxSdkVersion = 32)]
+[assembly: UsesPermission(Name = global::Android.Manifest.Permission.WriteExternalStorage, MaxSdkVersion = 29)]
+[assembly: UsesPermission(Name = "android.permission.MANAGE_EXTERNAL_STORAGE")]
 
 namespace RTXSandbox.Android;
 
@@ -26,11 +31,25 @@ namespace RTXSandbox.Android;
     Theme = "@android:style/Theme.Material.NoActionBar.Fullscreen")]
 public sealed class MainActivity : Activity
 {
+    private const int ImportModRequestCode = 7301;
+    // Standard 104-key PC layout. Touch buttons may target every key instead
+    // of being limited to the handful used by the base game; this also leaves
+    // the full keyboard namespace available to mods.
     private static readonly string[] KeyboardBindings =
     {
-        "W", "A", "S", "D", "Space", "Shift", "Ctrl", "E", "Q", "F", "V", "B",
-        "Escape", "Tab", "Up", "Down", "Left", "Right",
-        "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        "Escape",
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        "PrintScreen", "ScrollLock", "Pause",
+        "Grave", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "Minus", "Equals", "Backspace",
+        "Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "LeftBracket", "RightBracket", "Backslash",
+        "CapsLock", "A", "S", "D", "F", "G", "H", "J", "K", "L", "Semicolon", "Apostrophe", "Enter",
+        "ShiftLeft", "Z", "X", "C", "V", "B", "N", "M", "Comma", "Period", "Slash", "ShiftRight",
+        "CtrlLeft", "MetaLeft", "AltLeft", "Space", "AltRight", "MetaRight", "Menu", "CtrlRight",
+        "Insert", "Home", "PageUp", "Delete", "End", "PageDown", "Up", "Left", "Down", "Right",
+        "NumLock", "NumpadDivide", "NumpadMultiply", "NumpadSubtract",
+        "Numpad7", "Numpad8", "Numpad9", "NumpadAdd",
+        "Numpad4", "Numpad5", "Numpad6",
+        "Numpad1", "Numpad2", "Numpad3", "NumpadEnter", "Numpad0", "NumpadDecimal",
     };
 
     private static readonly string[] MouseBindings = { "Left", "Right", "Middle", "WheelUp", "WheelDown" };
@@ -56,6 +75,7 @@ public sealed class MainActivity : Activity
     private bool _replacingGameDialog;
     private bool _diagnosticSession;
     private AndroidGameUiMode _currentUiMode = AndroidGameUiMode.Gameplay;
+    private string _modDirectory = string.Empty;
 
     protected override void OnCreate(Bundle? savedInstanceState)
     {
@@ -75,6 +95,15 @@ public sealed class MainActivity : Activity
         }
 
         string filesDirectory = FilesDir?.AbsolutePath ?? AppContext.BaseDirectory;
+        string runtimeRoot = System.IO.Path.Combine(filesDirectory, "Runtime");
+        string documentsDirectory = global::Android.OS.Environment
+            .GetExternalStoragePublicDirectory(global::Android.OS.Environment.DirectoryDocuments)?.AbsolutePath
+            ?? System.IO.Path.Combine(filesDirectory, "Documents");
+        _modDirectory = System.IO.Path.Combine(documentsDirectory, "RTXSandbox", "Mods");
+        System.Environment.SetEnvironmentVariable("RTX_SANDBOX_OUTPUT_ROOT", runtimeRoot);
+        System.Environment.SetEnvironmentVariable("RTX_SANDBOX_PLUGIN_ROOT", _modDirectory);
+        Directory.CreateDirectory(runtimeRoot);
+        StartModRuntimeIfStorageIsAvailable();
         IPlatformStorage platformStorage = new DirectoryPlatformStorage(filesDirectory);
         _store = new TouchControlProfileStore(filesDirectory);
         TouchControlSelfTest.Run();
@@ -115,6 +144,8 @@ public sealed class MainActivity : Activity
             _gameSurface = new AndroidGameSurface(
                 this, _input, baseContent, contentPacks, platformStorage, UpdateStatus);
             _gameSurface.UiStateChanged += HandleGameUiState;
+            _gameSurface.ModImportRequested += BeginModImport;
+            _gameSurface.ModStorageAccessRequested += RequestModStorageAccess;
             root.AddView(_gameSurface, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
         }
@@ -170,8 +201,110 @@ public sealed class MainActivity : Activity
     protected override void OnResume()
     {
         base.OnResume();
+        StartModRuntimeIfStorageIsAvailable();
         _gameSurface?.OnResume();
     }
+
+    private bool HasModStorageAccess() => OperatingSystem.IsAndroidVersionAtLeast(30)
+        ? global::Android.OS.Environment.IsExternalStorageManager
+        : CheckSelfPermission(global::Android.Manifest.Permission.WriteExternalStorage) == Permission.Granted;
+
+    private void StartModRuntimeIfStorageIsAvailable()
+    {
+        if (!HasModStorageAccess() || string.IsNullOrWhiteSpace(_modDirectory)) return;
+        Directory.CreateDirectory(_modDirectory);
+        BepInExBootstrap.Start();
+    }
+
+    private void RequestModStorageAccess()
+    {
+        RunOnUiThread(() =>
+        {
+            if (HasModStorageAccess())
+            {
+                StartModRuntimeIfStorageIsAvailable();
+                Toast.MakeText(this, $"模組目錄已可使用：{_modDirectory}", ToastLength.Long)?.Show();
+                return;
+            }
+
+            if (OperatingSystem.IsAndroidVersionAtLeast(30))
+            {
+                var intent = new Intent(global::Android.Provider.Settings.ActionManageAppAllFilesAccessPermission);
+                intent.SetData(global::Android.Net.Uri.Parse($"package:{PackageName}"));
+                StartActivity(intent);
+                return;
+            }
+
+            RequestPermissions(new[]
+            {
+                global::Android.Manifest.Permission.ReadExternalStorage,
+                global::Android.Manifest.Permission.WriteExternalStorage,
+            }, 7302);
+        });
+    }
+
+    private void BeginModImport()
+    {
+        if (!HasModStorageAccess())
+        {
+            Toast.MakeText(this, "請先授予模組目錄的檔案存取權。", ToastLength.Long)?.Show();
+            RequestModStorageAccess();
+            return;
+        }
+        RunOnUiThread(() =>
+        {
+            var intent = new Intent(Intent.ActionOpenDocument);
+            intent.AddCategory(Intent.CategoryOpenable);
+            // DocumentsUI reports managed DLLs inconsistently (including the
+            // generic "COM file" type on API 30). Do not filter by MIME here;
+            // the selected filename is strictly checked for .dll below.
+            intent.SetType("*/*");
+            StartActivityForResult(intent, ImportModRequestCode);
+        });
+    }
+
+#pragma warning disable CS0672
+    protected override void OnActivityResult(int requestCode, Result resultCode, Intent? data)
+    {
+        base.OnActivityResult(requestCode, resultCode, data);
+        if (requestCode != ImportModRequestCode || resultCode != Result.Ok || data?.Data is null) return;
+        try
+        {
+            global::Android.Net.Uri uri = data.Data;
+            string fileName = "ImportedMod.dll";
+            using (global::Android.Database.ICursor? cursor = ContentResolver?.Query(uri, null, null, null, null))
+            {
+                if (cursor?.MoveToFirst() == true)
+                {
+                    int nameColumn = cursor.GetColumnIndex(global::Android.Provider.IOpenableColumns.DisplayName);
+                    if (nameColumn >= 0 && cursor.GetString(nameColumn) is { Length: > 0 } displayName)
+                        fileName = displayName;
+                }
+            }
+            fileName = string.Concat(fileName.Select(character =>
+                System.IO.Path.GetInvalidFileNameChars().Contains(character) ? '_' : character));
+            if (!fileName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("只允許匯入 .NET 模組 DLL。");
+
+            Directory.CreateDirectory(BepInExBootstrap.PluginDirectory);
+            string destination = System.IO.Path.Combine(BepInExBootstrap.PluginDirectory, fileName);
+            if (File.Exists(destination))
+                destination = System.IO.Path.Combine(BepInExBootstrap.PluginDirectory,
+                    $"{System.IO.Path.GetFileNameWithoutExtension(fileName)}-{DateTime.Now:yyyyMMdd-HHmmss}.dll");
+            using Stream source = ContentResolver?.OpenInputStream(uri)
+                ?? throw new IOException("無法讀取選取的 DLL。");
+            using FileStream target = File.Create(destination);
+            source.CopyTo(target);
+            Toast.MakeText(this, $"已匯入 {System.IO.Path.GetFileName(destination)}；重新啟動後載入。",
+                ToastLength.Long)?.Show();
+        }
+        catch (Exception exception)
+        {
+            Log.Error("RTXSandbox.ModImport", exception.ToString());
+            Toast.MakeText(this, $"模組匯入失敗：{exception.Message}", ToastLength.Long)?.Show();
+        }
+    }
+#pragma warning restore CS0672
 
     public override void OnWindowFocusChanged(bool hasFocus)
     {
@@ -744,8 +877,20 @@ public sealed class MainActivity : Activity
 
     private Button MakeButton(string text)
     {
-        var button = new Button(this) { Text = text, TextSize = 13f };
+        var button = new Button(this)
+        {
+            Text = text,
+            TextSize = 13f,
+            Elevation = 0f,
+        };
+        button.SetMinHeight(0);
+        button.SetMinWidth(0);
         button.SetAllCaps(false);
+        button.SetTextColor(Color.Rgb(242, 246, 250));
+        button.SetPadding(Dp(10), 0, Dp(10), 0);
+        button.BackgroundTintList = new global::Android.Content.Res.ColorStateList(
+            new[] { new[] { global::Android.Resource.Attribute.StatePressed }, Array.Empty<int>() },
+            new[] { Color.Rgb(61, 126, 171).ToArgb(), Color.Rgb(38, 51, 67).ToArgb() });
         return button;
     }
 

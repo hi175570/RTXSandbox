@@ -20,8 +20,12 @@ public sealed class TouchControlView : View
         public required int PointerId { get; init; }
         public required CaptureKind Kind { get; init; }
         public TouchControlDefinition? Control { get; init; }
+        public float StartX { get; init; }
+        public float StartY { get; init; }
         public float LastX { get; set; }
         public float LastY { get; set; }
+        public bool LongPressCancelled { get; set; }
+        public bool LongPressTriggered { get; set; }
     }
 
     private readonly Paint _fill = new(PaintFlags.AntiAlias);
@@ -35,6 +39,14 @@ public sealed class TouchControlView : View
         Label = "SHF",
         BindingKind = VirtualBindingKind.GameAction,
         Binding = "Crouch",
+    };
+    private readonly TouchControlDefinition _lookBreakControl = new()
+    {
+        Id = "look-long-press-break",
+        Type = TouchControlType.Button,
+        Label = "LMB",
+        BindingKind = VirtualBindingKind.Mouse,
+        Binding = "Left",
     };
     private TouchControlDefinition? _selected;
 
@@ -158,12 +170,12 @@ public sealed class TouchControlView : View
                     Input.IsDown(control.BindingKind, control.Binding);
         int alpha = (int)(Math.Clamp(editOpacity, 0f, 1f) * 255);
         _fill.Color = down
-            ? Color.Argb(alpha, 63, 160, 215)
-            : Color.Argb(alpha, 35, 52, 73);
+            ? Color.Argb(alpha, 62, 133, 180)
+            : Color.Argb(alpha, 31, 39, 50);
         _fill.SetStyle(Paint.Style.Fill);
         _stroke.Color = control == _selected
             ? Color.Rgb(255, 201, 71)
-            : Color.Argb(Math.Max(alpha, 110), 230, 239, 248);
+            : Color.Argb(Math.Max(alpha, 118), 224, 231, 238);
         _stroke.SetStyle(Paint.Style.Stroke);
         _stroke.StrokeWidth = control == _selected ? 5f : 2.5f;
 
@@ -183,7 +195,7 @@ public sealed class TouchControlView : View
         }
         else
         {
-            float corner = Math.Min(bounds.Width(), bounds.Height()) * 0.22f;
+            float corner = Math.Min(bounds.Width(), bounds.Height()) * 0.09f;
             canvas.DrawRoundRect(bounds, corner, corner, _fill);
             canvas.DrawRoundRect(bounds, corner, corner, _stroke);
         }
@@ -289,9 +301,26 @@ public sealed class TouchControlView : View
         {
             _captures[pointerId] = new PointerCapture
             {
-                PointerId = pointerId, Kind = CaptureKind.Look, LastX = x, LastY = y,
+                PointerId = pointerId,
+                Kind = CaptureKind.Look,
+                StartX = x,
+                StartY = y,
+                LastX = x,
+                LastY = y,
             };
+            PostDelayed(() => BeginLookLongPress(pointerId), 360L);
         }
+    }
+
+    private void BeginLookLongPress(int pointerId)
+    {
+        if (!_captures.TryGetValue(pointerId, out PointerCapture? capture) ||
+            capture.Kind != CaptureKind.Look || capture.LongPressCancelled || capture.LongPressTriggered)
+            return;
+        capture.LongPressTriggered = true;
+        Input.Press(_lookBreakControl);
+        PerformHapticFeedback(FeedbackConstants.LongPress);
+        Invalidate();
     }
 
     private void MovePointer(MotionEvent e, int index)
@@ -306,6 +335,9 @@ public sealed class TouchControlView : View
                 UpdateMovementControl(capture.Control, x, y);
                 break;
             case CaptureKind.Look:
+                if (!capture.LongPressTriggered &&
+                    DistanceSquared(x, y, capture.StartX, capture.StartY) > 28f * 28f)
+                    capture.LongPressCancelled = true;
                 Input.AddLookDelta(
                     (x - capture.LastX) * Profile.HorizontalLookSensitivity,
                     (y - capture.LastY) * Profile.VerticalLookSensitivity * (Profile.InvertLookY ? -1f : 1f));
@@ -334,6 +366,8 @@ public sealed class TouchControlView : View
         if (!_captures.Remove(pointerId, out PointerCapture? capture)) return;
         if (capture.Kind == CaptureKind.Button && capture.Control is not null)
             Input.Release(capture.Control);
+        if (capture.Kind == CaptureKind.Look && capture.LongPressTriggered)
+            Input.Release(_lookBreakControl);
         if (capture.Kind == CaptureKind.Joystick)
             Input.SetMovement(0f, 0f);
         if (capture.Kind is CaptureKind.EditDrag or CaptureKind.EditResize)
@@ -346,6 +380,8 @@ public sealed class TouchControlView : View
         {
             if (capture.Kind == CaptureKind.Button && capture.Control is not null)
                 Input.Release(capture.Control);
+            if (capture.Kind == CaptureKind.Look && capture.LongPressTriggered)
+                Input.Release(_lookBreakControl);
         }
         _captures.Clear();
         Input.ReleaseAll();
@@ -402,10 +438,10 @@ public sealed class TouchControlView : View
                 bounds.Top + (row + 1) * cellHeight - 2f);
             bool down = center && Input.IsDown(VirtualBindingKind.GameAction, "Crouch");
             _fill.Color = down
-                ? Color.Argb(alpha, 63, 160, 215)
-                : Color.Argb(alpha, 35, 52, 73);
-            canvas.DrawRoundRect(cell, 12f, 12f, _fill);
-            canvas.DrawRoundRect(cell, 12f, 12f, _stroke);
+                ? Color.Argb(alpha, 62, 133, 180)
+                : Color.Argb(alpha, 31, 39, 50);
+            canvas.DrawRoundRect(cell, 5f, 5f, _fill);
+            canvas.DrawRoundRect(cell, 5f, 5f, _stroke);
             float baseline = cell.CenterY() - (metrics.Ascent + metrics.Descent) * 0.5f;
             canvas.DrawText(center ? "SHF" : arrows[row, column], cell.CenterX(), baseline, _text);
         }
