@@ -15,7 +15,7 @@
          IDE fast-deployment files outside the package. -->
     <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
     <AndroidUseSharedRuntime>false</AndroidUseSharedRuntime>
-    <RuntimeIdentifiers Condition="'$(RuntimeIdentifier)' == ''">android-arm64;android-x64</RuntimeIdentifiers>
+    <RuntimeIdentifiers Condition="'$(RuntimeIdentifier)' == ''">android-arm64;android-arm;android-x64;android-x86</RuntimeIdentifiers>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <AndroidLinkMode>SdkOnly</AndroidLinkMode>
@@ -44,6 +44,7 @@
     <Compile Include="..\Infrastructure\FrameWorkBudget.cs" Link="Shared\Infrastructure\FrameWorkBudget.cs" />
     <Compile Include="..\Infrastructure\Platform\PlatformServices.cs" Link="Shared\Infrastructure\PlatformServices.cs" />
     <Compile Include="..\Persistence\WorldSaveService.cs" Link="Shared\Persistence\WorldSaveService.cs" />
+    <Compile Include="..\Rendering\ProceduralMaterialAtlas.cs" Link="Shared\Rendering\ProceduralMaterialAtlas.cs" />
     <AndroidAsset Include="..\Content\Base\**\*.json">
       <Link>Content\Base\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </AndroidAsset>

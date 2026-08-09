@@ -35,6 +35,7 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     public int ChangesLastStep { get; private set; }
     public int SimulationSubstepsLastStep { get; private set; }
     public int ActiveGridCount => _world.PhysicsGrids.Count;
+    public bool SimulationEnabled { get; set; } = true;
     public ulong SelectedGridId { get; private set; }
     public string Status { get; private set; } = "Grid physics ready";
     public string ModeName => "StructuralGrid";
@@ -88,6 +89,12 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     {
         deltaSeconds = Math.Clamp(deltaSeconds, 0f, 0.05f);
         ChangesLastStep = 0;
+        if (!SimulationEnabled)
+        {
+            SimulationSubstepsLastStep = 0;
+            Status = $"Physics paused: {ActiveGridCount} grids retained";
+            return;
+        }
         _analysisAccumulator += deltaSeconds;
         if (_analysisAccumulator >= 0.05f)
         {
@@ -126,7 +133,7 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
 
     public void PushAnalyticSpheresFromPlayer(Vector3 playerPosition, Vector3 playerVelocity)
     {
-        if (_world.AnalyticSpheres.Count == 0) return;
+        if (!SimulationEnabled || _world.AnalyticSpheres.Count == 0) return;
         _rigidBodyBackend ??= new BepuPhysicsBackend(_world, _simulationFocus);
         _rigidBodyBackend.QueuePlayerPush(playerPosition, playerVelocity);
     }

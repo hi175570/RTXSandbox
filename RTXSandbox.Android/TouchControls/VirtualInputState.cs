@@ -33,11 +33,16 @@ public sealed class VirtualInputState
         lock (_sync)
         {
             if (_hardwareRebindTarget is null) return false;
-            foreach (string target in _hardwareKeysByBinding
-                         .Where(pair => string.Equals(pair.Value, physicalKey, StringComparison.OrdinalIgnoreCase))
-                         .Select(pair => pair.Key).ToArray())
-                _hardwareKeysByBinding.Remove(target);
-            _hardwareKeysByBinding[_hardwareRebindTarget] = physicalKey;
+            bool unbind = physicalKey.Equals("Escape", StringComparison.OrdinalIgnoreCase) ||
+                          physicalKey.Equals("Back", StringComparison.OrdinalIgnoreCase);
+            if (!unbind)
+            {
+                foreach (string target in _hardwareKeysByBinding
+                             .Where(pair => string.Equals(pair.Value, physicalKey, StringComparison.OrdinalIgnoreCase))
+                             .Select(pair => pair.Key).ToArray())
+                    _hardwareKeysByBinding.Remove(target);
+            }
+            _hardwareKeysByBinding[_hardwareRebindTarget] = unbind ? "Unbound" : physicalKey;
             _hardwareRebindTarget = null;
         }
         HardwareBindingsChanged?.Invoke();

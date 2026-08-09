@@ -1,5 +1,25 @@
 # RTX Sandbox Roadmap
 
+## 本輪：Android 虛擬機最終回歸（2026-08-09）
+
+> 本輪所有 ADB 安裝、啟動、輸入、截圖與 logcat 都明確指定 `emulator-5554`（Android 11／API 30；依 APK 驗證 x86_64 與 x86）；即使裝置清單曾出現實體手機，也沒有對手機序號發送任何操作。本節優先於下方較早的 Android 狀態。
+
+| 項目 | 狀態 | 驗證證據／限制 |
+|---|---|---|
+| Android 物品欄材質 | ✅ **【已完成並在 VM 顯示】** | Android UI 已使用共用 `ProceduralMaterialAtlas` 的 GLES texture，以與桌面相同的等角方塊卡顯示 top／side 材質；草、土、石、發光、金屬、玻璃、沙、雪與木材均已在 `build/validation/emulator-inventory-textured.png` 實際顯示。物品欄可用 `E` 開啟與關閉，快捷欄位置已下移。 |
+| Android Raster 陰影 | ✅ **【方向光陰影 V1 已完成】** | Classic、PBR Forward、Deferred 與 Hybrid 共用快取式 1024×1024 方向光 shadow map，3×3 PCF；Deferred／Hybrid 透過第三張 G-buffer attachment 傳遞 shadow visibility。四條管線均在同一 VM 世界實際出圖，沒有 shader／FBO／AndroidRuntime error。點光、聚光與完整桌面反射仍未完成。 |
+| 桌面 PBR Forward 回退 | ✅ **【本輪發現並修復】** | 六管線回歸時確認 `forward_post.frag.glsl` 的鄰域 sharpen 取樣括號錯誤，PBR shader 編譯失敗後曾安全回退 Classic。已改為單一正確的 tone-map 取樣函式；RTX 5050 High 與 Ultra 均真正以 `PBR Forward Raster` 通過，Ultra feature mask 2047、4096² shadow、framebuffer 94–255，沒有再回退。 |
+| Android Compute Path Tracing | ✅ **【黑畫面問題目前不存在／流體高度已接入】** | 在 GLES 3.1 VM 實際切換並持續出圖，`build/validation/emulator-compute-fluid-level-final.png` 證明目前 compute shader、世界 volume 與 ImGui 均正常執行；新增 R8UI fluid-level volume，部分水格不再被當作完整立方體。Micro Voxel／Physics Grid 精確求交與完整透明折射仍是後續限制。 |
+| 已有水格再次倒水 | ✅ **【已完成並自測】** | 桌面、Build Tool 與 Android 都允許以水對準已有水格再次倒入；每桶增加 16 單位，滿格溢出會交給既有守恆流水向鄰格分配。91/91 self-tests 驗證第二桶可接受且總量 32 不消失。 |
+| Physics 模擬開關 | ✅ **【已完成並操作驗證】** | 桌面與 Android 均可暫停／恢復物理模擬；關閉只凍結既有 Physics Grid，不刪除或重設位置。91/91 self-tests 覆蓋停用後位置保持與恢復後繼續下落；VM 設定頁已實際切換並恢復預設開啟。 |
+| Android 中文字形 | ✅ **【已完成並在 VM 顯示】** | 設定頁使用的繁中／簡中完整句子與標點已納入 glyph corpus；`build/validation/emulator-gameplay-settings-final2.png` 未再出現缺字 `?`。 |
+| Android 局部更新延遲 | 🟡 **【已改善／未達效能目標】** | 互動 mesh 更新由固定 80 ms 節流改為 60 Hz 排程；直接放置／挖除可立即要求更新，初次可見 Chunk 也改為最近一個同步、其餘逐個背景建立。VM 1920×1080 實測約 46–57 FPS，仍未達 100／120 FPS，不能標示為效能完成。 |
+| Android 四 ABI | ✅ **【封裝完成／x86 實際執行】** | `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 均有同版本 `libcimgui.so`，ELF LOAD alignment 為 0x4000 且不依賴 `libc++_shared.so`。已修正 32 位 `ImTextureID` ABI 錯位；x86 signed APK 在 `emulator-5554` 實際載入共用 ImGui、世界與 Classic，穩態約 57–61 FPS且無 FATAL／OverflowException。ARMv7 只標記建置與封裝驗證。 |
+| 建置與執行 | ✅ **【本輪已驗證】** | Android x64 Debug／Release 與四 ABI Release publish 均可產生 APK；x86 signed APK 已用 `adb -s emulator-5554 install -r` 覆蓋安裝並啟動。Release UI、物品欄、設定、物理開關及五條非 DXR Renderer 均在 VM 操作。 |
+| 完整 Android／桌面畫質一致 | 🟡 **【部分完成】** | 主選單、暫停、設定、物品欄、世界與輸入使用共用資料與同款 ImGui；Hardware DXR 維持 Windows-only。Android 尚缺桌面完整點／聚光陰影、反射、體積霧／煙霧、完整水材質與全部 Renderer 高階設定，不能宣稱 100% 一致。 |
+| 遠端 GitHub Actions | 🟡 **【本機設定已修／待本次 push 驗證】** | 已確認舊 run 31268090912 失敗；Android 舊字元編譯錯誤在目前程式碼已不存在。Workflow 現安裝 .NET 9＋6（self-test 會編譯 net6 測試 Mod）、使用 Node 24 版官方 Actions，Android SDK 缺失會明確失敗，並逐一 publish 四個 Android ABI；遠端綠燈必須以本次 push 後的新 run 為準。 |
+| DLSS／FSR 補幀 | ⛔ **【未假實作】** | 目前最終呈現仍是 OpenGL；DXR 的 D3D12 結果會 readback 再上傳 OpenGL。正式 DLSS Frame Generation／FSR Frame Generation 需要 D3D12 或 Vulkan presentation、motion vectors、depth 與 UI-less color 等輸入，不能用一個 OpenGL 設定開關冒充。需先建立共用 D3D12／Vulkan present 路徑，本輪只記錄阻塞，不標完成。 |
+
 ## 本輪：桌面／Android 共用 ImGui 介面（2026-08-08）
 
 > 本節是目前 Android 狀態；後文較早的「尚未移植」紀錄只保留歷史，不應覆蓋本節。

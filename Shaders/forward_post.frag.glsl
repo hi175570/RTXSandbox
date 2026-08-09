@@ -214,19 +214,25 @@ vec3 toneMap(vec3 color)
         max(color * (2.43 * color + 0.59) + 0.14, vec3(1e-5)), 0.0, 1.0);
 }
 
+vec3 sampleToneMapped(vec2 uv)
+{
+    vec3 hdr = texture(uHdrColor, clamp(uv, vec2(0.001), vec2(0.999))).rgb;
+    return pow(max(toneMap(hdr), vec3(0.0)), vec3(1.0 / 2.2));
+}
+
 vec3 applyFsrSharpen(vec3 source, vec2 uv)
 {
     vec2 texel = uTexelSize;
     vec3 c = source;
-    vec3 sampleCenter = pow(max(toneMap(texture(uHdrColor, clamp(uv, vec2(0.001), vec2(0.999))).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleUp = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(-1.0, 0.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleDown = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(1.0, 0.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleLeft = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(0.0, -1.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleRight = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(0.0, 1.0) * texel, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleDiagA = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(-1.0, -1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleDiagB = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(1.0, -1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleDiagC = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(-1.0, 1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
-    vec3 sampleDiagD = pow(max(toneMap(texture(uHdrColor, clamp(uv + vec2(1.0, 1.0) * texel * 0.9, vec2(0.001), vec2(0.999)).rgb), vec3(0.0)), vec3(1.0 / 2.2));
+    vec3 sampleCenter = sampleToneMapped(uv);
+    vec3 sampleUp = sampleToneMapped(uv + vec2(-1.0, 0.0) * texel);
+    vec3 sampleDown = sampleToneMapped(uv + vec2(1.0, 0.0) * texel);
+    vec3 sampleLeft = sampleToneMapped(uv + vec2(0.0, -1.0) * texel);
+    vec3 sampleRight = sampleToneMapped(uv + vec2(0.0, 1.0) * texel);
+    vec3 sampleDiagA = sampleToneMapped(uv + vec2(-1.0, -1.0) * texel * 0.9);
+    vec3 sampleDiagB = sampleToneMapped(uv + vec2(1.0, -1.0) * texel * 0.9);
+    vec3 sampleDiagC = sampleToneMapped(uv + vec2(-1.0, 1.0) * texel * 0.9);
+    vec3 sampleDiagD = sampleToneMapped(uv + vec2(1.0, 1.0) * texel * 0.9);
     vec3 sampleUpLeft = sampleUp + sampleDown + sampleLeft + sampleRight;
     vec3 sampleDownRight = sampleDiagA + sampleDiagB + sampleDiagC + sampleDiagD;
     vec3 n = sampleUpLeft;

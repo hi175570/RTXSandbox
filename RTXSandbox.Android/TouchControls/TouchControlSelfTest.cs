@@ -62,6 +62,10 @@ internal static class TouchControlSelfTest
         Require(input.TryResolveHardwareKey("Q", out VirtualBindingKind reboundKind, out string reboundBinding) &&
                 reboundKind == VirtualBindingKind.Keyboard && reboundBinding == "W", "hardware key resolve");
         Require(input.IsHardwareBindingRemapped(VirtualBindingKind.Keyboard, "W"), "default key replaced");
+        input.BeginHardwareRebind(VirtualBindingKind.Keyboard, "W");
+        Require(input.TryCaptureHardwareKey("Escape"), "escape clears binding capture");
+        Require(input.IsHardwareBindingRemapped(VirtualBindingKind.Keyboard, "W"), "unbound action remains explicit");
+        Require(!input.TryResolveHardwareKey("Escape", out _, out _), "escape is not assigned as the action key");
         input.ResetHardwareBindings();
         Require(!input.IsHardwareBindingRemapped(VirtualBindingKind.Keyboard, "W"), "hardware reset");
     }

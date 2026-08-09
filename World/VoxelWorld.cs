@@ -58,6 +58,26 @@ public sealed class VoxelWorld : IVoxelWorld
     public ushort[] RawData => _storage.CreateLinearSnapshot(Width, Depth);
     public ushort[] CreateRenderWindowSnapshot(int originX, int originZ) =>
         _storage.CreateWindowSnapshot(originX, originZ, Width, Depth);
+    internal ushort[] CreateRenderVolumeSnapshot(
+        int originX,
+        int originY,
+        int originZ,
+        int width,
+        int height,
+        int depth)
+    {
+        var result = new ushort[checked(width * height * depth)];
+        for (int z = 0; z < depth; z++)
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            int worldY = originY + y;
+            if (worldY < MinimumY || worldY >= MaximumY) continue;
+            result[x + width * (y + height * z)] =
+                _storage.GetBlock(originX + x, worldY, originZ + z);
+        }
+        return result;
+    }
     internal ushort[] CreateRenderChunkSnapshot(ChunkCoordinate chunk) =>
         _storage.CreateWindowSnapshot(
             chunk.MinimumX, chunk.MinimumZ, ChunkCoordinate.Size, ChunkCoordinate.Size);
@@ -71,6 +91,25 @@ public sealed class VoxelWorld : IVoxelWorld
             int localZ = z - originZ;
             if ((uint)localX >= width || (uint)localY >= Height || (uint)localZ >= depth) continue;
             result[localX + width * (localY + Height * localZ)] = level;
+        }
+        return result;
+    }
+    internal byte[] CreateFluidRenderVolumeSnapshot(
+        int originX,
+        int originY,
+        int originZ,
+        int width,
+        int height,
+        int depth)
+    {
+        var result = new byte[checked(width * height * depth)];
+        foreach (((int x, int y, int z), byte level) in _fluidLevels)
+        {
+            int localX = x - originX;
+            int localY = y - originY;
+            int localZ = z - originZ;
+            if ((uint)localX >= width || (uint)localY >= height || (uint)localZ >= depth) continue;
+            result[localX + width * (localY + height * localZ)] = level;
         }
         return result;
     }
@@ -215,6 +254,27 @@ public sealed class VoxelWorld : IVoxelWorld
                 !SetBlockId(x, y, z, (ushort)VoxelMaterial.Water)) return false;
         }
         return SetFluidLevel(x, y, z, (byte)(FluidCapacity - amount)) || existing != (ushort)VoxelMaterial.Water;
+    }
+
+    /// <summary>
+    /// Adds a finite bucket of water to the selected cell. Any amount that does
+    /// not fit in that cell is handed to the local flow simulation so an
+    /// already occupied water surface can still receive another bucket.
+    /// </summary>
+    public bool PourWater(int x, int y, int z, byte amount = FluidCapacity)
+    {
+        if (!IsInside(x, y, z) || amount == 0) return false;
+        ushort existingBlock = GetLoadedBlockId(x, y, z);
+        if (existingBlock != (ushort)VoxelMaterial.Water && !IsReplaceableMaterial(existingBlock))
+            return false;
+
+        byte currentAmount = GetFluidAmount(x, y, z);
+        byte accepted = (byte)Math.Min(amount, FluidCapacity - currentAmount);
+        bool changed = accepted > 0 && SetFluidAmount(x, y, z, (byte)(currentAmount + accepted));
+        byte overflow = (byte)(amount - accepted);
+        if (overflow > 0)
+            FluidDisplaced?.Invoke(new FluidDisplacementEvent(x, y, z, overflow));
+        return changed || overflow > 0;
     }
 
     internal bool SetFluidLevel(int x, int y, int z, byte level)

@@ -251,6 +251,7 @@ Emission 不只改變方塊自身顏色。Raster 管線建立有限數量的發�
 - 向下落下與向四周擴散。
 - 量守恆與薄層表面。
 - 固體放入水中時的排水與鄰格溢流。
+- 可以對已有水的格子繼續倒水；每次增加一桶有限水量，超過單格容量的部分會守恆地流向鄰格。
 - 小範圍連通管壓力／液面平衡。
 - 世界修改、存檔、載入及 Renderer 更新。
 - 游泳阻力；跳躍鍵在不同水深仍提供足以離水的跳躍，不用自動爬牆。
@@ -354,8 +355,8 @@ BepInEx/plugins/
 | Linux（Ubuntu／WSL） | x64 | 87/87 self-tests；Mesa／Xvfb GL 4.3 下 Classic、PBR、Deferred、Hybrid、Compute smoke；BepInEx `Started: True` | 五條 OpenGL Renderer；無 D3D12 DXR | **實際驗證** |
 | Linux | ARM64 | self-contained 發行檔在 QEMU AArch64 通過 87/87 self-tests | 尚無 ARM64 GPU 畫面；Mod hook 有限制 | **核心驗證** |
 | macOS | x64／ARM64 | 兩種 RID 可跨編譯，已有 OpenGL 4.1／GLSL 410 fallback | 沒有 Apple 實機；Compute PT 需要 GL 4.3 因而停用；無 DXR | **跨編譯** |
-| Android 11+ | x64 | API 30 Emulator 實際覆蓋安裝、舊世界存讀、完整世界管理、流水、Micro Voxel、Physics Grid、觸控／可編輯外接輸入、共用 UI，以及 Classic／PBR／Deferred／Hybrid／Compute | host-GPU GLES 3.1 VM 中 Classic、Deferred、Compute 均約 58–60 FPS；Hardware DXR 不可用；Mod runtime 與完整桌面 Renderer 細項尚未接入 | **V1 可玩／持續接入** |
-| Android 8+ | ARM64 | Release APK、共用世界、流水、Micro Voxel、BEPU Physics Grid、輸入及 16 KB 對齊 ImGui native library已封裝；已安裝至 Samsung A32／Android 13 | 手機受安全鎖保護，無權繞過；本輪只能確認安裝，尚未驗證真機 3D 畫面、效能及多點觸控 | **安裝完成／解鎖後複驗** |
+| Android 11+ | x64／x86 | API 30 Emulator 實際覆蓋安裝、舊世界存讀、完整世界管理、流水、Micro Voxel、Physics Grid、觸控／可編輯外接輸入、共用 UI，以及 Classic／PBR／Deferred／Hybrid／Compute；x86 也已實際載入 ImGui 與世界 | host-GPU GLES 3.1 VM 中 Classic 約 58–60 FPS，Compute 可持續出圖；Hardware DXR 不可用；Mod runtime 與完整桌面 Renderer 細項尚未接入 | **V1 可玩／持續接入** |
+| Android 8+ | ARM64／ARMv7 | 兩種 Release APK 都封裝共用世界、流水、Micro Voxel、BEPU Physics Grid、輸入及 16 KB 對齊 ImGui native library | 本輪遵照要求只使用模擬器；ARM64／ARMv7 尚無新的實機執行證據，不能宣稱真機畫面、效能及多點觸控完成 | **建置封裝完成／真機待驗證** |
 | iOS／iPadOS | ARM64 | 無正式 target | 尚未處理 Metal、簽名、觸控 Host 與發佈 | **未支援** |
 
 ### Renderer 可用性
@@ -391,7 +392,7 @@ Android 專案不是獨立世界 Demo：它直接 link／重用 `World`、`Playe
 - Micro Voxel／Physics Grid 的 V1 顯示、放置、刪除與 BEPU 模擬已接入；仍需真機多點觸控、長時間壓測與所有桌面編輯工具的一致性複驗。
 - ARM64 實機效能、記憶體與所有 ABI 的最終驗證。
 - Android Mod runtime 與桌面 BepInEx 等價能力。
-`libcimgui.so` 的 x64／ARM64 版本已以靜態 C++ runtime 重新連結，ELF `LOAD` alignment 均為 `0x4000`，符合 16 KB page-size；Android x64 Debug 與 ARM64 Release 都以 `0 warnings / 0 errors` 建置。這代表核心 ImGui 已正式接入，但不代表所有桌面頁面都已移植。Android 專用建置說明見 [RTXSandbox.Android/README.md](RTXSandbox.Android/README.md)。
+`libcimgui.so` 的 x64、x86、ARM64 與 ARMv7 版本已以靜態 C++ runtime 重新連結，ELF `LOAD` alignment 均為 `0x4000`，符合 16 KB page-size；32 位版本另固定使用與 ImGui.NET 相同的 pointer-sized `ImTextureID` ABI。四種 Release APK 都能產生，x86 已在 API 30 VM 實際顯示共用 ImGui；ARMv7 目前只有建置／封裝證據。這代表核心 ImGui 已正式接入，但不代表所有桌面頁面都已移植。Android 專用建置說明見 [RTXSandbox.Android/README.md](RTXSandbox.Android/README.md)。
 
 ### macOS、Linux 與 ARM64
 

@@ -354,6 +354,11 @@ public sealed class MainActivity : Activity
         if (e.Action == KeyEventActions.Down && e.RepeatCount == 0 &&
             _input.TryCaptureHardwareKey(e.KeyCode.ToString()))
             return true;
+        if (e.KeyCode is Keycode.Escape or Keycode.Back)
+        {
+            if (e.Action == KeyEventActions.Down && e.RepeatCount == 0) OnBackPressed();
+            return true;
+        }
         TouchControlDefinition? control = HardwareControlFor(e.KeyCode);
         if (control is null) return base.DispatchKeyEvent(e);
 

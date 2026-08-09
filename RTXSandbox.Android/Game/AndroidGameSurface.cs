@@ -14,6 +14,7 @@ using RTXSandbox.Configuration;
 using RTXSandbox.Gameplay;
 using RTXSandbox.Infrastructure.Platform;
 using RTXSandbox.Persistence;
+using RTXSandbox.Rendering;
 using RTXSandbox.World;
 using RTXSandbox.UI;
 
@@ -70,6 +71,8 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private const int FloatsPerVertex = 12;
     private const int ComputeWindowSize = 64;
     private const int ComputeWindowHeight = 256;
+    private const int ShadowMapSize = 1024;
+    private const double MeshUpdateIntervalSeconds = 1.0 / 60.0;
     private readonly VirtualInputState _input;
     private readonly Action<string> _status;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -96,6 +99,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private bool _precisionMode;
     private bool _meshDirty = true;
     private double _lastMeshUpload;
+    private bool _interactiveMeshUpdateRequested;
     private string _glVersion = "OpenGL ES";
     private long _lastTicks;
     private double _fpsWindowStart;
@@ -108,6 +112,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private int _gbufferFramebuffer;
     private int _gbufferAlbedoTexture;
     private int _gbufferNormalTexture;
+    private int _gbufferLightingTexture;
     private int _gbufferDepthTexture;
     private int _gbufferWidth;
     private int _gbufferHeight;
@@ -117,7 +122,19 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private int _computeDisplayProgram;
     private int _computeOutputTexture;
     private int _computeVoxelTexture;
+    private int _computeFluidTexture;
     private int _computeMaterialTexture;
+    private int _materialAtlasTexture;
+    private int _materialAtlasWidth;
+    private int _materialAtlasHeight;
+    private const int MaterialAtlasTilesPerRow = 32;
+    private int _shadowProgram;
+    private int _shadowFramebuffer;
+    private int _shadowColorTexture;
+    private int _shadowDepthBuffer;
+    private Matrix4x4 _shadowMatrix;
+    private ChunkCoordinate? _shadowCenter;
+    private bool _shadowDirty = true;
     private int _computeOriginX;
     private int _computeOriginY;
     private int _computeOriginZ;
@@ -144,8 +161,6 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private float _sprintFovOffset;
     private string _paletteSearch = string.Empty;
     private readonly HashSet<string> _favoriteBlocks = new(StringComparer.OrdinalIgnoreCase);
-    private string _paletteCategory = "All";
-    private bool _favoritesOnly;
     private IReadOnlyList<WorldSaveSummary> _knownWorlds = Array.Empty<WorldSaveSummary>();
     private string _selectedWorldStorage = "world1";
     private string _worldRenameDraft = "world1";
@@ -188,6 +203,9 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         _microBuild = new MicroBuildSystem(_world, _blocks, _player.WouldIntersectAabb);
         _waterFlow = new WaterFlowSimulation(_world);
         _physics = new VoxelPhysicsSimulator(_world, _blocks);
+        _physics.SimulationEnabled = global::Android.App.Application.Context
+            .GetSharedPreferences("rtxsandbox-ui", FileCreationMode.Private)
+            ?.GetBoolean("physics-enabled", true) ?? true;
         _hotbar = new CreativeHotbar(_blocks);
         _items = new ItemRegistry(_blocks);
         _inventory = new PlayerInventory(_items);
@@ -226,8 +244,10 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             _meshDirty = true;
         };
         _status(loaded
-            ? $"撌脰??亙?其???{Path.GetFileName(_worldSaves.LastLoadSource)}"
-            : error is null ? "撌脣遣蝡?冽撘??? : $"??瑼??亙仃??撌脣??典遣蝡???{error}");
+            ? $"已載入世界：{Path.GetFileName(_worldSaves.LastLoadSource)}"
+            : error is null
+                ? "已建立新的世界。"
+                : $"世界載入失敗，已建立新世界：{error}");
         RefreshWorldList();
     }
 
@@ -237,15 +257,15 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     public IReadOnlyList<AndroidRendererChoice> RendererChoices =>
     [
-        new("Classic", "蝬?", true, "OpenGL ES raster"),
-        new("PbrForward", "PBR ???", true, "OpenGL ES forward material lighting"),
-        new("Deferred", "撱園皜脫?", _supportsEs3,
-            _supportsEs3 ? "OpenGL ES 3 MRT G-buffer" : "?閬?OpenGL ES 3.0 MRT"),
-        new("Hybrid", "瘛瑕?撘?PBR", _supportsEs3,
-            _supportsEs3 ? "Deferred geometry + screen-space environment pass" : "?閬?OpenGL ES 3.0 MRT"),
-        new("ComputePathTracing", "Compute 頝臬?餈質馱", _supportsCompute,
-            _supportsCompute ? "OpenGL ES 3.1 compute voxel ray tracing" : "?閬?OpenGL ES 3.1 compute shader"),
-        new("HardwareRayTracing", "蝖祇???餈質馱", false, "DXR ???Windows Direct3D 12"),
+        new("Classic", "經典光照", true, "OpenGL ES raster"),
+        new("PbrForward", "PBR 前向光照", true, "OpenGL ES forward material lighting"),
+        new("Deferred", "延遲渲染", _supportsEs3,
+            _supportsEs3 ? "OpenGL ES 3 MRT G-buffer" : "需要 OpenGL ES 3.0 MRT"),
+        new("Hybrid", "混合式 PBR", _supportsEs3,
+            _supportsEs3 ? "Deferred geometry + screen-space environment pass" : "需要 OpenGL ES 3.0 MRT"),
+        new("ComputePathTracing", "Compute 路徑追蹤", _supportsCompute,
+            _supportsCompute ? "OpenGL ES 3.1 compute voxel ray tracing" : "需要 OpenGL ES 3.1 compute shader"),
+        new("HardwareRayTracing", "硬體光線追蹤", false, "DXR 僅支援 Windows Direct3D 12"),
     ];
 
     public void RequestUiMode(AndroidGameUiMode mode) => _requests.Enqueue(() => SetUiMode(mode));
@@ -341,6 +361,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         _supportsCompute = _glVersion.StartsWith("OpenGL ES 3.1", StringComparison.OrdinalIgnoreCase) ||
                            _glVersion.StartsWith("OpenGL ES 3.2", StringComparison.OrdinalIgnoreCase);
         RecreateProgram();
+        CreateMaterialAtlasTexture();
         _chunkMeshes.Clear();
         _pendingChunkMeshBuild = null;
         _gridMesh = null;
@@ -353,7 +374,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES20.GlCullFace(GLES20.GlBack);
         _lastTicks = _clock.ElapsedTicks;
         _fpsWindowStart = _clock.Elapsed.TotalSeconds;
-        _status($"Classic 繚 ?梁銝?嚗?瑼?繚 {_glVersion}");
+        _status($"Classic 已載入 · {_glVersion}");
         try
         {
             _imgui = new AndroidImGuiController(
@@ -362,7 +383,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         }
         catch (Exception exception)
         {
-            _status($"Android ImGui ???仃??{exception.Message}");
+            _status($"Android ImGui 初始化失敗：{exception.Message}");
         }
         PublishUiState();
     }
@@ -433,10 +454,12 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                 _input.ConsumeLookDelta();
             }
 
-            if (_meshDirty && _clock.Elapsed.TotalSeconds - _lastMeshUpload >= 0.08)
+            double meshElapsed = _clock.Elapsed.TotalSeconds - _lastMeshUpload;
+            if (_meshDirty && (_interactiveMeshUpdateRequested || meshElapsed >= MeshUpdateIntervalSeconds))
             {
                 UploadWorldMesh();
                 _lastMeshUpload = _clock.Elapsed.TotalSeconds;
+                _interactiveMeshUpdateRequested = false;
             }
         }
 
@@ -465,6 +488,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     private void RenderForward(Matrix4x4 matrix, Vector3 eye)
     {
+        RenderDirectionalShadow(eye);
         GLES20.GlBindFramebuffer(GLES20.GlFramebuffer, 0);
         GLES20.GlViewport(0, 0, _width, _height);
         GLES20.GlClearColor(0.32f, 0.58f, 0.86f, 1f);
@@ -504,6 +528,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES31.GlActiveTexture(GLES31.GlTexture1);
         GLES31.GlBindTexture(GLES31.GlTexture2d, _computeMaterialTexture);
         GLES31.GlUniform1i(GLES31.GlGetUniformLocation(_computeProgram, "uMaterials"), 1);
+        GLES31.GlActiveTexture(GLES31.GlTexture2);
+        GLES31.GlBindTexture(GLES30.GlTexture3d, _computeFluidTexture);
+        GLES31.GlUniform1i(GLES31.GlGetUniformLocation(_computeProgram, "uFluidLevels"), 2);
+        GLES31.GlUniform1i(GLES31.GlGetUniformLocation(_computeProgram, "uWaterMaterial"),
+            (int)VoxelMaterial.Water);
         GLES31.GlBindImageTexture(0, _computeOutputTexture, 0, false, 0, GLES31.GlWriteOnly, GLES31.GlRgba8);
         GLES31.GlDispatchCompute((_width + 7) / 8, (_height + 7) / 8, 1);
         GLES31.GlMemoryBarrier(GLES31.GlShaderImageAccessBarrierBit | GLES31.GlTextureFetchBarrierBit);
@@ -525,8 +554,104 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         if (location >= 0) GLES20.GlUniform3f(location, value.X, value.Y, value.Z);
     }
 
+    private void BindShadowUniforms(int program)
+    {
+        int matrixLocation = GLES20.GlGetUniformLocation(program, "uLightMvp");
+        if (matrixLocation < 0) return;
+        GLES20.GlUniformMatrix4fv(matrixLocation, 1, false, ToArray(_shadowMatrix), 0);
+        GLES20.GlActiveTexture(GLES20.GlTexture3);
+        GLES20.GlBindTexture(GLES20.GlTexture2d, _shadowColorTexture);
+        int sampler = GLES20.GlGetUniformLocation(program, "uShadowMap");
+        if (sampler >= 0) GLES20.GlUniform1i(sampler, 3);
+        int texel = GLES20.GlGetUniformLocation(program, "uShadowTexel");
+        if (texel >= 0) GLES20.GlUniform2f(texel, 1f / ShadowMapSize, 1f / ShadowMapSize);
+        GLES20.GlActiveTexture(GLES20.GlTexture0);
+    }
+
+    private void RenderDirectionalShadow(Vector3 eye)
+    {
+        EnsureShadowResources();
+        if (_shadowFramebuffer == 0) return;
+        ChunkCoordinate center = ChunkCoordinate.FromVoxel(
+            (int)MathF.Floor(eye.X), (int)MathF.Floor(eye.Z));
+        if (_shadowCenter != center)
+        {
+            _shadowCenter = center;
+            _shadowDirty = true;
+        }
+        if (!_shadowDirty) return;
+
+        Vector3 lightDirection = Vector3.Normalize(new Vector3(0.45f, 0.82f, 0.32f));
+        Vector3 focus = new(
+            center.MinimumX + ChunkCoordinate.Size * 0.5f,
+            Math.Clamp(eye.Y - 8f, VoxelWorld.MinimumY + 24f, VoxelWorld.MaximumY - 24f),
+            center.MinimumZ + ChunkCoordinate.Size * 0.5f);
+        Matrix4x4 lightView = Matrix4x4.CreateLookAt(focus + lightDirection * 72f, focus, Vector3.UnitY);
+        Matrix4x4 lightProjection = Matrix4x4.CreateOrthographic(96f, 96f, 1f, 176f);
+        _shadowMatrix = lightView * lightProjection;
+
+        GLES20.GlBindFramebuffer(GLES20.GlFramebuffer, _shadowFramebuffer);
+        GLES20.GlViewport(0, 0, ShadowMapSize, ShadowMapSize);
+        GLES20.GlClearColor(1f, 1f, 1f, 1f);
+        GLES20.GlClear(GLES20.GlColorBufferBit | GLES20.GlDepthBufferBit);
+        GLES20.GlEnable(GLES20.GlDepthTest);
+        GLES20.GlDisable(GLES20.GlBlend);
+        GLES20.GlCullFace(GLES20.GlFront);
+        GLES20.GlUseProgram(_shadowProgram);
+        int matrix = GLES20.GlGetUniformLocation(_shadowProgram, "uLightMvp");
+        GLES20.GlUniformMatrix4fv(matrix, 1, false, ToArray(_shadowMatrix), 0);
+        foreach (GpuMesh mesh in _chunkMeshes.Values) DrawMesh(mesh, transparent: false);
+        if (_gridMesh is not null) DrawMesh(_gridMesh, transparent: false);
+        DisableSceneAttributes();
+        GLES20.GlCullFace(GLES20.GlBack);
+        GLES20.GlBindFramebuffer(GLES20.GlFramebuffer, 0);
+        _shadowDirty = false;
+    }
+
+    private void EnsureShadowResources()
+    {
+        if (_shadowFramebuffer != 0) return;
+        if (_shadowProgram == 0)
+            _shadowProgram = CreateProgram(ShadowVertexShader, ShadowFragmentShader);
+
+        int[] textures = new int[1];
+        GLES20.GlGenTextures(1, textures, 0);
+        _shadowColorTexture = textures[0];
+        GLES20.GlBindTexture(GLES20.GlTexture2d, _shadowColorTexture);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureMinFilter, GLES20.GlNearest);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureMagFilter, GLES20.GlNearest);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureWrapS, GLES20.GlClampToEdge);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureWrapT, GLES20.GlClampToEdge);
+        GLES20.GlTexImage2D(GLES20.GlTexture2d, 0, GLES20.GlRgba,
+            ShadowMapSize, ShadowMapSize, 0, GLES20.GlRgba, GLES20.GlUnsignedByte, null);
+
+        int[] renderbuffers = new int[1];
+        GLES20.GlGenRenderbuffers(1, renderbuffers, 0);
+        _shadowDepthBuffer = renderbuffers[0];
+        GLES20.GlBindRenderbuffer(GLES20.GlRenderbuffer, _shadowDepthBuffer);
+        GLES20.GlRenderbufferStorage(GLES20.GlRenderbuffer, GLES20.GlDepthComponent16,
+            ShadowMapSize, ShadowMapSize);
+
+        int[] framebuffers = new int[1];
+        GLES20.GlGenFramebuffers(1, framebuffers, 0);
+        _shadowFramebuffer = framebuffers[0];
+        GLES20.GlBindFramebuffer(GLES20.GlFramebuffer, _shadowFramebuffer);
+        GLES20.GlFramebufferTexture2D(GLES20.GlFramebuffer, GLES20.GlColorAttachment0,
+            GLES20.GlTexture2d, _shadowColorTexture, 0);
+        GLES20.GlFramebufferRenderbuffer(GLES20.GlFramebuffer, GLES20.GlDepthAttachment,
+            GLES20.GlRenderbuffer, _shadowDepthBuffer);
+        int status = GLES20.GlCheckFramebufferStatus(GLES20.GlFramebuffer);
+        GLES20.GlBindFramebuffer(GLES20.GlFramebuffer, 0);
+        if (status != GLES20.GlFramebufferComplete)
+        {
+            _status($"Android shadow map unavailable: FBO 0x{status:X}");
+            _shadowFramebuffer = 0;
+        }
+    }
+
     private void RenderDeferred(Matrix4x4 matrix, Vector3 eye, bool hybrid)
     {
+        RenderDirectionalShadow(eye);
         EnsureGBuffer();
         if (_gbufferFramebuffer == 0)
         {
@@ -536,7 +661,8 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
         GLES30.GlBindFramebuffer(GLES30.GlFramebuffer, _gbufferFramebuffer);
         GLES30.GlViewport(0, 0, _width, _height);
-        GLES30.GlDrawBuffers(2, new[] { GLES30.GlColorAttachment0, GLES30.GlColorAttachment1 }, 0);
+        GLES30.GlDrawBuffers(3,
+            new[] { GLES30.GlColorAttachment0, GLES30.GlColorAttachment1, GLES30.GlColorAttachment2 }, 0);
         GLES30.GlClearColor(0f, 0f, 0f, 0f);
         GLES30.GlClear(GLES30.GlColorBufferBit | GLES30.GlDepthBufferBit);
         DrawScenePass(_program, matrix, eye, includeTransparent: false);
@@ -553,6 +679,9 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES30.GlActiveTexture(GLES30.GlTexture1);
         GLES30.GlBindTexture(GLES30.GlTexture2d, _gbufferNormalTexture);
         GLES30.GlUniform1i(GLES30.GlGetUniformLocation(_lightingProgram, "uNormalRough"), 1);
+        GLES30.GlActiveTexture(GLES30.GlTexture2);
+        GLES30.GlBindTexture(GLES30.GlTexture2d, _gbufferLightingTexture);
+        GLES30.GlUniform1i(GLES30.GlGetUniformLocation(_lightingProgram, "uLighting"), 2);
         GLES30.GlUniform1i(GLES30.GlGetUniformLocation(_lightingProgram, "uHybrid"), hybrid ? 1 : 0);
         GLES30.GlDrawArrays(GLES30.GlTriangles, 0, 3);
 
@@ -579,6 +708,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         if (mvp >= 0) GLES20.GlUniformMatrix4fv(mvp, 1, false, ToArray(matrix), 0);
         int camera = GLES20.GlGetUniformLocation(program, "uCamera");
         if (camera >= 0) GLES20.GlUniform3f(camera, eye.X, eye.Y, eye.Z);
+        BindShadowUniforms(program);
         if (includeOpaque)
         {
             foreach ((ChunkCoordinate coordinate, GpuMesh mesh) in _chunkMeshes)
@@ -658,7 +788,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     private void DrawGameplayHudImGui()
     {
-        ImGui.SetNextWindowPos(new Vector2(_width * 0.5f, _height - 82f),
+        ImGui.SetNextWindowPos(new Vector2(_width * 0.5f, _height - 28f),
             ImGuiCond.Always, new Vector2(0.5f, 1f));
         ImGui.SetNextWindowBgAlpha(0.58f);
         ImGui.Begin("##hotbar",
@@ -694,7 +824,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             ImGui.SameLine();
             ImGui.Text(block.DisplayName);
             ImGui.TextDisabled($"ID {block.Id}  |  {block.Key}");
-            ImGui.Text($"?惇摨?{block.Metallic:0.00}  |  蝎?摨?{block.Roughness:0.00}");
+            ImGui.Text($"金屬度 {block.Metallic:0.00}  |  粗糙度 {block.Roughness:0.00}");
             ImGui.End();
         }
 
@@ -793,7 +923,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             float width = ImGui.GetContentRegionAvail().X;
             if (ImGui.Button($"{T("continue")} - {_worldSaves.DisplayName}", new Vector2(width, 42f)))
                 SetUiMode(AndroidGameUiMode.Gameplay);
-            ImGui.SeparatorText(_language == UiLanguage.English ? "Worlds" : _language == UiLanguage.SimplifiedChinese ? "銝?" : "銝?");
+            ImGui.SeparatorText(Localize("世界", "世界", "Worlds"));
             if (ImGui.BeginChild("SavedWorlds", new Vector2(0f, Math.Max(120f, menuHeight - 580f)), ImGuiChildFlags.Borders))
             {
                 foreach (WorldSaveSummary world in _knownWorlds)
@@ -801,7 +931,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                     bool current = string.Equals(world.StorageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase);
                     bool selected = string.Equals(world.StorageName, _selectedWorldStorage, StringComparison.OrdinalIgnoreCase);
                     string currentPrefix = current
-                        ? (_language == UiLanguage.English ? "[Current] " : "[?桀?] ")
+                        ? Localize("[目前] ", "[当前] ", "[Current] ")
                         : string.Empty;
                     if (ImGui.Selectable($"{currentPrefix}{world.DisplayName}##world-{world.StorageName}",
                             selected, ImGuiSelectableFlags.None, new Vector2(0f, 34f)))
@@ -811,7 +941,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                         _worldMenuStatus = string.Empty;
                     }
                     ImGui.SameLine(Math.Max(205f, width * 0.48f));
-                    ImGui.TextDisabled($"{world.Preset} 繚 Seed {world.Seed}");
+                    ImGui.TextDisabled($"{world.Preset} · Seed {world.Seed}");
                 }
             }
             ImGui.EndChild();
@@ -822,21 +952,21 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                 bool current = string.Equals(selectedWorld.StorageName, _worldSaves.WorldName, StringComparison.OrdinalIgnoreCase);
                 float quarter = (width - ImGui.GetStyle().ItemSpacing.X * 3f) * 0.25f;
                 if (current) ImGui.BeginDisabled();
-                if (ImGui.Button("頛", new Vector2(quarter, 34f))) OpenWorld(selectedWorld.StorageName);
+                if (ImGui.Button(Localize("載入", "加载", "Open"), new Vector2(quarter, 34f))) OpenWorld(selectedWorld.StorageName);
                 if (current) ImGui.EndDisabled();
                 ImGui.SameLine();
-                if (ImGui.Button("???", new Vector2(quarter, 34f))) RebuildWorld(selectedWorld.StorageName);
+                if (ImGui.Button(Localize("重新生成", "重新生成", "Rebuild"), new Vector2(quarter, 34f))) RebuildWorld(selectedWorld.StorageName);
                 ImGui.SameLine();
-                if (ImGui.Button("??賢?", new Vector2(quarter, 34f))) RenameWorld(selectedWorld.StorageName);
+                if (ImGui.Button(Localize("重新命名", "重命名", "Rename"), new Vector2(quarter, 34f))) RenameWorld(selectedWorld.StorageName);
                 ImGui.SameLine();
                 if (current) ImGui.BeginDisabled();
-                if (ImGui.Button("?芷", new Vector2(quarter, 34f))) DeleteWorld(selectedWorld.StorageName);
+                if (ImGui.Button(Localize("刪除", "删除", "Delete"), new Vector2(quarter, 34f))) DeleteWorld(selectedWorld.StorageName);
                 if (current) ImGui.EndDisabled();
                 ImGui.SetNextItemWidth(width);
                 ImGui.InputText("##world-rename", ref _worldRenameDraft, 64);
             }
             if (!string.IsNullOrWhiteSpace(_worldMenuStatus)) ImGui.TextWrapped(_worldMenuStatus);
-            if (ImGui.Button("撱箇?銝?", new Vector2(width, 38f)))
+            if (ImGui.Button(Localize("建立世界", "创建世界", "Create World"), new Vector2(width, 38f)))
             {
                 _worldNameDraft = "New World";
                 _worldSeedDraft = Random.Shared.Next(int.MinValue, int.MaxValue);
@@ -866,22 +996,22 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         ImGui.SetNextWindowSize(new Vector2(MathF.Min(_width - 24f, 620f), MathF.Min(_height - 24f, 460f)),
             ImGuiCond.FirstUseEver);
         bool open = true;
-        if (ImGui.Begin("撱箇?銝?", ref open, ImGuiWindowFlags.NoCollapse))
+        if (ImGui.Begin(Localize("建立世界", "创建世界", "Create World"), ref open, ImGuiWindowFlags.NoCollapse))
         {
-            ImGui.InputText("銝??迂", ref _worldNameDraft, 64);
+            ImGui.InputText(Localize("世界名稱", "世界名称", "World Name"), ref _worldNameDraft, 64);
             ImGui.InputInt("Seed", ref _worldSeedDraft);
-            ImGui.TextDisabled("Natural 繚 Auto Biome 繚 Lakes 繚 Vegetation");
+            ImGui.TextDisabled("Natural · Auto Biome · Lakes · Vegetation");
             ImGui.Separator();
             bool valid = !string.IsNullOrWhiteSpace(_worldNameDraft);
             if (!valid) ImGui.BeginDisabled();
-            if (ImGui.Button("撱箇?", new Vector2(180f, 42f)))
+            if (ImGui.Button(Localize("建立", "创建", "Create"), new Vector2(180f, 42f)))
             {
                 CreateWorld(_worldNameDraft, _worldSeedDraft);
                 open = false;
             }
             if (!valid) ImGui.EndDisabled();
             ImGui.SameLine();
-            if (ImGui.Button("??", new Vector2(180f, 42f))) open = false;
+            if (ImGui.Button(Localize("取消", "取消", "Cancel"), new Vector2(180f, 42f))) open = false;
         }
         ImGui.End();
         if (!open && _uiMode == AndroidGameUiMode.CreateWorld)
@@ -1002,12 +1132,12 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         ImGui.SetNextWindowPos(new Vector2(_width * 0.5f, _height * 0.5f),
             ImGuiCond.FirstUseEver, new Vector2(0.5f));
         ImGui.SetNextWindowSize(new Vector2(
-            MathF.Min(_width - 24f, 900f), MathF.Min(_height - 24f, 560f)), ImGuiCond.FirstUseEver);
+            MathF.Min(_width - 24f, 900f), MathF.Min(_height - 24f, 850f)), ImGuiCond.FirstUseEver);
         bool open = true;
         if (ImGui.Begin("RTX Sandbox Editor", ref open,
                 ImGuiWindowFlags.NoCollapse))
         {
-            ImGui.TextDisabled($"{BlockChoices.Count} materials | Tab or I closes editor");
+            ImGui.TextDisabled($"{BlockChoices.Count} materials | E closes editor");
             if (ImGui.BeginTabBar("EditorTabs"))
             {
                 bool blocksTabOpen = true;
@@ -1021,11 +1151,14 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                     {
                         if (slot > 0) ImGui.SameLine();
                         BlockDefinition quickBlock = _hotbar.GetBlock(slot);
-                        bool selectedSlot = slot == _hotbar.SelectedSlot;
-                        if (selectedSlot) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.22f, 0.62f, 0.92f, 0.95f));
-                        if (ImGui.Button($"{slot + 1}\n{ShortBlockName(quickBlock.DisplayName)}##hotbar-{slot}", new Vector2(76f, 66f)))
+                        if (DrawBlockCard(
+                                quickBlock,
+                                new Vector2(76f, 76f),
+                                $"library-quickbar-{slot}",
+                                selected: slot == _hotbar.SelectedSlot,
+                                label: (slot + 1).ToString(),
+                                compact: true))
                             _hotbar.SelectedSlot = slot;
-                        if (selectedSlot) ImGui.PopStyleColor();
                     }
                     ImGui.Separator();
                     ImGui.SetNextItemWidth(330f);
@@ -1043,15 +1176,18 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                         for (int index = 0; index < visible.Length; index++)
                         {
                             BlockDefinition block = visible[index];
-                            Vector3 tint = Vector3.Clamp(block.Albedo, new Vector3(0.08f), Vector3.One);
-                            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(tint, 0.92f));
-                            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(Vector3.Min(Vector3.One, tint * 1.25f), 1f));
-                            if (ImGui.Button($"{ShortBlockName(block.DisplayName)}##material-{block.Id}", new Vector2(104f, 92f)))
+                            ImGui.PushID($"block:{block.Key}");
+                            if (DrawBlockCard(
+                                    block,
+                                    new Vector2(104f, 102f),
+                                    $"material-{block.Key}",
+                                    selected: block.Id == _hotbar.SelectedBlock.Id,
+                                    label: ShortName(block.DisplayName, 14)))
                             {
                                 _hotbar.SelectAndAssign(block.Id);
                                 PublishUiState();
                             }
-                            ImGui.PopStyleColor(2);
+                            ImGui.PopID();
                             if ((index + 1) % columns != 0) ImGui.SameLine();
                         }
                     }
@@ -1090,7 +1226,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     {
         if (maxLength <= 0) return string.Empty;
         if (string.IsNullOrWhiteSpace(value)) return value ?? string.Empty;
-        return value.Length <= maxLength ? value : value[..(maxLength - 1)] + "??;
+        return value.Length <= maxLength ? value : value[..(maxLength - 1)] + "…";
     }
 
     private bool DrawBlockCard(
@@ -1133,7 +1269,9 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             position.X + Math.Max(3f, (size.X - textSize.X) * 0.5f),
             position.Y + size.Y - textSize.Y - (compact ? 2f : 5f));
         uint textColor = ImGui.ColorConvertFloat4ToU32(new Vector4(0.94f, 0.97f, 1f, 1f));
+        drawList.PushClipRect(position + Vector2.One, position + size - Vector2.One, true);
         drawList.AddText(textPosition, textColor, text);
+        drawList.PopClipRect();
 
         if (_favoriteBlocks.Contains(block.Key) && !compact)
         {
@@ -1152,25 +1290,88 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         return clicked;
     }
 
-    private static void DrawMaterialCube(ImDrawListPtr drawList, Vector2 position, Vector2 size, BlockDefinition block)
+    private void DrawMaterialCube(ImDrawListPtr drawList, Vector2 position, Vector2 size, BlockDefinition block)
     {
-        Vector2 rightTop = position + new Vector2(size.X * 0.64f, 0f);
-        Vector2 bottomRight = position + size;
-        drawList.AddRectFilled(
-            position,
-            bottomRight,
-            ImGui.ColorConvertFloat4ToU32(new Vector4(0.18f, 0.18f, 0.18f, 1f)),
-            0.0f);
-        drawList.AddRectFilled(
-            position + new Vector2(3f, 3f),
-            rightTop + new Vector2(2f, 2f),
-            ImGui.ColorConvertFloat4ToU32(new Vector4(block.Albedo * 0.78f + new Vector3(0.05f), 1f)),
-            0.0f);
-        drawList.AddRectFilled(
-            rightTop,
-            bottomRight - new Vector2(3f, 3f),
-            ImGui.ColorConvertFloat4ToU32(new Vector4(block.Albedo * 0.58f + new Vector3(0.05f), 1f)),
-            0.0f);
+        float halfWidth = MathF.Min(size.X * 0.42f, size.Y * 0.46f);
+        float topHeight = halfWidth * 0.56f;
+        float sideHeight = MathF.Min(size.Y - topHeight - 1f, halfWidth * 0.98f);
+        float centerX = position.X + size.X * 0.5f;
+        float topY = position.Y + Math.Max(1f, (size.Y - topHeight - sideHeight) * 0.42f);
+        Vector2 top = new(centerX, topY);
+        Vector2 right = new(centerX + halfWidth, topY + topHeight);
+        Vector2 middle = new(centerX, topY + topHeight * 2f);
+        Vector2 left = new(centerX - halfWidth, topY + topHeight);
+        Vector2 rightBottom = right + new Vector2(0f, sideHeight);
+        Vector2 middleBottom = middle + new Vector2(0f, sideHeight);
+        Vector2 leftBottom = left + new Vector2(0f, sideHeight);
+
+        if (block.Emission.LengthSquared() > 0.04f)
+        {
+            Vector3 glowVector = Vector3.Clamp(block.Emission, Vector3.Zero, Vector3.One);
+            uint glow = ImGui.ColorConvertFloat4ToU32(new Vector4(glowVector, 0.22f));
+            drawList.AddCircleFilled(new Vector2(centerX, topY + topHeight + sideHeight * 0.45f),
+                halfWidth * 1.1f, glow, 24);
+        }
+
+        MaterialTileUv topUv = MaterialTileUvFor(block.Id, MaterialFace.Top);
+        MaterialTileUv sideUv = MaterialTileUvFor(block.Id, MaterialFace.Side);
+        nint texture = (nint)_materialAtlasTexture;
+        float alpha = block.Transmission > 0f ? 0.78f : 1f;
+        uint leftTint = ImGui.ColorConvertFloat4ToU32(new Vector4(0.72f, 0.76f, 0.82f, alpha));
+        uint rightTint = ImGui.ColorConvertFloat4ToU32(new Vector4(0.55f, 0.60f, 0.69f, alpha));
+        uint topTint = ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, alpha));
+
+        AddTexturedQuad(drawList, texture, left, middle, middleBottom, leftBottom, sideUv, leftTint,
+            flipX: true, flipY: true);
+        AddTexturedQuad(drawList, texture, middle, right, rightBottom, middleBottom, sideUv, rightTint,
+            flipY: true);
+        AddTexturedQuad(drawList, texture, top, right, middle, left, topUv, topTint);
+
+        uint outline = ImGui.ColorConvertFloat4ToU32(new Vector4(0.86f, 0.90f, 0.96f, 0.72f));
+        drawList.AddLine(top, right, outline, 1f);
+        drawList.AddLine(right, rightBottom, outline, 1f);
+        drawList.AddLine(rightBottom, middleBottom, outline, 1f);
+        drawList.AddLine(middleBottom, leftBottom, outline, 1f);
+        drawList.AddLine(leftBottom, left, outline, 1f);
+        drawList.AddLine(left, top, outline, 1f);
+        drawList.AddLine(left, middle, outline, 1f);
+        drawList.AddLine(middle, right, outline, 1f);
+        drawList.AddLine(middle, middleBottom, outline, 1f);
+    }
+
+    private MaterialTileUv MaterialTileUvFor(ushort materialId, MaterialFace face)
+    {
+        int tile = materialId * ProceduralMaterialAtlas.FacesPerMaterial + (int)face;
+        int tileX = tile % MaterialAtlasTilesPerRow * ProceduralMaterialAtlas.TileSize;
+        int tileY = tile / MaterialAtlasTilesPerRow * ProceduralMaterialAtlas.TileSize;
+        return new MaterialTileUv(
+            new Vector2(
+                (tileX + 0.5f) / _materialAtlasWidth,
+                (tileY + 0.5f) / _materialAtlasHeight),
+            new Vector2(
+                (tileX + ProceduralMaterialAtlas.TileSize - 0.5f) / _materialAtlasWidth,
+                (tileY + ProceduralMaterialAtlas.TileSize - 0.5f) / _materialAtlasHeight));
+    }
+
+    private static void AddTexturedQuad(
+        ImDrawListPtr drawList,
+        nint texture,
+        Vector2 a,
+        Vector2 b,
+        Vector2 c,
+        Vector2 d,
+        MaterialTileUv uv,
+        uint tint,
+        bool flipX = false,
+        bool flipY = false)
+    {
+        float left = flipX ? uv.Maximum.X : uv.Minimum.X;
+        float right = flipX ? uv.Minimum.X : uv.Maximum.X;
+        float top = flipY ? uv.Maximum.Y : uv.Minimum.Y;
+        float bottom = flipY ? uv.Minimum.Y : uv.Maximum.Y;
+        drawList.AddImageQuad(texture, a, b, c, d,
+            new Vector2(left, top), new Vector2(right, top),
+            new Vector2(right, bottom), new Vector2(left, bottom), tint);
     }
 
     private static void DrawBlockTooltip(BlockDefinition block)
@@ -1188,14 +1389,17 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         ImGui.SetNextWindowSize(new Vector2(
             MathF.Min(_width - 24f, 680f), MathF.Min(_height - 24f, 640f)), ImGuiCond.FirstUseEver);
         bool open = true;
-        if (ImGui.Begin("RTX Sandbox 閮剖?", ref open,
+        if (ImGui.Begin(Localize("RTX Sandbox 設定", "RTX Sandbox 设置", "RTX Sandbox Settings"), ref open,
                 ImGuiWindowFlags.NoCollapse))
         {
-            ImGui.TextDisabled("霈???喟???甇?虜??????芸?靽???);
+            ImGui.TextDisabled(Localize(
+                "桌面與 Android 共用主要選單結構；此頁只顯示裝置支援的功能。",
+                "桌面与 Android 共用主要菜单结构；此页只显示设备支持的功能。",
+                "Desktop and Android share the main menu structure; this page only shows supported device features."));
             ImGui.Spacing();
             if (ImGui.BeginTabBar("SettingsTabs"))
             {
-                if (ImGui.BeginTabItem("?恍"))
+                if (ImGui.BeginTabItem(Localize("圖形", "图形", "Graphics")))
                 {
                     ImGui.SeparatorText(T("renderer"));
                     foreach (AndroidRendererChoice choice in RendererChoices)
@@ -1213,19 +1417,43 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                         ImGui.TextDisabled(choice.Reason);
                         if (!choice.Available) ImGui.EndDisabled();
                     }
-                    ImGui.SeparatorText("憿舐內");
-                    ImGui.Text($"閫??摨佗?{_width} ? {_height}");
-                    ImGui.TextDisabled("Android ?圾?漲??VSync ?梁頂蝯?Surface 蝞∠???舀??Renderer 銝??質???具?);
+                    ImGui.SeparatorText(Localize("顯示", "显示", "Display"));
+                    ImGui.Text($"{Localize("目前解析度", "当前分辨率", "Current resolution")}：{_width} × {_height}");
+                    ImGui.TextDisabled(Localize(
+                        "Android 由系統 Surface 控制 VSync；渲染器專屬品質設定會在支援後顯示。",
+                        "Android 由系统 Surface 控制 VSync；渲染器专用品质设置会在支持后显示。",
+                        "Android VSync is controlled by the system Surface. Renderer-specific quality settings appear when supported."));
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("??????))
+                if (ImGui.BeginTabItem(Localize("遊戲設定", "游戏设置", "Gameplay")))
                 {
-                    ImGui.TextDisabled("銵???蝙?刻?銝?銝?渡??亙?鞈?嚗脤???賊??撠? Renderer ?亙??");
+                    ImGui.TextDisabled(Localize(
+                        "世界與遊戲規則由共用核心管理；只在功能真正可用時提供設定。",
+                        "世界与游戏规则由共用核心管理；只在功能真正可用时提供设置。",
+                        "World and gameplay rules use the shared core; settings are shown only when functional."));
+                    bool physicsEnabled = _physics.SimulationEnabled;
+                    if (ImGui.Checkbox(Localize("啟用物理模擬", "启用物理模拟", "Enable physics simulation"),
+                            ref physicsEnabled))
+                    {
+                        _physics.SimulationEnabled = physicsEnabled;
+                        global::Android.App.Application.Context
+                            .GetSharedPreferences("rtxsandbox-ui", FileCreationMode.Private)
+                            ?.Edit()
+                            ?.PutBoolean("physics-enabled", physicsEnabled)
+                            ?.Apply();
+                    }
+                    ImGui.TextDisabled(Localize(
+                        "關閉後保留既有物理結構的位置，只停止模擬。",
+                        "关闭后保留已有物理结构的位置，只停止模拟。",
+                        "When disabled, existing physics grids keep their positions and stop simulating."));
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("?批????))
+                if (ImGui.BeginTabItem(Localize("按鍵設定", "按键设置", "Controls")))
                 {
-                    ImGui.TextWrapped("憭?萇雿輻 PC ?嚗ndroid ?血????舐楊頛舐?閫豢閬?撅扎?);
+                    ImGui.TextWrapped(Localize(
+                        "外接鍵盤沿用 PC 預設；Android 另有可編輯的觸控控制層。",
+                        "外接键盘沿用 PC 默认；Android 另有可编辑的触控控制层。",
+                        "External keyboards use the PC defaults; Android also has an editable touch-control layer."));
                     if (ImGui.Button(T("controls"), new Vector2(210f, 42f)))
                     {
                         _uiReturnMode = AndroidGameUiMode.Settings;
@@ -1233,10 +1461,10 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                     }
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("閫豢"))
+                if (ImGui.BeginTabItem(Localize("觸控", "触控", "Touch")))
                 {
                     ImGui.Dummy(new Vector2(0f, 12f));
-                    if (ImGui.Button("??閫豢蝺刻摩??, new Vector2(240f, 48f)))
+                    if (ImGui.Button(T("touch_editor"), new Vector2(240f, 48f)))
                         SetUiMode(AndroidGameUiMode.TouchEditor);
                     ImGui.EndTabItem();
                 }
@@ -1277,14 +1505,13 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         bool open = true;
         if (BeginCenteredWindow(T("controls_title"), ref open, 0.72f, 0.82f))
         {
-            ImGui.TextWrapped(_language == UiLanguage.English
-                ? "External keyboard controls share the PC defaults. Select a key, then press its replacement. Touch controls remain an Android-only input layer."
-                : _language == UiLanguage.SimplifiedChinese
-                    ? "憭?桃?雿輻銝?PC ?詨???霈斗??柴圻?扳??桀??Android 銝颲撅?
-                    : "憭?萇雿輻??PC ?詨???閮剜??萸孛?扳??萄??Android 撠頛詨撅扎?);
+            ImGui.TextWrapped(Localize(
+                "外接鍵盤沿用 PC 預設。選擇按鍵後，再按下替代鍵。觸控控制仍是 Android 專用輸入層。",
+                "外接键盘沿用 PC 默认。选择按键后，再按下替代键。触控控制仍是 Android 专用输入层。",
+                "External keyboard controls share the PC defaults. Select a key, then press its replacement. Touch controls remain an Android-only input layer."));
             if (_input.HardwareRebindTarget is not null)
                 ImGui.TextColored(new Vector4(0.25f, 0.86f, 1f, 1f),
-                    _language == UiLanguage.English ? "Press a key..." : "隢?銝???菊?);
+                    Localize("請按下任意鍵……", "请按下任意键……", "Press a key..."));
             ImGui.Separator();
             DrawEditableBinding("move_forward", VirtualBindingKind.Keyboard, "W", "W");
             DrawEditableBinding("move_backward", VirtualBindingKind.Keyboard, "S", "S");
@@ -1297,7 +1524,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             DrawEditableBinding("build_tools", VirtualBindingKind.Keyboard, "B", "B");
             DrawEditableBinding("precision", VirtualBindingKind.Keyboard, "V", "V");
             ImGui.Separator();
-            if (ImGui.Button(_language == UiLanguage.English ? "Reset defaults" : "?身?身",
+            if (ImGui.Button(Localize("重設預設值", "重置默认值", "Reset defaults"),
                     new Vector2(180f, 42f)))
                 _input.ResetHardwareBindings();
             ImGui.SameLine();
@@ -1317,21 +1544,34 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         ImGui.TextUnformatted(T(key));
         ImGui.SameLine(250f);
         string label = _input.HardwareKeyLabel(kind, binding, fallback);
+        if (string.Equals(label, "Unbound", StringComparison.OrdinalIgnoreCase))
+            label = Localize("未設定", "未设置", "Unbound");
         if (ImGui.Button($"{label}##binding-{kind}-{binding}", new Vector2(230f, 0f)))
             _input.BeginHardwareRebind(kind, binding);
     }
 
     private string T(string key) => UiText.Get(_language, key);
 
+    private string Localize(string traditional, string simplified, string english) => _language switch
+    {
+        UiLanguage.SimplifiedChinese => simplified,
+        UiLanguage.English => english,
+        _ => traditional,
+    };
+
     private static readonly string[] AndroidUiGlyphText =
     {
         UiText.GlyphCorpus,
-        "蝬????撱園皜脫?瘛瑕?撘楝敺蕭頩斤′擃?蝺?閬??Ｗ??舀撠?亙",
-        "霈???喟??迤撣賊????脫??芸?靽??恍?????扳?嗡??Ｚ圾?漲蝟餌絞蝞∠?",
-        "銵???蝙?其????湔???脤??賊?撠?憭?萇?身?閫豢撠頛詨撅?,
-        "?拙?甈遣?極?瑟憛?鞈芣?撠翰?瑟?蝎曉?敺格憛芋撘蝺????身摰?撠梁絞閮芋蝯?閮?ａ?",
-        "蝜?銝剜?蝪⊿?銝剜??望?蝜潛??蝺刻摩閫豢?停?迂隞晶撠閫??",
-        "撱箇?銝?銝??迂??頛?????賢??芷憭望???撌脣??刻?嗥黎蝟餅?瘜?鋡恍?撅砍漲蝎?摨?,
+        "經典光照前向延遲混合路徑追蹤硬體世界目前載入重新生成命名刪除建立取消",
+        "图形游戏按键触控解析度渲染器品质外接键盘默认替代输入",
+        "圖形遊戲按鍵觸控解析度渲染器品質外接鍵盤預設替代輸入",
+        "金屬度粗糙度精密模式已載入初始化失敗新的世界",
+        "桌面與安卓共用主要選單結構此頁只顯示裝置支援功能目前系統控制專屬設定規則核心管理真正可用另有編輯層選擇按下任意鍵重設值未設定",
+        "桌面与安卓共用主要菜单结构此页只显示设备支持功能当前系统控制专属设置规则核心管理真正可用另有编辑层选择按下任意键重置值未设置",
+        "啟用物理模擬關閉後保留既有結構的位置只停止",
+        "启用物理模拟关闭后保留已有结构的位置只停止",
+        "桌面與 Android 共用主要選單結構；此頁只顯示裝置支援的功能。世界與遊戲規則由共用核心管理；只在功能真正可用時提供設定。關閉後保留既有物理結構的位置，只停止模擬。",
+        "桌面与 Android 共用主要菜单结构；此页只显示设备支持的功能。世界与游戏规则由共用核心管理；只在功能真正可用时提供设置。关闭后保留已有物理结构的位置，只停止模拟。",
     };
 
     private void HandleBlockActions()
@@ -1361,7 +1601,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                     ? _physics.TryPlaceMicroOnGrid(
                         gridTarget, _hotbar.SelectedBlock.Id, _microBuild.GridDivisor)
                     : _physics.TryPlaceOnGrid(gridTarget, _hotbar.SelectedBlock.Id));
-            if (gridChanged) _meshDirty = true;
+            if (gridChanged)
+            {
+                _meshDirty = true;
+                _interactiveMeshUpdateRequested = true;
+            }
             return;
         }
 
@@ -1371,7 +1615,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                                     (destroy
                                         ? _microBuild.Erase(precision.Value)
                                         : _microBuild.Place(precision.Value, _hotbar.SelectedBlock.Id));
-            if (precisionChanged) _meshDirty = true;
+            if (precisionChanged)
+            {
+                _meshDirty = true;
+                _interactiveMeshUpdateRequested = true;
+            }
             return;
         }
 
@@ -1380,11 +1628,26 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             changed = _world.SetBlockId(remove.X, remove.Y, remove.Z, 0);
         if (place && hit is { } target && PlacementRules.IsFarEnough(target.Distance))
         {
-            (int x, int y, int z) = target.Adjacent;
-            if (!_player.WouldIntersectBlock(x, y, z))
-                changed = _world.SetBlockId(x, y, z, _hotbar.SelectedBlock.Id) || changed;
+            BlockDefinition selected = _hotbar.SelectedBlock;
+            if (selected.Id == (ushort)VoxelMaterial.Water && _world.IsFluid(target.X, target.Y, target.Z))
+            {
+                changed = _world.PourWater(target.X, target.Y, target.Z) || changed;
+            }
+            else
+            {
+                BlockDefinition targetDefinition = _blocks.Get(target.MaterialId);
+                (int x, int y, int z) = targetDefinition.IsReplaceable && target.MaterialId != selected.Id
+                    ? (target.X, target.Y, target.Z)
+                    : target.Adjacent;
+                if (!selected.IsCollidable || !_player.WouldIntersectBlock(x, y, z))
+                    changed = _world.SetBlockId(x, y, z, selected.Id) || changed;
+            }
         }
-        if (changed) _meshDirty = true;
+        if (changed)
+        {
+            _meshDirty = true;
+            _interactiveMeshUpdateRequested = true;
+        }
     }
 
     private PrecisionHit? CurrentPrecisionHit()
@@ -1424,12 +1687,24 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             });
             return;
         }
-        if (_uiMode != AndroidGameUiMode.Gameplay) return;
         if (_input.ConsumePressed(VirtualBindingKind.Keyboard, "E"))
-            SetUiMode(AndroidGameUiMode.Inventory);
-        else if (_input.ConsumePressed(VirtualBindingKind.Keyboard, "B"))
-            SetUiMode(AndroidGameUiMode.BuildTools);
-        else if (_input.ConsumePressed(VirtualBindingKind.Keyboard, "V"))
+        {
+            if (_uiMode is AndroidGameUiMode.Gameplay or AndroidGameUiMode.Inventory)
+                SetUiMode(_uiMode == AndroidGameUiMode.Inventory
+                    ? AndroidGameUiMode.Gameplay
+                    : AndroidGameUiMode.Inventory);
+            return;
+        }
+        if (_input.ConsumePressed(VirtualBindingKind.Keyboard, "B"))
+        {
+            if (_uiMode is AndroidGameUiMode.Gameplay or AndroidGameUiMode.BuildTools)
+                SetUiMode(_uiMode == AndroidGameUiMode.BuildTools
+                    ? AndroidGameUiMode.Gameplay
+                    : AndroidGameUiMode.BuildTools);
+            return;
+        }
+        if (_uiMode != AndroidGameUiMode.Gameplay) return;
+        if (_input.ConsumePressed(VirtualBindingKind.Keyboard, "V"))
         {
             _precisionMode = !_precisionMode;
             _microBuild.Enabled = _precisionMode;
@@ -1497,18 +1772,66 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         return program;
     }
 
+    private void CreateMaterialAtlasTexture()
+    {
+        var atlas = new ProceduralMaterialAtlas(_blocks);
+        int materialCount = _blocks.Definitions.Max(definition => (int)definition.Id) + 1;
+        int tileCount = materialCount * ProceduralMaterialAtlas.FacesPerMaterial;
+        int tileRows = (tileCount + MaterialAtlasTilesPerRow - 1) / MaterialAtlasTilesPerRow;
+        _materialAtlasWidth = MaterialAtlasTilesPerRow * ProceduralMaterialAtlas.TileSize;
+        _materialAtlasHeight = Math.Max(1, tileRows) * ProceduralMaterialAtlas.TileSize;
+        byte[] compactPixels = new byte[_materialAtlasWidth * _materialAtlasHeight * 4];
+        foreach (BlockDefinition definition in _blocks.Definitions)
+        foreach (MaterialFace face in Enum.GetValues<MaterialFace>())
+        {
+            int tile = definition.Id * ProceduralMaterialAtlas.FacesPerMaterial + (int)face;
+            int sourceX = tile % ProceduralMaterialAtlas.TilesPerRow * ProceduralMaterialAtlas.TileSize;
+            int sourceY = tile / ProceduralMaterialAtlas.TilesPerRow * ProceduralMaterialAtlas.TileSize;
+            int destinationX = tile % MaterialAtlasTilesPerRow * ProceduralMaterialAtlas.TileSize;
+            int destinationY = tile / MaterialAtlasTilesPerRow * ProceduralMaterialAtlas.TileSize;
+            for (int row = 0; row < ProceduralMaterialAtlas.TileSize; row++)
+            {
+                int source = ((sourceY + row) * ProceduralMaterialAtlas.Width + sourceX) * 4;
+                int destination = ((destinationY + row) * _materialAtlasWidth + destinationX) * 4;
+                Array.Copy(atlas.ColorPixels, source, compactPixels, destination,
+                    ProceduralMaterialAtlas.TileSize * 4);
+            }
+        }
+
+        using ByteBuffer pixels = ByteBuffer.AllocateDirect(compactPixels.Length)!;
+        pixels.Put(compactPixels);
+        pixels.Position(0);
+
+        int[] textures = new int[1];
+        GLES20.GlGenTextures(1, textures, 0);
+        _materialAtlasTexture = textures[0];
+        GLES20.GlBindTexture(GLES20.GlTexture2d, _materialAtlasTexture);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureMinFilter, GLES20.GlNearest);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureMagFilter, GLES20.GlNearest);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureWrapS, GLES20.GlClampToEdge);
+        GLES20.GlTexParameteri(GLES20.GlTexture2d, GLES20.GlTextureWrapT, GLES20.GlClampToEdge);
+        GLES20.GlTexImage2D(GLES20.GlTexture2d, 0, GLES20.GlRgba,
+            _materialAtlasWidth, _materialAtlasHeight, 0,
+            GLES20.GlRgba, GLES20.GlUnsignedByte, pixels);
+        int error = GLES20.GlGetError();
+        if (error != GLES20.GlNoError)
+            _status($"Android material atlas upload failed: GL 0x{error:X}");
+    }
+
     private void EnsureGBuffer()
     {
         if (!_supportsEs3 || _width <= 1 || _height <= 1) return;
         if (_gbufferFramebuffer != 0 && _gbufferWidth == _width && _gbufferHeight == _height) return;
         DeleteGBuffer();
-        int[] textures = new int[3];
+        int[] textures = new int[4];
         GLES30.GlGenTextures(textures.Length, textures, 0);
         _gbufferAlbedoTexture = textures[0];
         _gbufferNormalTexture = textures[1];
-        _gbufferDepthTexture = textures[2];
+        _gbufferLightingTexture = textures[2];
+        _gbufferDepthTexture = textures[3];
         ConfigureColorTarget(_gbufferAlbedoTexture);
         ConfigureColorTarget(_gbufferNormalTexture);
+        ConfigureColorTarget(_gbufferLightingTexture);
         GLES30.GlBindTexture(GLES30.GlTexture2d, _gbufferDepthTexture);
         GLES30.GlTexParameteri(GLES30.GlTexture2d, GLES30.GlTextureMinFilter, GLES30.GlNearest);
         GLES30.GlTexParameteri(GLES30.GlTexture2d, GLES30.GlTextureMagFilter, GLES30.GlNearest);
@@ -1525,9 +1848,12 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             GLES30.GlTexture2d, _gbufferAlbedoTexture, 0);
         GLES30.GlFramebufferTexture2D(GLES30.GlFramebuffer, GLES30.GlColorAttachment1,
             GLES30.GlTexture2d, _gbufferNormalTexture, 0);
+        GLES30.GlFramebufferTexture2D(GLES30.GlFramebuffer, GLES30.GlColorAttachment2,
+            GLES30.GlTexture2d, _gbufferLightingTexture, 0);
         GLES30.GlFramebufferTexture2D(GLES30.GlFramebuffer, GLES30.GlDepthAttachment,
             GLES30.GlTexture2d, _gbufferDepthTexture, 0);
-        GLES30.GlDrawBuffers(2, new[] { GLES30.GlColorAttachment0, GLES30.GlColorAttachment1 }, 0);
+        GLES30.GlDrawBuffers(3,
+            new[] { GLES30.GlColorAttachment0, GLES30.GlColorAttachment1, GLES30.GlColorAttachment2 }, 0);
         int status = GLES30.GlCheckFramebufferStatus(GLES30.GlFramebuffer);
         GLES30.GlBindFramebuffer(GLES30.GlFramebuffer, 0);
         if (status != GLES30.GlFramebufferComplete)
@@ -1547,11 +1873,12 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         if (!_supportsCompute || _width <= 1 || _height <= 1) return;
         if (_computeOutputTexture == 0)
         {
-            int[] textures = new int[3];
+            int[] textures = new int[4];
             GLES30.GlGenTextures(textures.Length, textures, 0);
             _computeOutputTexture = textures[0];
             _computeVoxelTexture = textures[1];
-            _computeMaterialTexture = textures[2];
+            _computeFluidTexture = textures[2];
+            _computeMaterialTexture = textures[3];
 
             GLES30.GlBindTexture(GLES30.GlTexture3d, _computeVoxelTexture);
             GLES30.GlTexParameteri(GLES30.GlTexture3d, GLES30.GlTextureMinFilter, GLES30.GlNearest);
@@ -1562,6 +1889,16 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             GLES30.GlTexImage3D(GLES30.GlTexture3d, 0, GLES30.GlR16ui,
                 ComputeWindowSize, ComputeWindowHeight, ComputeWindowSize, 0,
                 GLES30.GlRedInteger, GLES30.GlUnsignedShort, null);
+
+            GLES30.GlBindTexture(GLES30.GlTexture3d, _computeFluidTexture);
+            GLES30.GlTexParameteri(GLES30.GlTexture3d, GLES30.GlTextureMinFilter, GLES30.GlNearest);
+            GLES30.GlTexParameteri(GLES30.GlTexture3d, GLES30.GlTextureMagFilter, GLES30.GlNearest);
+            GLES30.GlTexParameteri(GLES30.GlTexture3d, GLES30.GlTextureWrapS, GLES30.GlClampToEdge);
+            GLES30.GlTexParameteri(GLES30.GlTexture3d, GLES30.GlTextureWrapT, GLES30.GlClampToEdge);
+            GLES30.GlTexParameteri(GLES30.GlTexture3d, GLES30.GlTextureWrapR, GLES30.GlClampToEdge);
+            GLES30.GlTexImage3D(GLES30.GlTexture3d, 0, GLES30.GlR8ui,
+                ComputeWindowSize, ComputeWindowHeight, ComputeWindowSize, 0,
+                GLES30.GlRedInteger, GLES30.GlUnsignedByte, null);
             UploadComputeMaterials();
         }
 
@@ -1611,18 +1948,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         _computeOriginY = Math.Clamp((int)MathF.Floor(eye.Y) - ComputeWindowHeight / 2,
             VoxelWorld.MinimumY, VoxelWorld.MaximumY - ComputeWindowHeight);
         _computeOriginZ = (int)MathF.Floor(eye.Z) - ComputeWindowSize / 2;
-        ushort[] source = _world.CreateRenderWindowSnapshot(_computeOriginX, _computeOriginZ);
-        short[] window = new short[ComputeWindowSize * ComputeWindowHeight * ComputeWindowSize];
-        int sourceY = _computeOriginY - VoxelWorld.MinimumY;
-        int rowBytes = ComputeWindowSize * sizeof(ushort);
-        for (int z = 0; z < ComputeWindowSize; z++)
-        for (int y = 0; y < ComputeWindowHeight; y++)
-        {
-            int sourceIndex = ComputeWindowSize * (sourceY + y + VoxelWorld.Height * z);
-            int destinationIndex = ComputeWindowSize * (y + ComputeWindowHeight * z);
-            System.Buffer.BlockCopy(source, sourceIndex * sizeof(ushort), window,
-                destinationIndex * sizeof(short), rowBytes);
-        }
+        ushort[] source = _world.CreateRenderVolumeSnapshot(
+            _computeOriginX, _computeOriginY, _computeOriginZ,
+            ComputeWindowSize, ComputeWindowHeight, ComputeWindowSize);
+        short[] window = new short[source.Length];
+        System.Buffer.BlockCopy(source, 0, window, 0, source.Length * sizeof(ushort));
 
         using ByteBuffer bytes = ByteBuffer.AllocateDirect(window.Length * sizeof(short))!;
         bytes.Order(ByteOrder.NativeOrder()!);
@@ -1633,6 +1963,17 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES30.GlTexSubImage3D(GLES30.GlTexture3d, 0, 0, 0, 0,
             ComputeWindowSize, ComputeWindowHeight, ComputeWindowSize,
             GLES30.GlRedInteger, GLES30.GlUnsignedShort, shorts);
+
+        byte[] fluidLevels = _world.CreateFluidRenderVolumeSnapshot(
+            _computeOriginX, _computeOriginY, _computeOriginZ,
+            ComputeWindowSize, ComputeWindowHeight, ComputeWindowSize);
+        using ByteBuffer fluidBytes = ByteBuffer.AllocateDirect(fluidLevels.Length)!;
+        fluidBytes.Put(fluidLevels);
+        fluidBytes.Position(0);
+        GLES30.GlBindTexture(GLES30.GlTexture3d, _computeFluidTexture);
+        GLES30.GlTexSubImage3D(GLES30.GlTexture3d, 0, 0, 0, 0,
+            ComputeWindowSize, ComputeWindowHeight, ComputeWindowSize,
+            GLES30.GlRedInteger, GLES30.GlUnsignedByte, fluidBytes);
         _computeWorldDirty = false;
     }
 
@@ -1651,11 +1992,13 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     {
         if (_gbufferFramebuffer != 0)
             GLES30.GlDeleteFramebuffers(1, new[] { _gbufferFramebuffer }, 0);
-        int[] textures = { _gbufferAlbedoTexture, _gbufferNormalTexture, _gbufferDepthTexture };
+        int[] textures =
+            { _gbufferAlbedoTexture, _gbufferNormalTexture, _gbufferLightingTexture, _gbufferDepthTexture };
         if (textures.Any(texture => texture != 0)) GLES30.GlDeleteTextures(textures.Length, textures, 0);
         _gbufferFramebuffer = 0;
         _gbufferAlbedoTexture = 0;
         _gbufferNormalTexture = 0;
+        _gbufferLightingTexture = 0;
         _gbufferDepthTexture = 0;
         _gbufferWidth = 0;
         _gbufferHeight = 0;
@@ -1675,15 +2018,24 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         {
             DeleteMesh(_chunkMeshes[stale]);
             _chunkMeshes.Remove(stale);
+            _shadowDirty = true;
         }
 
         if (_chunkMeshes.Count == 0)
         {
-            foreach (ChunkCoordinate coordinate in desired.OrderBy(chunk => chunk.Z).ThenBy(chunk => chunk.X))
+            ChunkCoordinate? nearest = desired
+                .OrderBy(chunk => Math.Max(Math.Abs(chunk.X - center.X), Math.Abs(chunk.Z - center.Z)))
+                .ThenBy(chunk => chunk.Z)
+                .ThenBy(chunk => chunk.X)
+                .Cast<ChunkCoordinate?>()
+                .FirstOrDefault();
+            if (nearest.HasValue)
             {
+                ChunkCoordinate coordinate = nearest.Value;
                 MeshBuildResult result = BuildChunkMesh(_world.CreateChunkMeshingSnapshot(coordinate));
                 _chunkMeshes[coordinate] = UploadMesh(result, null);
                 _dirtyMeshChunks.Remove(coordinate);
+                _shadowDirty = true;
             }
         }
         else
@@ -1718,6 +2070,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         {
             _gridMesh = UploadMesh(BuildGridMesh(), _gridMesh);
             _gridMeshDirty = false;
+            _shadowDirty = true;
         }
 
         _opaqueVertexCount = _chunkMeshes.Values.Sum(mesh => mesh.OpaqueVertexCount) +
@@ -1741,6 +2094,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             {
                 _chunkMeshes.TryGetValue(completed.Coordinate, out GpuMesh? previous);
                 _chunkMeshes[completed.Coordinate] = UploadMesh(completed.Mesh, previous);
+                _shadowDirty = true;
                 if (currentVersion == completed.Version)
                     _dirtyMeshChunks.Remove(completed.Coordinate);
             }
@@ -2172,10 +2526,10 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             AndroidRendererMode.HardwareRayTracing => "Hardware RT",
             _ => "Classic",
         };
-        string precision = _precisionMode ? " 繚 V 蝎曉?" : string.Empty;
-        _status($"{renderer} 繚 {fps} FPS 繚 {_vertexCount:N0} vertices 繚 UI max {_maximumUiMilliseconds:0.0} ms{precision}");
+        string precision = _precisionMode ? " · V 精密模式" : string.Empty;
+        _status($"{renderer} · {fps} FPS · {_vertexCount:N0} vertices · UI max {_maximumUiMilliseconds:0.0} ms{precision}");
         if (_physics.ActiveGridCount > 0)
-            _status($"Physics Grid 繚 {_physics.ActiveGridCount} active 繚 {_physics.Status}");
+            _status($"Physics Grid · {_physics.ActiveGridCount} active · {_physics.Status}");
         _fpsFrames = 0;
         _fpsWindowStart = now;
         _maximumUiMilliseconds = 0;
@@ -2257,6 +2611,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     private const string VertexShader = """
         uniform mat4 uMvp;
+        uniform mat4 uLightMvp;
         attribute vec3 aPosition;
         attribute vec3 aNormal;
         attribute vec3 aColor;
@@ -2269,6 +2624,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         varying float vMetallic;
         varying float vRoughness;
         varying float vAlpha;
+        varying vec4 vShadowPosition;
         void main() {
             vPosition = aPosition;
             vNormal = aNormal;
@@ -2276,18 +2632,36 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             vMetallic = aMetallic;
             vRoughness = aRoughness;
             vAlpha = aAlpha;
+            vShadowPosition = uLightMvp * vec4(aPosition, 1.0);
             gl_Position = uMvp * vec4(aPosition, 1.0);
         }
         """;
 
     private const string ClassicFragmentShader = """
         precision mediump float;
+        uniform sampler2D uShadowMap;
+        uniform vec2 uShadowTexel;
         varying vec3 vNormal;
         varying vec3 vAlbedo;
         varying float vAlpha;
+        varying vec4 vShadowPosition;
+        float shadowVisibility(vec3 normal, vec3 lightDirection) {
+            vec3 projected = vShadowPosition.xyz / max(vShadowPosition.w, 0.0001) * 0.5 + 0.5;
+            if (projected.x <= 0.0 || projected.x >= 1.0 || projected.y <= 0.0 || projected.y >= 1.0 || projected.z >= 1.0)
+                return 1.0;
+            float bias = max(0.0022 * (1.0 - dot(normal, lightDirection)), 0.0007);
+            float visibility = 0.0;
+            for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                float depth = texture2D(uShadowMap, projected.xy + vec2(float(x), float(y)) * uShadowTexel).r;
+                visibility += projected.z - bias <= depth ? 1.0 : 0.24;
+            }
+            return visibility / 9.0;
+        }
         void main() {
             vec3 lightDirection = normalize(vec3(0.45, 0.82, 0.32));
-            float light = 0.30 + max(dot(normalize(vNormal), lightDirection), 0.0) * 0.70;
+            vec3 normal = normalize(vNormal);
+            float light = 0.30 + max(dot(normal, lightDirection), 0.0) * 0.70 * shadowVisibility(normal, lightDirection);
             gl_FragColor = vec4(vAlbedo * light, vAlpha);
         }
         """;
@@ -2296,12 +2670,29 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         precision highp float;
         const float PI = 3.14159265359;
         uniform vec3 uCamera;
+        uniform sampler2D uShadowMap;
+        uniform vec2 uShadowTexel;
         varying vec3 vPosition;
         varying vec3 vNormal;
         varying vec3 vAlbedo;
         varying float vMetallic;
         varying float vRoughness;
         varying float vAlpha;
+        varying vec4 vShadowPosition;
+
+        float shadowVisibility(vec3 normal, vec3 lightDirection) {
+            vec3 projected = vShadowPosition.xyz / max(vShadowPosition.w, 0.0001) * 0.5 + 0.5;
+            if (projected.x <= 0.0 || projected.x >= 1.0 || projected.y <= 0.0 || projected.y >= 1.0 || projected.z >= 1.0)
+                return 1.0;
+            float bias = max(0.0022 * (1.0 - dot(normal, lightDirection)), 0.0007);
+            float visibility = 0.0;
+            for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                float depth = texture2D(uShadowMap, projected.xy + vec2(float(x), float(y)) * uShadowTexel).r;
+                visibility += projected.z - bias <= depth ? 1.0 : 0.24;
+            }
+            return visibility / 9.0;
+        }
 
         float distributionGgx(vec3 n, vec3 h, float roughness) {
             float a = roughness * roughness;
@@ -2336,7 +2727,8 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             float g = geometrySchlick(nv, roughness) * geometrySchlick(max(dot(n, l), 0.001), roughness);
             vec3 specular = d * g * f / max(4.0 * nv * max(nl, 0.001), 0.001);
             vec3 diffuse = (1.0 - f) * (1.0 - metallic) * vAlbedo / PI;
-            vec3 color = (diffuse + specular) * nl * 2.2 + vAlbedo * 0.16;
+            float visibility = shadowVisibility(n, l);
+            vec3 color = (diffuse + specular) * nl * visibility * 2.2 + vAlbedo * 0.16;
             color = color / (color + vec3(1.0));
             color = pow(color, vec3(1.0 / 2.2));
             gl_FragColor = vec4(color, vAlpha);
@@ -2346,6 +2738,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private const string DeferredVertexShader = """
         #version 300 es
         uniform mat4 uMvp;
+        uniform mat4 uLightMvp;
         layout(location = 0) in vec3 aPosition;
         layout(location = 1) in vec3 aNormal;
         layout(location = 2) in vec3 aColor;
@@ -2356,11 +2749,13 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         out vec3 vAlbedo;
         out float vMetallic;
         out float vRoughness;
+        out vec4 vShadowPosition;
         void main() {
             vNormal = aNormal;
             vAlbedo = aColor;
             vMetallic = aMetallic;
             vRoughness = aRoughness;
+            vShadowPosition = uLightMvp * vec4(aPosition, 1.0);
             gl_Position = uMvp * vec4(aPosition, 1.0);
         }
         """;
@@ -2372,11 +2767,31 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         in vec3 vAlbedo;
         in float vMetallic;
         in float vRoughness;
+        in vec4 vShadowPosition;
+        uniform sampler2D uShadowMap;
+        uniform vec2 uShadowTexel;
         layout(location = 0) out vec4 gAlbedoMetal;
         layout(location = 1) out vec4 gNormalRough;
+        layout(location = 2) out vec4 gLighting;
+        float shadowVisibility(vec3 normal, vec3 lightDirection) {
+            vec3 projected = vShadowPosition.xyz / max(vShadowPosition.w, 0.0001) * 0.5 + 0.5;
+            if (projected.x <= 0.0 || projected.x >= 1.0 || projected.y <= 0.0 || projected.y >= 1.0 || projected.z >= 1.0)
+                return 1.0;
+            float bias = max(0.0022 * (1.0 - dot(normal, lightDirection)), 0.0007);
+            float visibility = 0.0;
+            for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                float depth = texture(uShadowMap, projected.xy + vec2(float(x), float(y)) * uShadowTexel).r;
+                visibility += projected.z - bias <= depth ? 1.0 : 0.24;
+            }
+            return visibility / 9.0;
+        }
         void main() {
+            vec3 normal = normalize(vNormal);
+            vec3 lightDirection = normalize(vec3(0.45, 0.82, 0.32));
             gAlbedoMetal = vec4(vAlbedo, clamp(vMetallic, 0.0, 1.0));
-            gNormalRough = vec4(normalize(vNormal) * 0.5 + 0.5, clamp(vRoughness, 0.04, 1.0));
+            gNormalRough = vec4(normal * 0.5 + 0.5, clamp(vRoughness, 0.04, 1.0));
+            gLighting = vec4(shadowVisibility(normal, lightDirection), 0.0, 0.0, 1.0);
         }
         """;
 
@@ -2396,6 +2811,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         precision highp float;
         uniform sampler2D uAlbedoMetal;
         uniform sampler2D uNormalRough;
+        uniform sampler2D uLighting;
         uniform int uHybrid;
         in vec2 vUv;
         out vec4 outColor;
@@ -2410,8 +2826,9 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             vec3 albedo = albedoMetal.rgb;
             float metallic = albedoMetal.a;
             float roughness = normalRough.a;
+            float shadow = texture(uLighting, vUv).r;
             vec3 lightDirection = normalize(vec3(0.45, 0.82, 0.32));
-            float diffuseLight = max(dot(n, lightDirection), 0.0);
+            float diffuseLight = max(dot(n, lightDirection), 0.0) * shadow;
             vec3 diffuse = albedo * (0.16 + diffuseLight * 0.84) * (1.0 - metallic * 0.35);
             vec3 reflectedSky = mix(vec3(0.10, 0.16, 0.23), vec3(0.38, 0.63, 0.88), n.y * 0.5 + 0.5);
             float facing = clamp(1.0 - abs(n.z), 0.0, 1.0);
@@ -2426,6 +2843,22 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         }
         """;
 
+    private const string ShadowVertexShader = """
+        uniform mat4 uLightMvp;
+        attribute vec3 aPosition;
+        void main() {
+            gl_Position = uLightMvp * vec4(aPosition, 1.0);
+        }
+        """;
+
+    private const string ShadowFragmentShader = """
+        precision highp float;
+        void main() {
+            float depth = gl_FragCoord.z;
+            gl_FragColor = vec4(depth, depth, depth, 1.0);
+        }
+        """;
+
     private const string ComputePathTracingShader = """
         #version 310 es
         precision highp float;
@@ -2434,6 +2867,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
         layout(rgba8, binding = 0) writeonly uniform highp image2D uOutput;
         uniform highp usampler3D uVoxels;
+        uniform highp usampler3D uFluidLevels;
         uniform sampler2D uMaterials;
         uniform vec2 uResolution;
         uniform vec3 uCamera;
@@ -2442,6 +2876,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         uniform vec3 uUp;
         uniform float uTanHalfFov;
         uniform ivec3 uVoxelOrigin;
+        uniform int uWaterMaterial;
         const ivec3 WindowSize = ivec3(64, 256, 64);
 
         bool insideWindow(ivec3 cell) {
@@ -2452,6 +2887,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         uint voxelAt(ivec3 cell) {
             if (!insideWindow(cell)) return 0u;
             return texelFetch(uVoxels, cell - uVoxelOrigin, 0).r;
+        }
+
+        uint fluidLevelAt(ivec3 cell) {
+            if (!insideWindow(cell)) return 0u;
+            return texelFetch(uFluidLevels, cell - uVoxelOrigin, 0).r;
         }
 
         uint traceVoxel(vec3 origin, vec3 direction, out vec3 normal, out vec3 hitPosition) {
@@ -2467,8 +2907,27 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             for (int iteration = 0; iteration < 192; iteration++) {
                 uint material = voxelAt(cell);
                 if (material != 0u) {
-                    hitPosition = origin + ray * distanceAlongRay;
-                    return material;
+                    float cellExit = min(sideDistance.x, min(sideDistance.y, sideDistance.z));
+                    if (material == uint(uWaterMaterial)) {
+                        float level = float(min(fluidLevelAt(cell), 15u));
+                        float surfaceY = float(cell.y) + 0.875 * (16.0 - level) / 16.0;
+                        vec3 entryPosition = origin + ray * distanceAlongRay;
+                        if (entryPosition.y <= surfaceY + 0.0005) {
+                            hitPosition = entryPosition;
+                            return material;
+                        }
+                        if (ray.y < -0.00001) {
+                            float surfaceDistance = (surfaceY - origin.y) / ray.y;
+                            if (surfaceDistance >= distanceAlongRay && surfaceDistance <= cellExit) {
+                                normal = vec3(0.0, 1.0, 0.0);
+                                hitPosition = origin + ray * surfaceDistance;
+                                return material;
+                            }
+                        }
+                    } else {
+                        hitPosition = origin + ray * distanceAlongRay;
+                        return material;
+                    }
                 }
                 if (!insideWindow(cell) && distanceAlongRay > 96.0) break;
                 if (sideDistance.x <= sideDistance.y && sideDistance.x <= sideDistance.z) {

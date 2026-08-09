@@ -706,6 +706,21 @@ public static class SelfTests
         Assert(waterSnapshot.GetFluidLevel(horizontal.X, 1, horizontal.Z) ==
                world.GetFluidLevel(horizontal.X, 1, horizontal.Z),
             "fluid level was not copied into the immutable renderer snapshot");
+
+        var pourWorld = new VoxelWorld(generate: false);
+        using var pourFlow = new WaterFlowSimulation(pourWorld);
+        for (int x = 1; x <= 9; x++)
+        for (int z = 1; z <= 9; z++)
+            pourWorld.Set(x, 0, z, VoxelMaterial.Stone);
+        pourWorld.Set(5, 1, 5, VoxelMaterial.Water);
+        Assert(pourWorld.PourWater(5, 1, 5),
+            "an existing water cell rejected a second bucket");
+        for (int step = 0; step < 24; step++) pourFlow.Update(0.05f);
+        Assert(SumWater(pourWorld, 0, 10, 0, 4, 0, 10) == VoxelWorld.FluidCapacity * 2,
+            "pouring into existing water did not preserve the added finite volume");
+        Assert(new[] { (4, 1, 5), (6, 1, 5), (5, 1, 4), (5, 1, 6) }
+                .Any(cell => pourWorld.GetFluidAmount(cell.Item1, cell.Item2, cell.Item3) > 0),
+            "a second bucket did not flow out of the targeted water cell");
     }
 
     private static void TestWaterDisplacement()
@@ -1511,6 +1526,12 @@ public static class SelfTests
         Assert(world.PhysicsGrids.Count == 1 && world.PhysicsGrids.Grids[0].Elements.Count == 2,
             "connected unsupported voxels did not become one local grid");
         float startY = world.PhysicsGrids.Grids[0].Position.Y;
+        physics.SimulationEnabled = false;
+        for (int index = 0; index < 4; index++) physics.Update(1f / 60f);
+        Assert(world.PhysicsGrids.Count == 1 &&
+               MathF.Abs(world.PhysicsGrids.Grids[0].Position.Y - startY) < 0.00001f,
+            "disabling physics deleted or moved an existing grid");
+        physics.SimulationEnabled = true;
         for (int index = 0; index < 12; index++) physics.Update(1f / 60f);
         Assert(world.PhysicsGrids.Grids[0].Position.Y < startY,
             "physics grid did not move continuously under gravity");
@@ -2754,13 +2775,19 @@ public static class SelfTests
     private static void Run(string name, Action test, List<string> failures)
     {
         _testsRun++;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Console.Write($"TEST {_testsRun,2}  {name} ... ");
+        Console.Out.Flush();
         try
         {
             test();
-            Console.WriteLine($"PASS  {name}");
+            stopwatch.Stop();
+            Console.WriteLine($"PASS ({stopwatch.Elapsed.TotalMilliseconds:0} ms)");
         }
         catch (Exception exception)
         {
+            stopwatch.Stop();
+            Console.WriteLine($"FAIL ({stopwatch.Elapsed.TotalMilliseconds:0} ms)");
             failures.Add($"{name}: {exception.Message}");
         }
     }

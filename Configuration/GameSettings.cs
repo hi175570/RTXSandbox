@@ -116,6 +116,7 @@ public sealed class GameSettings
     public float AutosaveMinutes { get; set; } = 2f;
     public bool StartInFlightMode { get; set; }
     public bool StartWithNoClip { get; set; }
+    public bool PhysicsSimulationEnabled { get; set; } = true;
     public string SelectedBlockKey { get; set; } = "rtxsandbox:stone";
     public string EditorTool { get; set; } = "Place";
     public int BrushRadius { get; set; } = 2;

@@ -409,9 +409,11 @@ public sealed class BuildToolSystem
             ? (hit.X, hit.Y, hit.Z)
             : hit.Adjacent;
         BlockDefinition selectedBlock = _blocks.Get(SelectedBlockId);
-        if (selectedBlock.IsFluid && _world.IsFluid(hit.X, hit.Y, hit.Z))
+        if (SelectedBlockId == (ushort)VoxelMaterial.Water && _world.IsFluid(hit.X, hit.Y, hit.Z))
         {
-            (x, y, z) = (hit.X, hit.Y, hit.Z);
+            bool poured = _world.PourWater(hit.X, hit.Y, hit.Z);
+            Status = poured ? "Poured water into the connected volume" : "Water could not be placed here";
+            return poured;
         }
         var requested = new Dictionary<VoxelPoint, PendingEdit>();
         AddPending(requested, x, y, z, SelectedBlockId);

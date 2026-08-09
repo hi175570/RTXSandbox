@@ -25,13 +25,6 @@ namespace RTXSandbox;
 public sealed partial class SandboxGame : GameWindow
 {
     private static readonly int[] QualityBounces = { 1, 2, 3, 4, 6, 8, 12, 16, 20, 30, 40, 50 };
-    private static readonly string[] BindableKeys =
-    {
-        "W", "A", "S", "D", "Q", "E", "R", "F", "V", "B", "I", "N", "M", "X",
-        "Space", "LeftShift", "RightShift", "LeftControl", "RightControl", "LeftAlt", "RightAlt",
-        "Tab", "Escape", "Up", "Down", "Left", "Right", "PageUp", "PageDown", "Home", "End",
-        "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9",
-    };
     private static readonly IReadOnlyDictionary<string, string> ChineseBlockWords =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -128,6 +121,7 @@ public sealed partial class SandboxGame : GameWindow
     private bool _pauseMenuVisible;
     private bool _modsVisible;
     private bool _achievementsVisible;
+    private string? _bindingCaptureTarget;
     private bool _languageVisible;
     private bool _keyBindingsVisible;
     private bool _settingsOpenedFromPause;
@@ -384,7 +378,10 @@ public sealed partial class SandboxGame : GameWindow
         {
             if (_blocks.TryGet(key, out BlockDefinition? recent) && recent!.IsPlaceable) _recentBlocks.Add(recent.Key);
         }
-        _physics = new VoxelPhysicsSimulator(_world, _blocks);
+        _physics = new VoxelPhysicsSimulator(_world, _blocks)
+        {
+            SimulationEnabled = _settings.PhysicsSimulationEnabled,
+        };
         _waterFlow = new WaterFlowSimulation(_world);
         _inventory = new PlayerInventory(_items);
         if (loadedSave && savedState.Inventory.Count > 0)
@@ -1754,6 +1751,9 @@ public sealed partial class SandboxGame : GameWindow
         bool enteringText = _loaded && _ui.WantsTextEntry;
         bool simulateShortcut = _gpuSmoke && !_gpuSmokeShortcutTriggered &&
                                 _gpuSmokeFrames >= 1 && !string.IsNullOrEmpty(_gpuSmokeShortcut);
+        // A binding capture owns every key for one frame. In particular, Escape
+        // means "unbound" here and must not close the controls screen.
+        if (_bindingCaptureTarget is not null) return;
         bool escapePressed = IsBindingPressed(_settings.PauseKey) ||
                              (simulateShortcut && _gpuSmokeShortcut == "settings");
         if (!imeComposing && escapePressed)
@@ -2206,7 +2206,10 @@ public sealed partial class SandboxGame : GameWindow
         VoxelHit hit = _selection.Value;
         if (!PlacementRules.IsFarEnough(hit.Distance)) return;
         BlockDefinition hitDefinition = _blocks.Get(hit.MaterialId);
-        (int x, int y, int z) = hitDefinition.IsReplaceable && hit.MaterialId != selectedBlock.Id
+        bool pouringIntoWater = selectedBlock.Id == (ushort)VoxelMaterial.Water && hitDefinition.IsFluid;
+        (int x, int y, int z) = pouringIntoWater
+            ? (hit.X, hit.Y, hit.Z)
+            : hitDefinition.IsReplaceable && hit.MaterialId != selectedBlock.Id
             ? (hit.X, hit.Y, hit.Z)
             : hit.Adjacent;
         ushort existing = _world.GetBlockId(x, y, z);
@@ -2226,8 +2229,14 @@ public sealed partial class SandboxGame : GameWindow
         y = placeEvent.Y;
         z = placeEvent.Z;
         existing = _world.GetBlockId(x, y, z);
+        if (placeEvent.NewBlockId == (ushort)VoxelMaterial.Water && _world.IsFluid(x, y, z))
+        {
+            if (_world.PourWater(x, y, z))
+                _progression.NotifyBlockPlaced(_blocks.Get(placeEvent.NewBlockId));
+            return;
+        }
         if ((existing != 0 && !_blocks.Get(existing).IsReplaceable) ||
-            _player.WouldIntersectBlock(x, y, z))
+            (_blocks.Get(placeEvent.NewBlockId).IsCollidable && _player.WouldIntersectBlock(x, y, z)))
         {
             return;
         }
@@ -3368,6 +3377,13 @@ public sealed partial class SandboxGame : GameWindow
 
                     ImGui.Separator();
                     ImGui.TextWrapped("Structural Grid physics is part of the world: unsupported six-face components become continuous moving and rotating local grids.");
+                    bool physicsEnabled = _physics.SimulationEnabled;
+                    if (ImGui.Checkbox("Enable physics simulation", ref physicsEnabled))
+                    {
+                        _physics.SimulationEnabled = physicsEnabled;
+                        _settings.PhysicsSimulationEnabled = physicsEnabled;
+                    }
+                    ImGui.TextDisabled("Disabling simulation freezes existing grids at their current transforms; it does not delete them.");
                     ImGui.TextDisabled(_physics.Status);
                     ImGui.EndTabItem();
                 }
@@ -3682,17 +3698,17 @@ public sealed partial class SandboxGame : GameWindow
             ImGui.Separator();
             if (ImGui.BeginChild("bindings", new NumericsVector2(0f, -96f), ImGuiChildFlags.Borders))
             {
-                _settings.MoveForwardKey = DrawBindingRow(L("move_forward"), _settings.MoveForwardKey);
-                _settings.MoveBackwardKey = DrawBindingRow(L("move_backward"), _settings.MoveBackwardKey);
-                _settings.MoveLeftKey = DrawBindingRow(L("move_left"), _settings.MoveLeftKey);
-                _settings.MoveRightKey = DrawBindingRow(L("move_right"), _settings.MoveRightKey);
-                _settings.JumpKey = DrawBindingRow(L("jump"), _settings.JumpKey);
-                _settings.CrouchKey = DrawBindingRow(L("crouch"), _settings.CrouchKey);
-                _settings.SprintKey = DrawBindingRow(L("sprint"), _settings.SprintKey);
-                _settings.InventoryKey = DrawBindingRow(L("inventory"), _settings.InventoryKey);
-                _settings.BuildToolsKey = DrawBindingRow(L("build_tools"), _settings.BuildToolsKey);
-                _settings.PrecisionModeKey = DrawBindingRow(L("precision"), _settings.PrecisionModeKey);
-                _settings.PauseKey = DrawBindingRow(L("pause"), _settings.PauseKey);
+                _settings.MoveForwardKey = DrawBindingRow("move_forward", L("move_forward"), _settings.MoveForwardKey);
+                _settings.MoveBackwardKey = DrawBindingRow("move_backward", L("move_backward"), _settings.MoveBackwardKey);
+                _settings.MoveLeftKey = DrawBindingRow("move_left", L("move_left"), _settings.MoveLeftKey);
+                _settings.MoveRightKey = DrawBindingRow("move_right", L("move_right"), _settings.MoveRightKey);
+                _settings.JumpKey = DrawBindingRow("jump", L("jump"), _settings.JumpKey);
+                _settings.CrouchKey = DrawBindingRow("crouch", L("crouch"), _settings.CrouchKey);
+                _settings.SprintKey = DrawBindingRow("sprint", L("sprint"), _settings.SprintKey);
+                _settings.InventoryKey = DrawBindingRow("inventory", L("inventory"), _settings.InventoryKey);
+                _settings.BuildToolsKey = DrawBindingRow("build_tools", L("build_tools"), _settings.BuildToolsKey);
+                _settings.PrecisionModeKey = DrawBindingRow("precision", L("precision"), _settings.PrecisionModeKey);
+                _settings.PauseKey = DrawBindingRow("pause", L("pause"), _settings.PauseKey);
             }
             ImGui.EndChild();
             if (ImGui.Button(_settings.Language == UiLanguage.English ? "Restore Defaults" :
@@ -3710,6 +3726,7 @@ public sealed partial class SandboxGame : GameWindow
                 _settings.BuildToolsKey = "B";
                 _settings.PrecisionModeKey = "V";
                 _settings.PauseKey = "Escape";
+                _bindingCaptureTarget = null;
             }
             ImGui.SameLine();
             if (ImGui.Button(L("done"), new NumericsVector2(180f, 40f)))
@@ -3727,22 +3744,32 @@ public sealed partial class SandboxGame : GameWindow
         }
     }
 
-    private static string DrawBindingRow(string label, string binding)
+    private string DrawBindingRow(string id, string label, string binding)
     {
-        ImGui.PushID(label);
+        ImGui.PushID(id);
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(label);
         ImGui.SameLine(250f);
-        ImGui.SetNextItemWidth(260f);
-        if (ImGui.BeginCombo("##key", binding))
+        bool capturing = string.Equals(_bindingCaptureTarget, id, StringComparison.Ordinal);
+        string buttonLabel = capturing
+            ? (_settings.Language == UiLanguage.English ? "Press any key..." :
+                _settings.Language == UiLanguage.SimplifiedChinese ? "请按任意键……" : "請按任意鍵……")
+            : string.Equals(binding, "Unbound", StringComparison.OrdinalIgnoreCase)
+                ? (_settings.Language == UiLanguage.English ? "Unbound" :
+                    _settings.Language == UiLanguage.SimplifiedChinese ? "未设置" : "未設定")
+                : binding;
+        if (ImGui.Button($"{buttonLabel}##key", new NumericsVector2(260f, 0f)))
+            _bindingCaptureTarget = id;
+
+        if (capturing)
         {
-            foreach (string candidate in BindableKeys)
+            foreach (Keys key in Enum.GetValues<Keys>())
             {
-                bool selected = string.Equals(binding, candidate, StringComparison.OrdinalIgnoreCase);
-                if (ImGui.Selectable(candidate, selected)) binding = candidate;
-                if (selected) ImGui.SetItemDefaultFocus();
+                if (key == Keys.Unknown || !KeyboardState.IsKeyPressed(key)) continue;
+                binding = key == Keys.Escape ? "Unbound" : key.ToString();
+                _bindingCaptureTarget = null;
+                break;
             }
-            ImGui.EndCombo();
         }
         ImGui.PopID();
         return binding;
