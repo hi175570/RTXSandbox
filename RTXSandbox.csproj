@@ -14,7 +14,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <OutputPath>bin\$(Configuration)\$(TargetFramework)\Managed\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <RunCommand>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(AssemblyName).exe'))</RunCommand>
+    <RunCommand Condition="'$(OS)' == 'Windows_NT'">$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(AssemblyName).exe'))</RunCommand>
+    <RunCommand Condition="'$(OS)' != 'Windows_NT'">$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/bin/$(Configuration)/$(TargetFramework)/$(AssemblyName)'))</RunCommand>
     <RunWorkingDirectory>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)'))</RunWorkingDirectory>
     <StartProgram>$(RunCommand)</StartProgram>
     <StartWorkingDirectory>$(RunWorkingDirectory)</StartWorkingDirectory>

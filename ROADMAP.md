@@ -17,7 +17,7 @@
 | Android 四 ABI | ✅ **【封裝完成／x86 實際執行】** | `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 均有同版本 `libcimgui.so`，ELF LOAD alignment 為 0x4000 且不依賴 `libc++_shared.so`。已修正 32 位 `ImTextureID` ABI 錯位；x86 signed APK 在 `emulator-5554` 實際載入共用 ImGui、世界與 Classic，穩態約 57–61 FPS且無 FATAL／OverflowException。ARMv7 只標記建置與封裝驗證。 |
 | 建置與執行 | ✅ **【本輪已驗證】** | Android x64 Debug／Release 與四 ABI Release publish 均可產生 APK；x86 signed APK 已用 `adb -s emulator-5554 install -r` 覆蓋安裝並啟動。Release UI、物品欄、設定、物理開關及五條非 DXR Renderer 均在 VM 操作。 |
 | 完整 Android／桌面畫質一致 | 🟡 **【部分完成】** | 主選單、暫停、設定、物品欄、世界與輸入使用共用資料與同款 ImGui；Hardware DXR 維持 Windows-only。Android 尚缺桌面完整點／聚光陰影、反射、體積霧／煙霧、完整水材質與全部 Renderer 高階設定，不能宣稱 100% 一致。 |
-| 遠端 GitHub Actions | 🟡 **【本機設定已修／待本次 push 驗證】** | 已確認舊 run 31268090912 失敗；Android 舊字元編譯錯誤在目前程式碼已不存在。Workflow 現安裝 .NET 9＋6（self-test 會編譯 net6 測試 Mod）、使用 Node 24 版官方 Actions，Android SDK 缺失會明確失敗，並逐一 publish 四個 Android ABI；遠端綠燈必須以本次 push 後的新 run 為準。 |
+| 遠端 GitHub Actions | 🟡 **【已取得新失敗證據並續修】** | Run 31294267313 的 Ubuntu／macOS build 成功，但 `dotnet run --no-build` 立即失敗；WSL 重現證明專案把跨平台 `RunCommand` 硬編成 `RTXSandbox.exe`。現已依 Windows／Unix 選擇根目錄 apphost，並保留 .NET 9＋6、Node 24 官方 Actions、Android SDK 明確失敗與四 ABI publish；最終狀態仍以修正 push 後的新 run 為準。 |
 | DLSS／FSR 補幀 | ⛔ **【未假實作】** | 目前最終呈現仍是 OpenGL；DXR 的 D3D12 結果會 readback 再上傳 OpenGL。正式 DLSS Frame Generation／FSR Frame Generation 需要 D3D12 或 Vulkan presentation、motion vectors、depth 與 UI-less color 等輸入，不能用一個 OpenGL 設定開關冒充。需先建立共用 D3D12／Vulkan present 路徑，本輪只記錄阻塞，不標完成。 |
 
 ## 本輪：桌面／Android 共用 ImGui 介面（2026-08-08）
