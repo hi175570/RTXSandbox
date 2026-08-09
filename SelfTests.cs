@@ -2789,8 +2789,27 @@ public static class SelfTests
             stopwatch.Stop();
             Console.WriteLine($"FAIL ({stopwatch.Elapsed.TotalMilliseconds:0} ms)");
             failures.Add($"{name}: {exception.Message}");
+            if (string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                string annotationTitle = EscapeGitHubCommandProperty($"Self-test failed: {name}");
+                string annotationMessage = EscapeGitHubCommandData(exception.Message);
+                Console.WriteLine($"::error title={annotationTitle}::{annotationMessage}");
+            }
         }
     }
+
+    private static string EscapeGitHubCommandProperty(string value) => value
+        .Replace("%", "%25", StringComparison.Ordinal)
+        .Replace("\r", "%0D", StringComparison.Ordinal)
+        .Replace("\n", "%0A", StringComparison.Ordinal)
+        .Replace(":", "%3A", StringComparison.Ordinal)
+        .Replace(",", "%2C", StringComparison.Ordinal);
+
+    private static string EscapeGitHubCommandData(string value) => value
+        .Replace("%", "%25", StringComparison.Ordinal)
+        .Replace("\r", "%0D", StringComparison.Ordinal)
+        .Replace("\n", "%0A", StringComparison.Ordinal);
 
     private static void Assert(bool condition, string message)
     {
