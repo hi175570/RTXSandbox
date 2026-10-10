@@ -8,6 +8,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTXSandbox.ModAPI", "RTXSan
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTXSandbox.ExampleMod", "Examples\ExampleMod\RTXSandbox.ExampleMod.csproj", "{814E9539-A9EA-4219-8798-455BED832D14}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTXSandbox.Launcher", "RTXSandbox.Launcher\RTXSandbox.Launcher.csproj", "{042E787B-50D4-4D8A-A4C5-1983E66A78AA}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -26,6 +28,10 @@ Global
 		{814E9539-A9EA-4219-8798-455BED832D14}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{814E9539-A9EA-4219-8798-455BED832D14}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{814E9539-A9EA-4219-8798-455BED832D14}.Release|Any CPU.Build.0 = Release|Any CPU
+		{042E787B-50D4-4D8A-A4C5-1983E66A78AA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{042E787B-50D4-4D8A-A4C5-1983E66A78AA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{042E787B-50D4-4D8A-A4C5-1983E66A78AA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{042E787B-50D4-4D8A-A4C5-1983E66A78AA}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

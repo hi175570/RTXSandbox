@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>RTXSandbox.PreloaderProbe.Patcher</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" />
+    <PackageReference Include="HarmonyX" Version="2.16.1" />
+  </ItemGroup>
+</Project>

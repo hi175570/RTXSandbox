@@ -26,6 +26,9 @@ jobs:
         run: dotnet build RTXSandbox.csproj -c Release
       - name: Shared core tests
         run: dotnet run --project RTXSandbox.csproj -c Release --no-build -- --self-test
+      - name: BepInEx preloader integration
+        shell: pwsh
+        run: ./scripts/Test-Preloader.ps1 -Configuration Release
 
   publish-rids:
     runs-on: windows-latest

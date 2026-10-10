@@ -49,6 +49,7 @@
     <Compile Include="..\Infrastructure\FrameWorkBudget.cs" Link="Shared\Infrastructure\FrameWorkBudget.cs" />
     <Compile Include="..\Infrastructure\Platform\PlatformServices.cs" Link="Shared\Infrastructure\PlatformServices.cs" />
     <Compile Include="..\Modding\BepInExBootstrap.cs" Link="Shared\Modding\BepInExBootstrap.cs" />
+    <Compile Include="..\Modding\BepInExEnvironment.cs" Link="Shared\Modding\BepInExEnvironment.cs" />
     <Compile Include="..\Modding\ModHost.cs" Link="Shared\Modding\ModHost.cs" />
     <Compile Include="..\Persistence\WorldSaveService.cs" Link="Shared\Persistence\WorldSaveService.cs" />
     <Compile Include="..\Rendering\ProceduralMaterialAtlas.cs" Link="Shared\Rendering\ProceduralMaterialAtlas.cs" />

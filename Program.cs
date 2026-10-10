@@ -11,6 +11,17 @@ using System.Reflection;
 // a framework type is JIT-compiled.
 FrameworkAssemblyResolver.Install();
 
+if (AppContext.GetData("RTXSandbox.Preloader.Status") is null &&
+    Environment.GetEnvironmentVariable("RTX_SANDBOX_DISABLE_BEPINEX") != "1")
+{
+    string patchers = Path.Combine(RuntimePaths.OutputRoot, "BepInEx", "patchers");
+    if (Directory.Exists(patchers) && Directory.EnumerateFiles(patchers, "*.dll", SearchOption.AllDirectories).Any())
+    {
+        Console.Error.WriteLine("Startup patchers require the root RTXSandbox executable or Managed/RTXSandbox.Launcher.dll. Direct RTXSandbox.dll launch is too late to patch the game assembly.");
+        return 1;
+    }
+}
+
 if (args.Contains("--adversarial-performance-suite", StringComparer.OrdinalIgnoreCase))
 {
     return AdversarialPerformanceSuite.Run(args);
@@ -118,6 +129,9 @@ if (args.Contains("--physics-probe", StringComparer.OrdinalIgnoreCase))
 BepInExBootstrap.Start();
 if (args.Contains("--mod-diagnostics", StringComparer.OrdinalIgnoreCase))
 {
+    Console.WriteLine($"Preloader: {AppContext.GetData("RTXSandbox.Preloader.Status") ?? "Not run (launch the root executable)"}");
+    Console.WriteLine($"Preloader patch definitions: {AppContext.GetData("RTXSandbox.Preloader.PatchDefinitions") ?? 0}");
+    Console.WriteLine($"Preloader patched assemblies: {AppContext.GetData("RTXSandbox.Preloader.PatchedAssemblies") ?? 0}");
     Console.WriteLine($"BepInEx started: {BepInExBootstrap.Started}");
     Console.WriteLine($"Plugin directory: {BepInExBootstrap.PluginDirectory}");
     foreach (LoadedPluginInfo plugin in BepInExBootstrap.LoadedPlugins)
@@ -128,7 +142,8 @@ if (args.Contains("--mod-diagnostics", StringComparer.OrdinalIgnoreCase))
     {
         Console.Error.WriteLine(BepInExBootstrap.FailureMessage);
     }
-    return BepInExBootstrap.Started ? 0 : 1;
+    return (BepInExBootstrap.Started && BepInExBootstrap.DependencyErrors.Count == 0) ||
+           Environment.GetEnvironmentVariable("RTX_SANDBOX_DISABLE_BEPINEX") == "1" ? 0 : 1;
 }
 using var game = new SandboxGame();
 game.Run();

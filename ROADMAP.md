@@ -1,5 +1,20 @@
 # RTX Sandbox Roadmap
 
+## 本輪：桌面 BepInEx 啟動前補丁（2026-10-10）
+
+| 項目 | 狀態 | 驗證證據／限制 |
+|---|---|---|
+| 框架目錄 | ✅ 已完成，沿用前輪 | `BepInEx/core` 保留框架 DLL；本輪未再搬移或複製至 Managed。 |
+| 真正的 Preloader／Patcher | ✅ 本輪已完成 | 根目錄 EXE 先進入獨立 Launcher；使用 BepInEx 官方 AssemblyPatcher 處理 patchers，再於 Default AssemblyLoadContext 載入補丁後的遊戲，最後啟動 Chainloader。 |
+| 啟動先後與補丁生效 | ✅ 已實測 | `scripts/Test-Preloader.ps1` 的 BasePatcher 在遊戲載入前新增常數欄位 314159 並修改入口 IL；一般 BasePlugin 成功讀取新欄位，驗證 Initialize／Finalizer、唯一遊戲組件及 Default context。 |
+| 失敗、重開與救援 | ✅ 已實測 | 重開含快取仍套用補丁；故意丟出例外時 exit 1、未啟動 Chainloader；停用 BepInEx 後能進入診斷。直接啟動遊戲 DLL 遇 patchers 會清楚拒絕。原始 DLL SHA-256 不变，測試暫存目錄自動清理。 |
+| 建置／封裝 | ✅ 本機已驗證 | 正常 NuGet restore；Debug／Release 0 warnings、0 errors；win-x64 managed publish 包亦通過相同補丁整合測試。 |
+| 核心／原生載入回歸 | ✅ 本機已驗證 | Debug 91/91 self-tests（含先前超時的 net6 模組編譯）；win-x64 發行包 Classic GPU smoke 通過，Intel UHD GL 4.3、70 frames。此為啟動回歸，不代表新效能驗收。 |
+| DXR 啟動回歸 | ✅ 重測通過，保留首次失敗 | RTX 5050 的根目錄 EXE smoke 重測通過 97 frames、framebuffer range 13–242；首次 framebuffer 檢查曾為常數 220 而失敗。直接遊戲 DLL 對照亦通過 57 frames。未因重測通過而宣稱已修復該偶發畫面問題。 |
+| games 安裝副本 | ✅ 本輪已更新並驗證 | `C:\D\games\RTXSandbox` 更新 10 個程式檔並逐一核對 SHA-256，34 個存檔／設定／內容等資料檔維持不變；舊檔備份於 `artifacts/games-before-preloader-20261010-125523`。已安裝 EXE 診斷通過，從安裝副本複製出的隔離測試包亦通過全部 Preloader 測試，未將測試插件留在使用者模組目錄。 |
+| CI 回歸入口 | ✅ 已加入，遠端結果另計 | Windows／Ubuntu／macOS core job 增加 Preloader 整合測試；遠端執行結果以新 commit 的 Actions 為準。 |
+| 平台限制 | 明確保留 | Android 僅沿用原有插件 adapter，尚無本輪桌面 Preloader；不支援將 Unity 專用插件或 BepInEx 5 patcher 直接當作 CoreCLR 插件。已執行的 runtime／framework／launcher DLL 不接受啟動前修改。 |
+
 ## 本輪：Android 虛擬機最終回歸（2026-08-09）
 
 > 本輪所有 ADB 安裝、啟動、輸入、截圖與 logcat 都明確指定 `emulator-5554`（Android 11／API 30；依 APK 驗證 x86_64 與 x86）；即使裝置清單曾出現實體手機，也沒有對手機序號發送任何操作。本節優先於下方較早的 Android 狀態。

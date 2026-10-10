@@ -322,7 +322,7 @@ ContentPacks/
 
 ### BepInEx Mod
 
-桌面 Host 使用 BepInEx 6 CoreCLR `6.0.0-be.785` 與 HarmonyX。框架程序集位於標準的 `BepInEx/core`，遊戲自己的 managed runtime 位於 `Managed`；此專案由遊戲自行啟動 CoreCLR chainloader，因此不需要 Unity 注入版的 `winhttp.dll`。插件放置方式：
+桌面 Host 使用 BepInEx 6 CoreCLR `6.0.0-be.785` 與 HarmonyX。框架程序集位於標準的 `BepInEx/core`，遊戲自己的 managed runtime 位於 `Managed`。根目錄啟動器會先執行 BepInEx 官方 `AssemblyPatcher`，再載入遊戲 DLL、啟動 Chainloader；一般插件放在 `plugins`，BepInEx 6 啟動前補丁放在 `patchers`。這條 CoreCLR 啟動流程不依賴 Unity Doorstop／`winhttp.dll`。補丁在記憶體套用，發生錯誤會留下 log 並停止啟動，可用 `RTX_SANDBOX_DISABLE_BEPINEX=1` 救援；詳細限制及測試指令見 [MODDING.md](MODDING.md#desktop-startup-patchers)。Android 仍使用原有插件 adapter，尚未加入桌面啟動前補丁。插件放置方式：
 
 ```text
 BepInEx/plugins/

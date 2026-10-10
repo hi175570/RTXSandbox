@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RTXSandboxHostTargetFramework Condition="'$(RTXSandboxHostTargetFramework)' == ''">net9.0</RTXSandboxHostTargetFramework>
+    <TargetFramework>$(RTXSandboxHostTargetFramework)</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <UseAppHost>false</UseAppHost>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" />
+    <PackageReference Include="HarmonyX" Version="2.16.1" />
+    <Compile Include="../Infrastructure/RuntimePaths.cs" Link="RuntimePaths.cs" />
+    <Compile Include="../Infrastructure/FrameworkAssemblyResolver.cs" Link="FrameworkAssemblyResolver.cs" />
+    <Compile Include="../Modding/BepInExEnvironment.cs" Link="BepInExEnvironment.cs" />
+  </ItemGroup>
+</Project>

@@ -1,6 +1,9 @@
 # RTX Sandbox modding
 
-RTX Sandbox hosts the BepInEx 6 CoreCLR chainloader itself. No Unity injection files or `winhttp.dll` are needed. At startup, BepInEx discovers standard `BasePlugin` DLLs under:
+RTX Sandbox's desktop launcher hosts BepInEx 6 CoreCLR. It runs the official
+`AssemblyPatcher` before loading the game, then the game starts the chainloader
+once. No Unity Doorstop injection files or `winhttp.dll` are needed. At startup,
+BepInEx discovers standard `BasePlugin` DLLs under:
 
 ```text
 <game directory>/BepInEx/plugins/
@@ -10,6 +13,45 @@ The framework assemblies, HarmonyX, Mono.Cecil and MonoMod runtime chain are
 kept under `<game directory>/BepInEx/core/`. `Managed/` contains the game and
 its rendering/runtime dependencies; BepInEx framework files are not duplicated
 there.
+
+## Desktop startup patchers
+
+Launch the root `RTXSandbox.exe` (Windows) / `RTXSandbox` (Linux/macOS), or run
+`dotnet Managed/RTXSandbox.Launcher.dll`. `dotnet run --project RTXSandbox.csproj`
+uses the root launcher too. Build and managed platform publish include the launcher.
+
+The startup order is **launcher → BepInEx AssemblyPatcher → patched game assembly
+→ BepInEx NetChainloader → game window**. Place BepInEx 6 `BasePatcher` assemblies
+under `BepInEx/patchers/`. `[PatcherPluginInfo]`, `[TargetAssembly]`, `[TargetType]`,
+`Initialize`, and `Finalizer` are handled by BepInEx's own patching engine.
+Targets are managed game DLLs in `Managed/` that have not already been loaded.
+The launcher, framework and runtime assemblies already executing are excluded.
+Patchers must use Cecil metadata and avoid loading game types before patching.
+
+Patches are applied in memory, leaving the original game DLLs intact. The launcher
+has its own dependency manifest: putting the unpatched game in the launcher's
+trusted-platform assembly list would make CoreCLR ignore patched bytes. Game
+dependencies and native libraries are resolved using the game's dependency manifest.
+
+Preloader messages go to `BepInEx/preloader.log`; startup failures also write
+`bepinex_preloader_error.log` beside the executable. A patcher error stops startup
+with exit code 1 rather than running a partially patched game. Set
+`RTX_SANDBOX_DISABLE_BEPINEX=1` to start without both patchers and ordinary plugins.
+`--mod-diagnostics` reports preloader status, patch counts and plugin errors.
+Direct `dotnet Managed/RTXSandbox.dll` launch is rejected when patchers are present.
+Self-tests, physics probes, performance benchmarks and non-Mod GPU smoke tests
+skip patchers so installed mods cannot contaminate their results.
+
+The desktop preloader is separate from the existing Android plugin adapter.
+Android startup patchers are not implemented by this change. Unity-specific
+plugins and BepInEx 5 patcher APIs are not made compatible by this launcher.
+
+Run `pwsh -File scripts/Test-Preloader.ps1` after a Release build. The test uses
+temporary packages, adds real game metadata with a patcher, verifies it from an
+ordinary plugin, checks repeat launch, failure/recovery and direct-launch guards,
+checks that the disk DLL is unchanged, then removes only its own temporary files.
+The fixtures under `Examples/PreloaderProbe` are tests; they are not shipped or
+installed into the player's mod folders. CI runs this test on all three desktop OSes.
 
 The game currently uses BepInEx `6.0.0-be.785` on a Visual Studio-compatible .NET 9 host by default. An optional .NET 10 host can be built with `-p:RTXSandboxHostTargetFramework=net10.0`. HarmonyX patching, plugin dependency ordering, logging and per-plugin `.cfg` files are included with the game. The in-game Mods page lists loaded plugins and dependency failures, opens both plugin folders, and can edit/save/reload common configuration values.
 

@@ -23,12 +23,14 @@
 
   <ItemGroup>
     <ProjectReference Include="RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj" />
+    <ProjectReference Include="RTXSandbox.Launcher\RTXSandbox.Launcher.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
     <Compile Remove="RTXSandbox.ModAPI\**\*.cs" />
     <Compile Remove="Examples\**\*.cs" />
     <Compile Remove="RTXSandbox.Android\**\*.cs" />
+    <Compile Remove="RTXSandbox.Launcher\**\*.cs" />
     <!-- Local screenshots, APK inspection and validation harnesses live here;
          they are artifacts, never part of the desktop game's source set. -->
     <Compile Remove="build\**\*.cs" />
@@ -91,10 +93,13 @@
 
   <Target Name="CreateRootAppHost"
           AfterTargets="Build"
-          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration">
+          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration;GetLauncherTargetPath">
+    <Copy SourceFiles="@(LauncherTarget)" DestinationFolder="$(OutputPath)" />
+    <Copy SourceFiles="@(LauncherTarget->'%(RootDir)%(Directory)%(Filename).deps.json');$(OutputPath)RTXSandbox.runtimeconfig.json"
+          DestinationFiles="$(OutputPath)RTXSandbox.Launcher.deps.json;$(OutputPath)RTXSandbox.Launcher.runtimeconfig.json" />
     <CreateAppHost AppHostSourcePath="$(AppHostSourcePath)"
                    AppHostDestinationPath="$(OutputPath)..\$(TargetName)$(_NativeExecutableExtension)"
-                   AppBinaryName="Managed/$(AssemblyName)$(TargetExt)"
+                   AppBinaryName="Managed/RTXSandbox.Launcher.dll"
                    IntermediateAssembly="@(IntermediateAssembly->'%(FullPath)')"
                    WindowsGraphicalUserInterface="$(_UseWindowsGraphicalUserInterface)"
                    Retries="$(CopyRetryCount)"
@@ -102,6 +107,13 @@
                    EnableMacOSCodeSign="$(_EnableMacOSCodeSign)"
                    DisableCetCompat="$(_DisableCetCompat)" />
     <Delete Files="$(TargetDir)$(TargetName)$(_NativeExecutableExtension)" />
+  </Target>
+
+  <Target Name="GetLauncherTargetPath">
+    <MSBuild Projects="RTXSandbox.Launcher/RTXSandbox.Launcher.csproj" Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration);RTXSandboxHostTargetFramework=$(TargetFramework)">
+      <Output TaskParameter="TargetOutputs" ItemName="LauncherTarget" />
+    </MSBuild>
   </Target>
 
   <!-- BepInEx is hosted by RTX Sandbox, but its framework still follows the
@@ -131,7 +143,7 @@
        game data beside it. Ordinary IDE publish remains unchanged. -->
   <Target Name="CreateManagedPlatformPublish"
           AfterTargets="Publish"
-          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration"
+          DependsOnTargets="_GetAppHostPaths;_GetAppHostCreationConfiguration;GetLauncherTargetPath"
           Condition="'$(RTXSandboxManagedPublish)' == 'true'">
     <ItemGroup>
       <PublishedShader Include="$(MSBuildProjectDirectory)\Shaders\*.glsl;$(MSBuildProjectDirectory)\Shaders\*.hlsl" />
@@ -142,9 +154,12 @@
          host can therefore keep targeting the pre-layout root DLL instead of
          Managed/RTXSandbox.dll when a publish directory is reused. -->
     <Delete Files="$(PublishDir)..\$(TargetName)$(_NativeExecutableExtension)" />
+    <Copy SourceFiles="@(LauncherTarget)" DestinationFolder="$(PublishDir)" />
+    <Copy SourceFiles="@(LauncherTarget->'%(RootDir)%(Directory)%(Filename).deps.json');$(PublishDir)RTXSandbox.runtimeconfig.json"
+          DestinationFiles="$(PublishDir)RTXSandbox.Launcher.deps.json;$(PublishDir)RTXSandbox.Launcher.runtimeconfig.json" />
     <CreateAppHost AppHostSourcePath="$(AppHostSourcePath)"
                    AppHostDestinationPath="$(PublishDir)..\$(TargetName)$(_NativeExecutableExtension)"
-                   AppBinaryName="Managed/$(AssemblyName)$(TargetExt)"
+                   AppBinaryName="Managed/RTXSandbox.Launcher.dll"
                    IntermediateAssembly="@(IntermediateAssembly->'%(FullPath)')"
                    WindowsGraphicalUserInterface="$(_UseWindowsGraphicalUserInterface)"
                    Retries="$(CopyRetryCount)"
