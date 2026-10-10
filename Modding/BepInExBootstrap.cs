@@ -1,5 +1,6 @@
 using System.Reflection;
 using BepInEx;
+using BepInEx.Bootstrap;
 using BepInEx.NET.Common;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -165,7 +166,7 @@ public static class BepInExBootstrap
             [nameof(Paths.BepInExAssemblyDirectory)] = coreDirectory,
             [nameof(Paths.BepInExAssemblyPath)] = Path.Combine(coreDirectory, "BepInEx.Core.dll"),
             [nameof(Paths.CachePath)] = Path.Combine(bepinRoot, "cache"),
-            [nameof(Paths.DllSearchPaths)] = new[] { RuntimePaths.ManagedDirectory }
+            [nameof(Paths.DllSearchPaths)] = new[] { RuntimePaths.ManagedDirectory, coreDirectory }
         };
 
         foreach ((string propertyName, object? value) in values)
@@ -173,6 +174,17 @@ public static class BepInExBootstrap
             PropertyInfo property = typeof(Paths).GetProperty(propertyName, BindingFlags.Public | BindingFlags.Static)
                 ?? throw new MissingMemberException(typeof(Paths).FullName, propertyName);
             property.SetValue(null, value);
+        }
+
+        // Cecil reads plugin metadata before the CLR loads the plugin. Its
+        // trusted-platform map still contains the build-time Managed paths
+        // recorded in the deps file, so register the real framework location
+        // as a first-class search directory instead of duplicating core DLLs.
+        string[] cecilDirectories = TypeLoader.CecilResolver.GetSearchDirectories();
+        foreach (string directory in new[] { coreDirectory, RuntimePaths.ManagedDirectory })
+        {
+            if (!cecilDirectories.Contains(directory, StringComparer.OrdinalIgnoreCase))
+                TypeLoader.CecilResolver.AddSearchDirectory(directory);
         }
     }
 

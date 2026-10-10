@@ -6,6 +6,11 @@ RTX Sandbox hosts the BepInEx 6 CoreCLR chainloader itself. No Unity injection f
 <game directory>/BepInEx/plugins/
 ```
 
+The framework assemblies, HarmonyX, Mono.Cecil and MonoMod runtime chain are
+kept under `<game directory>/BepInEx/core/`. `Managed/` contains the game and
+its rendering/runtime dependencies; BepInEx framework files are not duplicated
+there.
+
 The game currently uses BepInEx `6.0.0-be.785` on a Visual Studio-compatible .NET 9 host by default. An optional .NET 10 host can be built with `-p:RTXSandboxHostTargetFramework=net10.0`. HarmonyX patching, plugin dependency ordering, logging and per-plugin `.cfg` files are included with the game. The in-game Mods page lists loaded plugins and dependency failures, opens both plugin folders, and can edit/save/reload common configuration values.
 
 ## In-game manual workspace
@@ -16,6 +21,7 @@ Any file detected as UTF text (up to 4 MiB) can be treated as one C# source unit
 
 - the .NET 6 SDK reference assemblies;
 - every compatible managed assembly in the game's `Managed` directory;
+- the BepInEx, HarmonyX, Mono.Cecil, and MonoMod APIs in `BepInEx/core`;
 - compatible managed DLLs recursively discovered under `BepInEx/plugins`, including prerequisite mods.
 
 Native DLLs and assemblies targeting a runtime newer than .NET 6 are not valid compiler references and are skipped. Compilation requires a locally installed .NET SDK capable of building `net6.0`; having only the runtime is not enough.

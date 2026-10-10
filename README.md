@@ -322,7 +322,7 @@ ContentPacks/
 
 ### BepInEx Mod
 
-桌面 Host 使用 BepInEx 6 CoreCLR `6.0.0-be.785` 與 HarmonyX。插件放置方式：
+桌面 Host 使用 BepInEx 6 CoreCLR `6.0.0-be.785` 與 HarmonyX。框架程序集位於標準的 `BepInEx/core`，遊戲自己的 managed runtime 位於 `Managed`；此專案由遊戲自行啟動 CoreCLR chainloader，因此不需要 Unity 注入版的 `winhttp.dll`。插件放置方式：
 
 ```text
 BepInEx/plugins/
@@ -346,7 +346,7 @@ BepInEx/plugins/
 - **跨編譯**：只證明能產生目標架構檔案，不等於可玩。
 - **進行中**：有正式程式碼，但尚未達到完整一致或尚未完成本輪重新驗證。
 
-### 平台狀態（2026-08-08）
+### 平台狀態（2026-08-09）
 
 | 平台 | 架構 | 目前證據 | Renderer／限制 | 狀態 |
 |---|---|---|---|---|
@@ -354,7 +354,7 @@ BepInEx/plugins/
 | Windows | ARM64 | 可產生 self-contained／framework-dependent 發行檔 | 尚無 ARM64 Windows 實機；MonoMod hook 有限制 | **跨編譯** |
 | Linux（Ubuntu／WSL） | x64 | 87/87 self-tests；Mesa／Xvfb GL 4.3 下 Classic、PBR、Deferred、Hybrid、Compute smoke；BepInEx `Started: True` | 五條 OpenGL Renderer；無 D3D12 DXR | **實際驗證** |
 | Linux | ARM64 | self-contained 發行檔在 QEMU AArch64 通過 87/87 self-tests | 尚無 ARM64 GPU 畫面；Mod hook 有限制 | **核心驗證** |
-| macOS | x64／ARM64 | 兩種 RID 可跨編譯，已有 OpenGL 4.1／GLSL 410 fallback | 沒有 Apple 實機；Compute PT 需要 GL 4.3 因而停用；無 DXR | **跨編譯** |
+| macOS | x64／ARM64 | GitHub `macos-14` 已完成 Release build 與 91/91 shared self-tests；兩種 RID publish 成功，已有 OpenGL 4.1／GLSL 410 fallback | 尚無 Apple 實機 GPU 視窗證據；Compute PT 需要 GL 4.3 因而停用；無 DXR | **核心驗證／GPU 待驗證** |
 | Android 11+ | x64／x86 | API 30 Emulator 實際覆蓋安裝、舊世界存讀、完整世界管理、流水、Micro Voxel、Physics Grid、觸控／可編輯外接輸入、共用 UI，以及 Classic／PBR／Deferred／Hybrid／Compute；x64 Debug／Release 亦實際執行 Example Mod | Hardware DXR 不可用；Mod runtime V1 可載入 `BasePlugin`，但依賴隔離／Hot Reload 與完整桌面 Renderer 細項尚未接入；本輪雙 VM 下量測不沿用早期 58–60 FPS 作新結論 | **V1 可玩／持續接入** |
 | Android 8+ | ARM64／ARMv7 | 兩種 Release APK 都封裝共用世界、流水、Micro Voxel、BEPU Physics Grid、輸入及 16 KB 對齊 ImGui native library | 本輪遵照要求只使用模擬器；ARM64／ARMv7 尚無新的實機執行證據，不能宣稱真機畫面、效能及多點觸控完成 | **建置封裝完成／真機待驗證** |
 | iOS／iPadOS | ARM64 | 無正式 target | 尚未處理 Metal、簽名、觸控 Host 與發佈 | **未支援** |
@@ -673,47 +673,32 @@ RTXsandbox/
 - 高壓串流與最高 Renderer 設定仍可能出現低於目標 FPS 的場景；請以 benchmark 報告而不是平均 FPS 宣稱完成。
 - Runtime Mod hot reload 尚未提供；ARM64 RuntimeDetour 相容性有限。
 
-### ROADMAP 上目前未完成項目（2026-08-08 摘錄）
+### 可繼續開發但尚未完成（2026-08-09 現況）
 
-以下清單按優先主題彙整，避免你再手動逐頁查找。
+以下項目已依目前 Repository、[ROADMAP.md](ROADMAP.md) 與 [ROADMAP_OPTIMIZATION.md](ROADMAP_OPTIMIZATION.md) 重新整理。`部分完成` 表示已有正式可運作基礎；`未完成` 表示尚無可驗收實作。清單不把純美化、假選項或已修好的舊問題重新算入。
 
-#### 核心未完成
+| 主題 | 狀態 | 已有基礎 | 尚未完成／可繼續做的內容 |
+|---|---|---|---|
+| 長距離世界串流 | **部分完成** | 無界 X／Z、背景 Chunk generation、背景 Raster meshing、Region 保存與逐幀 commit 已可用 | 遠距 Chunk unload、mesh／AS eviction、Region read cache、Chunk LOD、resident-memory 硬上限與長時間無限探索驗證 |
+| 串流與互動效能目標 | **部分完成，未達驗收** | 有固定世界、Burst20、Place100、Break100、Physics 與六條桌面 Renderer benchmark | 仍不能保證加载、放置、挖除及物理始終 120 FPS；需要正式 priority worker pool、自適應 ms／byte budget、精確 `ChunkDirtyReason` 與更完整 GPU timing |
+| Chunk 儲存與記憶體 | **未完成** | 16×16 Chunk 與 32×32 Region 已存在 | 16³ sparse Section、Palette 壓縮、ArrayPool／worker arena、texture／mesh streaming 與大型世界記憶體回收 |
+| Raster CPU／GPU 提交 | **部分完成** | per-Chunk VBO cache、遮蔽面剔除與背景 mesh 已存在 | Raster Greedy Mesh 的完整桌面路徑、MultiDrawIndirect、GPU instancing、材質批次、persistent mapping、state sorting 與可靠 occlusion culling |
+| Hardware DXR 加速結構 | **部分完成** | 靜態世界與動態 Grid 已拆成兩個 BLAS；動態同拓撲可 refit，TLAS 可 update | per-Chunk／per-Grid BLAS cache、每 Chunk／Grid instance、純 transform TLAS update、AS compaction、ray-aware instance culling 與 DXR update budget |
+| D3D12／OpenGL 顯示互通 | **未完成** | DXR 結果可同步 readback 後顯示於 OpenGL 視窗 | shared resource 或 double／triple-buffer 非同步傳遞，移除同步 fence／readback／upload 尖峰 |
+| Deferred／Forward 完整效果 | **部分完成** | PBR、方向光 shadow、SSAO／SSR、HDR／Bloom、水與 G-buffer debug 已有 V1 | CSM、Point／Spot shadow atlas、Reflection Probe、完整 IBL／SSGI、Tiled／Clustered lighting、OIT、Volumetric Fog 與完整 TAA／motion vector 流程 |
+| Compute Path Tracing | **部分完成** | Compute shader trace、累積、反射／基本透明與世界 voxel 求交可用 | Denoiser、Adaptive Sampling、MIS／NEE、Blue Noise、ReSTIR、Wavefront／Ray Sorting、Temporal Reprojection，以及 Android Micro Voxel／Physics Grid 精確求交 |
+| Hardware RT 畫質 | **部分完成** | 真 DXR pipeline、BLAS／TLAS、反射／折射、彩色玻璃 transmission、發光方塊與 Infinite Mirror extension 已可執行 | 完整多反彈 GI、粗糙反射多採樣、體積水散射、AO／denoiser／temporal，以及跨材質能量一致性的完整驗證 |
+| DLSS／FSR 補幀 | **未完成／受架構阻塞** | 尚未用假開關冒充 | 需先有 D3D12 或 Vulkan presentation、motion vectors、depth、UI-less color 與 pacing；目前 OpenGL 最終呈現不具備正式 Frame Generation 輸入 |
+| 有限水體 | **部分完成** | 1～16 單位守恆流水、排水、再次倒水、連通管 V1 與逐格動畫已存在 | 跨未載入 Chunk 的持續流動、大型水域壓測、流速／黏度與真正連續流體模型 |
+| Physics Grid 進階 | **部分完成** | 剛體、碰撞、睡眠、推擠、Micro placement、保存與 Raster／DXR 顯示可用 | 碰撞造成二次斷裂、超大型 Grid 分區 shape rebuild、完整爆炸碎片、粒子／聲效與大規模 collider streaming |
+| Mod SDK／Runtime | **部分完成** | 桌面編譯入口、公開 Mod API、BepInEx，以及 Android 公開 `Documents/RTXSandbox/Mods/` 的 `BasePlugin` 載入已驗證 | 多來源 `.csproj`、NuGet／相依版本求解、隔離式 `AssemblyLoadContext`、Hot Reload、RuntimeDetour 跨 ABI、安全沙箱與可信簽章 |
+| Android 與桌面一致性 | **部分完成** | 共用世界資料、核心 ImGui、五條非 DXR Renderer V1、設定核心頁籤、觸控與外接輸入已接入 | 全部桌面 Renderer 進階設定與效果、Compute 精密幾何／透明語意、所有編輯工具逐項一致性，以及 ARM64 真機多點觸控／手把／長時間高負載驗證 |
+| Apple／ARM 平台 | **部分完成或未支援** | macOS hosted runner 已通過 Release build 與 91/91 core tests；桌面八 RID、Android 四 ABI CI 均成功 | macOS Apple GPU 視窗、簽章／權限與發行驗證；Windows／Linux ARM64 GPU 和 Mod hook 實機驗證；iOS／iPadOS Metal Host 仍未開始 |
+| UI／開發工具 | **部分完成** | 暫停、設定、世界管理、Mod 管理、成就列表版面與基本錯誤回退已存在 | 完整 `--safe-mode`、運行中 Shader Reload、世界複製／匯出／刪除前備份、筆刷 ghost／transform gizmo、天氣 preset、快速截圖與高樣本離線輸出 |
 
-- 完整安全模式（`--safe-mode`）：同時停用 Mod、忽略 UI layout、禁止自動載入世界還未成形。
-- Mod SDK 與通用工具鏈：多來源 `.csproj` 編譯、NuGet 版本解析、沙箱與簽章流程仍未完成。
-- 解析球體/物理進一步補完：目前有可推動球體、解析碰撞與反射，但尚未納入完整通用模型生命週期（模型、音訊、動畫）。
-- 警示機制與錯誤回報：仍缺少完整的熱更新回退路徑與「運行中 Shader Reload」入口。
+建議後續優先順序：先處理遠距 unload／記憶體上限與自適應工作預算，再完成 per-Chunk／per-Grid BLAS 和非同步 D3D12／OpenGL 互通；之後才是 Android 真機一致性、Mod 隔離／Hot Reload，以及 Renderer 高階畫質功能。
 
-#### 世界與內容
-
-- 0.12 世界呈現：串流、背景生成／保存／meshing、texture 分頁與大型世界座標仍未完成。
-- 0.12 世界管理：世界複製、匯出、刪除前自動備份或資源回收筒尚未完成。
-- 0.12 編輯體驗：選取框線框、筆刷預覽 ghost、transform gizmo 尚未完成；Showcase 尚未拆成 4 種獨立模板；天氣 preset（雨、雪、霧、濕表面、雷電）未完成；快速截圖/高樣本離線輸出未完成。
-- 0.13 物理進階：二次斷裂、動態重建預算、爆炸衝擊與粒子音效尚待實作。
-- 1.0 平台正式版：世界／內容／Mod 遷移器、世界分享與教學系統仍是長期路線。
-
-#### Rendering 與效能（按當前 Roadmap 狀態）
-
-- 未完成/待補（明確標為 `❌` 或 `部分完成`）：
-  - Occlusion Culling、GPU Instancing、Indirect Draw、Bindless Texture、Persistent Mapping、State Sorting
-  - Light Volume、Tiled/Clustered Deferred、Shader 特定 LUT、Specialization Constant、BRDF/其他相關 LUT、Branch Reduction
-  - 每 Chunk / 每 Grid BLAS cache、每 Chunk Instance TLAS、Ray Cone、Ray Compaction
-  - Adaptive Sampling、Blue Noise、ReSTIR、Wavefront PT、Ray Sorting
-  - Texture/Mesh Streaming、Voxel Clipmap、Chunk LOD、Distance Mesh
-  - Async Lighting、ImGui Dirty Update、Pause GPU（暫停仍未縮減背景 3D 負載）
-  - DXR 對每 Chunk 的可見性/遮蔽決策仍在單體可行流程階段，仍需完整 multi-instance transform-only 更新與 ray-aware instance culling。
-- 15 類惡意攻擊壓力測試仍不完整：已補 10k 左右範圍內的主要類別，但 10k dynamic bodies、CCD bullet wall、多存檔並行、長時間混合災難等仍待加入。
-
-#### 平台與編譯
-
-- macOS：目前仍缺 Apple 實機驗證流程（發行與簽章可用性、OpenGL context、權限）。
-- Windows/Linux/Android ARM64：雖有跨編譯與部分測試，但實機 GPU + Mod hook 路線仍非全驗證。
-- Android：六條非 DXR 渲染路線已接入，但缺少完整桌面 Mod runtime 對等與高負載真機壓測；實機觸控還需長時間一致性驗證。
-
-#### 重要補充
-
-- ROADMAP 的未完成項目不等同「不能運作」，而是「尚未達到可驗收的完整目標」。
-- 本專案原則仍然是：不把建置成功、假設定或已知 placeholder 當成完成項；每個真正完成項目都應對應實際測試證據。
+ROADMAP 的未完成項目不等同「不能運作」，而是尚未達到完整驗收目標。建置成功、預留入口與 Placeholder 都不標記為完成。
 
 ## 相關文件
 

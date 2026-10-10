@@ -104,6 +104,28 @@
     <Delete Files="$(TargetDir)$(TargetName)$(_NativeExecutableExtension)" />
   </Target>
 
+  <!-- BepInEx is hosted by RTX Sandbox, but its framework still follows the
+       conventional BepInEx/core layout. Keep only game/runtime assemblies in
+       Managed and let FrameworkAssemblyResolver load this isolated set before
+       the chainloader starts. -->
+  <Target Name="OrganizeBepInExBuild" AfterTargets="CreateRootAppHost">
+    <ItemGroup>
+      <BepInExBuildAssembly Include="$(OutputPath)BepInEx*.dll;
+                                        $(OutputPath)0Harmony.dll;
+                                        $(OutputPath)Mono.Cecil*.dll;
+                                        $(OutputPath)MonoMod*.dll;
+                                        $(OutputPath)SemanticVersioning.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutputPath)..\BepInEx\core;
+                          $(OutputPath)..\BepInEx\plugins;
+                          $(OutputPath)..\BepInEx\config;
+                          $(OutputPath)..\BepInEx\patchers;
+                          $(OutputPath)..\BepInEx\cache" />
+    <Move SourceFiles="@(BepInExBuildAssembly)"
+          DestinationFolder="$(OutputPath)..\BepInEx\core"
+          Condition="'@(BepInExBuildAssembly)' != ''" />
+  </Target>
+
   <!-- The platform build scripts opt into one consistent distributable layout:
        native apphost in the root, managed/runtime files in Managed, and portable
        game data beside it. Ordinary IDE publish remains unchanged. -->
@@ -137,5 +159,25 @@
     <Copy SourceFiles="@(PublishedContentPack)"
           DestinationFiles="@(PublishedContentPack->'$(PublishDir)..\ContentPacks\%(RecursiveDir)%(Filename)%(Extension)')" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\settings.json" DestinationFolder="$(PublishDir).." />
+  </Target>
+
+  <Target Name="OrganizeBepInExPublish"
+          AfterTargets="CreateManagedPlatformPublish"
+          Condition="'$(RTXSandboxManagedPublish)' == 'true'">
+    <ItemGroup>
+      <BepInExPublishedAssembly Include="$(PublishDir)BepInEx*.dll;
+                                            $(PublishDir)0Harmony.dll;
+                                            $(PublishDir)Mono.Cecil*.dll;
+                                            $(PublishDir)MonoMod*.dll;
+                                            $(PublishDir)SemanticVersioning.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(PublishDir)..\BepInEx\core;
+                          $(PublishDir)..\BepInEx\plugins;
+                          $(PublishDir)..\BepInEx\config;
+                          $(PublishDir)..\BepInEx\patchers;
+                          $(PublishDir)..\BepInEx\cache" />
+    <Move SourceFiles="@(BepInExPublishedAssembly)"
+          DestinationFolder="$(PublishDir)..\BepInEx\core"
+          Condition="'@(BepInExPublishedAssembly)' != ''" />
   </Target>
 </Project>

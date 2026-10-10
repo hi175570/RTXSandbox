@@ -30,6 +30,7 @@ public sealed class ModWorkspace
     private readonly string _pluginRoot;
     private readonly string _pluginRootPrefix;
     private readonly string _managedRoot;
+    private readonly string _frameworkRoot;
     private readonly string _backupRoot;
     private readonly string _trashRoot;
 
@@ -37,11 +38,13 @@ public sealed class ModWorkspace
         string pluginRoot,
         string managedRoot,
         string? backupRoot = null,
-        string? trashRoot = null)
+        string? trashRoot = null,
+        string? frameworkRoot = null)
     {
         _pluginRoot = NormalizeDirectory(pluginRoot);
         _pluginRootPrefix = _pluginRoot + Path.DirectorySeparatorChar;
         _managedRoot = NormalizeDirectory(managedRoot);
+        _frameworkRoot = NormalizeDirectory(frameworkRoot ?? ResolveFrameworkRoot(_managedRoot));
         string stateRoot = Path.GetDirectoryName(_pluginRoot) ?? _pluginRoot;
         _backupRoot = NormalizeDirectory(backupRoot ?? Path.Combine(stateRoot, "editor-backups"));
         _trashRoot = NormalizeDirectory(trashRoot ?? Path.Combine(stateRoot, "trash"));
@@ -272,6 +275,8 @@ public sealed class ModWorkspace
         var paths = new List<string>();
         if (Directory.Exists(_managedRoot))
             paths.AddRange(Directory.EnumerateFiles(_managedRoot, "*.dll", SearchOption.AllDirectories));
+        if (Directory.Exists(_frameworkRoot))
+            paths.AddRange(Directory.EnumerateFiles(_frameworkRoot, "*.dll", SearchOption.AllDirectories));
         if (Directory.Exists(_pluginRoot))
             paths.AddRange(Directory.EnumerateFiles(_pluginRoot, "*.dll", SearchOption.AllDirectories));
 
@@ -302,6 +307,16 @@ public sealed class ModWorkspace
             }
         }
         return references.Values.OrderBy(reference => reference.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static string ResolveFrameworkRoot(string managedRoot)
+    {
+        var managedDirectory = new DirectoryInfo(managedRoot);
+        string outputRoot = managedDirectory.Name.Equals("Managed", StringComparison.OrdinalIgnoreCase) &&
+                            managedDirectory.Parent is not null
+            ? managedDirectory.Parent.FullName
+            : managedDirectory.FullName;
+        return Path.Combine(outputRoot, "BepInEx", "core");
     }
 
     private static bool IsNewerThanNet6(string path)
@@ -335,6 +350,10 @@ public sealed class ModWorkspace
         project.AppendLine("    <LangVersion>latest</LangVersion>");
         project.AppendLine("    <CheckEolTargetFramework>false</CheckEolTargetFramework>");
         project.AppendLine("    <RestoreIgnoreFailedSources>true</RestoreIgnoreFailedSources>");
+        // The generated project has no PackageReference items. Online advisory
+        // auditing can only delay an explicit in-game compile when NuGet is
+        // unavailable; it cannot improve this local reference-only build.
+        project.AppendLine("    <NuGetAudit>false</NuGetAudit>");
         project.AppendLine("  </PropertyGroup>");
         project.AppendLine("  <ItemGroup>");
         project.AppendLine($"    <Compile Include=\"{Escape(sourcePath)}\" Link=\"{Escape(Path.GetFileNameWithoutExtension(sourcePath))}.cs\" />");

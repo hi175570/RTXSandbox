@@ -6,6 +6,11 @@ using RTXSandbox.ModAPI;
 using RTXSandbox.World;
 using System.Reflection;
 
+// BepInEx is self-hosted by the game rather than injected through winhttp.dll.
+// Install its conventional BepInEx/core resolver before the first reference to
+// a framework type is JIT-compiled.
+FrameworkAssemblyResolver.Install();
+
 if (args.Contains("--adversarial-performance-suite", StringComparer.OrdinalIgnoreCase))
 {
     return AdversarialPerformanceSuite.Run(args);
