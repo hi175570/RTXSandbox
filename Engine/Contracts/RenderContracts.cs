@@ -1,4 +1,4 @@
-namespace RTXSandbox.ModAPI;
+namespace RTXSandbox.Engine;
 
 public readonly struct RenderBackendInfo
 {
@@ -16,7 +16,7 @@ public readonly struct RenderBackendInfo
     }
 }
 
-/// <summary>Renderer discovery and switching service exposed through IModContext.GetService.</summary>
+/// <summary>Renderer discovery and switching contract used by the game engine.</summary>
 public interface IRenderBackendService
 {
     string ActiveBackendId { get; }

@@ -5,7 +5,8 @@ using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL4;
 using RTXSandbox.Gameplay;
 using RTXSandbox.Infrastructure;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
+using RTXSandbox.Rendering;
 using RTXSandbox.World;
 using SharpGen.Runtime;
 using Vortice;
@@ -68,11 +69,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
     private ID3D12Resource? _staticVertexBuffer;
     private ID3D12Resource? _dynamicVertexBuffer;
+    private ID3D12Resource? _settledDebrisVertexBuffer;
     private ID3D12Resource? _dynamicUpdateScratch;
     private ulong _dynamicUpdateScratchBytes;
     private ID3D12Resource? _instanceBuffer;
     private ID3D12Resource? _staticBlas;
     private ID3D12Resource? _dynamicBlas;
+    private ID3D12Resource? _settledDebrisBlas;
     private ID3D12Resource? _tlas;
     private ID3D12Resource? _output;
     private ID3D12Resource? _readback;
@@ -86,6 +89,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private int _emissiveLightCapacity;
     private int _reflectionTailWriteIndex;
     private bool _reflectionTailHistoryValid;
+    private uint _temporalFrameIndex;
+    private uint _lastTemporalPhase;
     private bool _reflectionTailEnabled;
     private int _reflectionTailWidth;
     private int _reflectionTailHeight;
@@ -105,7 +110,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private float _renderScale;
     private bool _geometryDirty;
     private bool _physicsGeometryDirty;
+    private bool _analyticSphereTransformDirty;
     private long _lastAccelerationStructureBuildMs;
+    private long _lastAnalyticSphereTlasUpdateMs;
     private long _lastStaticGeometryChangeMs;
     private long _staticGeometryDirtySinceMs;
     private bool _forceImmediateStaticRebuild;
@@ -119,8 +126,18 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private bool _disposed;
     private int _staticVertexCount;
     private int _dynamicVertexCount;
+    private int _settledDebrisVertexCount;
     private ulong _staticBlasBytes;
     private ulong _dynamicBlasBytes;
+    private ulong _settledDebrisBlasBytes;
+    private ulong _settledDebrisSignature;
+    private long _cachedPhysicsMembershipRevision = -1;
+    private WorldVertex[] _cachedSettledDebrisVertices = Array.Empty<WorldVertex>();
+    private int _cachedActualSettledDebrisVertexCount;
+    private ulong _cachedSettledDebrisGeometrySignature;
+    private int _cachedSettledDebrisGridCount;
+    private bool _batchHeavyDebrisAsDynamic;
+    private bool _cachedHeavyDebrisBatchMode;
     private ulong _tlasBytes;
     private int _emissiveLightCount;
     private int _lastLoadedChunkCount;
@@ -144,9 +161,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public int MaterialTextureResolution => ProceduralMaterialAtlas.TileSize;
     public string AdapterName { get; }
     public RaytracingTier RaytracingTier => _device.Options5.RaytracingTier;
-    public int TracedTriangleCount => (_staticVertexCount + _dynamicVertexCount) / 3;
+    public int TracedTriangleCount =>
+        (_staticVertexCount + _dynamicVertexCount + _settledDebrisVertexCount) / 3;
+    public int ActiveDynamicTriangleCount => _dynamicVertexCount / 3;
+    public int SettledDebrisTriangleCount => _cachedActualSettledDebrisVertexCount / 3;
     public ulong AccelerationStructureMemoryBytes =>
-        _staticBlasBytes + _dynamicBlasBytes + _analyticSphereBlasBytes + _tlasBytes;
+        _staticBlasBytes + _dynamicBlasBytes + _settledDebrisBlasBytes +
+        _analyticSphereBlasBytes + _tlasBytes;
     public int TracedAnalyticSphereCount => _world.AnalyticSpheres.Count;
     public int LastHitPixelCount { get; private set; }
     public int LastShadowRayPixelCount { get; private set; }
@@ -169,8 +190,14 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     public int TracedPhysicsGridTriangleCount { get; private set; }
     public int TracedMicroVoxelTriangleCount { get; private set; }
     public int DynamicTopologyBuildCount { get; private set; }
+    public int DynamicWorldTransformBuildCount { get; private set; }
     public int TlasUpdateCount { get; private set; }
     public int LastHardwareQuality { get; private set; }
+    public int LastOrdinaryReflectionDepthLimit { get; private set; }
+    public int LastTransparentReflectionDepthLimit { get; private set; }
+    public bool TemporalRayReuseEnabled { get; private set; }
+    internal static bool UsesSpatialPrimarySubsampling => false;
+    public bool TemporalRayReuseObserved { get; private set; }
     public double LastAccelerationStructureBuildMilliseconds { get; private set; }
     public double LastStaticAccelerationStructureBuildMilliseconds { get; private set; }
     public double LastDynamicAccelerationStructureBuildMilliseconds { get; private set; }
@@ -285,11 +312,34 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         CreateOutputResources();
     }
 
-    public void ResetAccumulation() => _reflectionTailHistoryValid = false;
+    public void ResetAccumulation()
+    {
+        // The DXR output itself is not accumulated. The only history here is the
+        // mirror-tail atlas, and it already reprojects from the previous camera.
+        // Invalidating it on every mouse delta made the approximate reflection
+        // range fall back to a dark seed for the whole time the player was turning.
+        // Resource recreation and genuinely incompatible camera jumps still clear
+        // the atlas explicitly in EnsureReflectionTailResources/Trace.
+    }
 
     public void Render(Vector3 cameraPosition, Camera camera, VoxelHit? selection, float timeOfDay,
         RenderQualitySettings quality, float exposure)
     {
+        if (_world.GenerationSettings.Preset == WorldPreset.ExternalBridge &&
+            _world.LoadedChunkCount == 0 &&
+            _world.PhysicsGrids.Count == 0 &&
+            _world.AnalyticSpheres.Count == 0)
+        {
+            // D3D12 cannot build a useful TLAS with no instances. A bridge world is
+            // intentionally empty until the first remote placement, so present a real
+            // black frame and keep the UI alive instead of inventing hidden geometry.
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+                ManifoldGardenFramePublisher.CurrentFramebuffer);
+            GL.Viewport(0, 0, _viewportWidth, _viewportHeight);
+            GL.ClearColor(0f, 0f, 0f, 0f);
+            GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+            return;
+        }
         long tailCpuStarted = Stopwatch.GetTimestamp();
         EnsureReflectionTailResources(quality.InfiniteMirrorQuality != InfiniteMirrorQuality.Off);
         LastReflectionTailCpuMilliseconds = quality.InfiniteMirrorQuality == InfiniteMirrorQuality.Off
@@ -305,8 +355,10 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         if (_geometryDirty && staticGeometryReady)
             ProcessStaticGeometryBuild();
         else if (_physicsGeometryDirty && now - _lastAccelerationStructureBuildMs >=
-                 (_world.AnalyticSpheres.Count > 0 ? 16 : 120))
+                 DynamicGeometryUpdateIntervalMilliseconds())
             RebuildDynamicAccelerationStructures();
+        else if (_analyticSphereTransformDirty && now - _lastAnalyticSphereTlasUpdateMs >= 16)
+            RefitTopLevelForAnalyticSpheres();
         Trace(cameraPosition, camera, selection, timeOfDay, quality);
 
         GL.Disable(EnableCap.DepthTest);
@@ -320,8 +372,29 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         GL.Uniform1(_display.Uniform("uImage"), 0);
         GL.Uniform2(_display.Uniform("uViewport"), (float)_viewportWidth, (float)_viewportHeight);
         GL.Uniform1(_display.Uniform("uExposure"), exposure);
+        // DXR already traces the curved ray in world space. The shared post-pass
+        // must not apply the legacy two-dimensional lens a second time.
+        GL.Uniform1(_display.Uniform("uBlackHoleCount"), 0);
         GL.BindVertexArray(_displayVertexArray);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+    }
+
+    private int DynamicGeometryUpdateIntervalMilliseconds()
+    {
+        int gridCount = _world.PhysicsGrids.Count;
+        // A synchronous BLAS update for tens of thousands of independently moving
+        // transparent triangles can cost more than tracing the frame. Under that
+        // exceptional load, submit real current geometry at a bounded rate while
+        // continuing to dispatch fresh primary/reflection/refraction rays every frame.
+        // This never reprojects pixels and ordinary scenes keep the 30 Hz path.
+        // At 20k independently moving shards, transforming roughly 480k vertices
+        // and refitting the BLAS every rendered frame consumes more than a complete
+        // 10 FPS frame budget by itself. Physics continues every update and primary
+        // rays remain fresh; only the submitted shard transforms are sampled at about 3 Hz.
+        // This produces discrete rigid motion rather than temporal blur/ghost pixels.
+        if (gridCount >= 10_000) return 350;
+        if (gridCount >= 2_048) return 50;
+        return 33;
     }
 
     private void UpdateVisibleChunkMask(
@@ -491,6 +564,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All),
                 new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All),
                 new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All),
+                new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All),
             },
         };
         return _device.CreateRootSignature(description);
@@ -633,8 +707,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         MaximumStaticGeometryBuildMilliseconds = Math.Max(
             MaximumStaticGeometryBuildMilliseconds,
             result.BuildMilliseconds);
-        WorldVertex[] dynamicVertices = BuildPhysicsGridVertices();
-        RebuildAccelerationStructures(result.Vertices, dynamicVertices, preserveStatic: false);
+        PhysicsGridGeometry dynamicGeometry = BuildPhysicsGridVertices();
+        RebuildAccelerationStructures(
+            result.Vertices,
+            dynamicGeometry.ActiveVertices,
+            dynamicGeometry.SettledVertices,
+            dynamicGeometry.SettledSignature,
+            preserveStatic: false);
     }
 
     private void ScheduleStaticGeometryBuild()
@@ -682,26 +761,38 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
 
     private void RebuildDynamicAccelerationStructures()
     {
-        WorldVertex[] dynamicVertices = BuildPhysicsGridVertices();
+        PhysicsGridGeometry dynamicGeometry = BuildPhysicsGridVertices();
+        WorldVertex[] dynamicVertices = dynamicGeometry.ActiveVertices;
+        bool settledChanged = dynamicGeometry.SettledSignature != _settledDebrisSignature ||
+                              dynamicGeometry.SettledVertices.Length != _settledDebrisVertexCount;
         if (!_analyticSphereTopologyDirty && _tlas is not null &&
+            !settledChanged &&
             dynamicVertices.Length == _dynamicVertexCount &&
             dynamicVertices.Length == 0)
         {
             RefitTopLevelForAnalyticSpheres();
             return;
         }
-        if (!_analyticSphereTopologyDirty && _dynamicBlas is not null && _dynamicVertexBuffer is not null &&
+        if (!settledChanged && !_analyticSphereTopologyDirty &&
+            _dynamicBlas is not null && _dynamicVertexBuffer is not null &&
             dynamicVertices.Length > 0 && dynamicVertices.Length == _dynamicVertexCount)
         {
             RefitDynamicAccelerationStructures(dynamicVertices);
             return;
         }
-        RebuildAccelerationStructures(Array.Empty<WorldVertex>(), dynamicVertices, preserveStatic: true);
+        RebuildAccelerationStructures(
+            Array.Empty<WorldVertex>(),
+            dynamicVertices,
+            dynamicGeometry.SettledVertices,
+            dynamicGeometry.SettledSignature,
+            preserveStatic: true);
     }
 
     private void RebuildAccelerationStructures(
         WorldVertex[] staticVertices,
         WorldVertex[] dynamicVertices,
+        WorldVertex[] settledDebrisVertices,
+        ulong settledDebrisSignature,
         bool preserveStatic)
     {
         long buildStarted = Stopwatch.GetTimestamp();
@@ -716,7 +807,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         if (!preserveStatic)
         {
             _staticVertexCount = staticVertices.Length;
-            if (staticVertices.Length == 0 && dynamicVertices.Length == 0 && _world.AnalyticSpheres.Count == 0)
+            if (staticVertices.Length == 0 && dynamicVertices.Length == 0 &&
+                settledDebrisVertices.Length == 0 && _world.AnalyticSpheres.Count == 0)
                 throw new InvalidOperationException("DXR world contains no traceable geometry.");
             _staticVertexBuffer = CreateVertexBuffer(
                 staticVertices.Length > 0 ? staticVertices : new WorldVertex[1], stride);
@@ -753,6 +845,24 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _dynamicBlasBytes = 0;
         }
 
+        _settledDebrisVertexCount = settledDebrisVertices.Length;
+        _settledDebrisSignature = settledDebrisSignature;
+        BuildRaytracingAccelerationStructureInputs? settledInputs = null;
+        RaytracingAccelerationStructurePrebuildInfo? settledInfo = null;
+        if (settledDebrisVertices.Length > 0)
+        {
+            _settledDebrisVertexBuffer = CreateVertexBuffer(settledDebrisVertices, stride);
+            settledInputs = CreateBottomLevelInputs(
+                _settledDebrisVertexBuffer, settledDebrisVertices.Length, stride, allowUpdate: false);
+            settledInfo = _device.GetRaytracingAccelerationStructurePrebuildInfo(settledInputs);
+            _settledDebrisBlasBytes = settledInfo.Value.ResultDataMaxSizeInBytes;
+            _settledDebrisBlas = CreateAccelerationStructure(settledInfo.Value.ResultDataMaxSizeInBytes);
+        }
+        else
+        {
+            _settledDebrisBlasBytes = 0;
+        }
+
         List<RaytracingInstanceDescription> instances = CreateSceneInstances();
         if (instances.Count == 0)
             throw new InvalidOperationException("DXR acceleration structure has no instances.");
@@ -786,6 +896,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         ulong scratchSize = topInfo.ScratchDataSizeInBytes;
         if (staticInfo.HasValue) scratchSize = Math.Max(scratchSize, staticInfo.Value.ScratchDataSizeInBytes);
         if (dynamicInfo.HasValue) scratchSize = Math.Max(scratchSize, dynamicInfo.Value.ScratchDataSizeInBytes);
+        if (settledInfo.HasValue) scratchSize = Math.Max(scratchSize, settledInfo.Value.ScratchDataSizeInBytes);
         using ID3D12Resource scratch = _device.CreateCommittedResource(HeapType.Default,
             ResourceDescription.Buffer(scratchSize, ResourceFlags.AllowUnorderedAccess), ResourceStates.Common);
 
@@ -810,6 +921,17 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             });
             _commands.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_dynamicBlas)));
         }
+        if (settledInputs is not null && _settledDebrisBlas is not null)
+        {
+            _commands.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
+            {
+                Inputs = settledInputs,
+                ScratchAccelerationStructureData = scratch.GPUVirtualAddress,
+                DestinationAccelerationStructureData = _settledDebrisBlas.GPUVirtualAddress,
+            });
+            _commands.ResourceBarrier(new ResourceBarrier(
+                new ResourceUnorderedAccessViewBarrier(_settledDebrisBlas)));
+        }
         _commands.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
         {
             Inputs = topInputs,
@@ -828,7 +950,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _staticGeometryDirtySinceMs = 0;
         }
         _physicsGeometryDirty = false;
+        _analyticSphereTransformDirty = false;
         _lastAccelerationStructureBuildMs = Environment.TickCount64;
+        _lastAnalyticSphereTlasUpdateMs = _lastAccelerationStructureBuildMs;
         double elapsed = (Stopwatch.GetTimestamp() - buildStarted) * 1000.0 / Stopwatch.Frequency;
         LastAccelerationStructureBuildMilliseconds = elapsed;
         RecordAccelerationStructureTiming(elapsed);
@@ -919,7 +1043,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         CreateEmissiveLightBuffer();
         UpdateDescriptors();
         _physicsGeometryDirty = false;
+        _analyticSphereTransformDirty = false;
         _lastAccelerationStructureBuildMs = Environment.TickCount64;
+        _lastAnalyticSphereTlasUpdateMs = _lastAccelerationStructureBuildMs;
         double elapsed = (Stopwatch.GetTimestamp() - buildStarted) * 1000.0 / Stopwatch.Frequency;
         LastAccelerationStructureBuildMilliseconds = elapsed;
         RecordAccelerationStructureTiming(elapsed);
@@ -937,8 +1063,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         if (instances.Count != _instanceCount)
         {
             _analyticSphereTopologyDirty = true;
+            PhysicsGridGeometry physicsGeometry = BuildPhysicsGridVertices();
             RebuildAccelerationStructures(
-                Array.Empty<WorldVertex>(), Array.Empty<WorldVertex>(), preserveStatic: true);
+                Array.Empty<WorldVertex>(),
+                physicsGeometry.ActiveVertices,
+                physicsGeometry.SettledVertices,
+                physicsGeometry.SettledSignature,
+                preserveStatic: true);
             return;
         }
         RaytracingInstanceDescription* mappedInstances =
@@ -980,8 +1111,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         });
         _commands.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(_tlas)));
         ExecuteCommands();
-        _physicsGeometryDirty = false;
-        _lastAccelerationStructureBuildMs = Environment.TickCount64;
+        _analyticSphereTransformDirty = false;
+        _lastAnalyticSphereTlasUpdateMs = Environment.TickCount64;
         double elapsed = ElapsedMilliseconds(buildStarted);
         LastAccelerationStructureBuildMilliseconds = elapsed;
         LastDynamicAccelerationStructureBuildMilliseconds = elapsed;
@@ -1072,11 +1203,13 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private List<RaytracingInstanceDescription> CreateSceneInstances()
     {
         var instances = new List<RaytracingInstanceDescription>(
-            2 + _world.AnalyticSpheres.Count);
+            3 + _world.AnalyticSpheres.Count);
         if (_staticBlas is not null)
             instances.Add(CreateInstance(_staticBlas, instanceId: 0));
         if (_dynamicBlas is not null)
             instances.Add(CreateInstance(_dynamicBlas, instanceId: 1));
+        if (_settledDebrisBlas is not null)
+            instances.Add(CreateInstance(_settledDebrisBlas, instanceId: 2));
         for (int index = 0; index < _world.AnalyticSpheres.Spheres.Count; index++)
             instances.Add(CreateAnalyticSphereInstance(
                 _analyticSphereBlas,
@@ -1109,7 +1242,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                 BlockDefinition material = _blocks.Get(sphere.MaterialId);
                 return new AnalyticSphereGpuData(
                     new Vector4(material.Albedo, material.Roughness),
-                    new Vector4(material.Metallic, sphere.MaterialId, 0f, 0f),
+                    new Vector4(material.Metallic, sphere.MaterialId,
+                        AnalyticSpherePlacement.IsBlackHole(material) ? 1f : 0f, 0f),
                     new Vector4(sphere.Center, sphere.Radius));
             })
             .ToArray();
@@ -1156,9 +1290,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             if (!ShouldTraceGrid(grid) ||
                 !_gridGeometryCache.TryGetValue(grid.Id, out CachedGridGeometry? cached))
                 continue;
-            foreach (LocalEmissiveLight light in cached.Lights)
-                candidates.Add(new EmissiveLight(
-                    grid.LocalToWorld(light.LocalPosition), light.Radius, light.Color, light.Intensity));
+            if (!cached.WorldTransformMatches(grid))
+                cached.UpdateWorldGeometry(grid);
+            candidates.AddRange(cached.WorldLights);
         }
         EmissiveLight[] lights = candidates.OrderByDescending(light => light.Intensity).Take(32).ToArray();
         _emissiveLightCount = lights.Length;
@@ -1247,6 +1381,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _readback = _device.CreateCommittedResource(HeapType.Readback,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
         _pixels = new byte[_width * _height * 4];
+        _temporalFrameIndex = 0;
+        TemporalRayReuseObserved = false;
 
         GL.BindTexture(TextureTarget.Texture2D, _displayTexture);
         GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, _width, _height, 0,
@@ -1396,7 +1532,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         if (_output is null || _readback is null || _staticVertexBuffer is null || _tlas is null) return;
         long traceStarted = Stopwatch.GetTimestamp();
         Vector3 forward = camera.Forward;
-        Vector3 right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
+        Vector3 right = Vector3.Normalize(Vector3.Cross(forward, camera.Up));
         Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
         if (_reflectionTailHistoryValid &&
             (Vector3.DistanceSquared(cameraPosition, _previousTailCameraPosition) > 24f * 24f ||
@@ -1419,9 +1555,29 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             InfiniteMirrorQuality.Extreme => 1000,
             _ => 0,
         };
+        bool extremeDebrisSecondaryLod = _world.PhysicsGrids.Count >= 10_000 &&
+                                          infiniteMirrorMode == 0;
         int realReflectionLayers = infiniteMirrorMode > 0
             ? MaximumReflectionBounces
             : Math.Clamp(quality.HardwareRayTracingReflectionBounces, 1, MaximumReflectionBounces);
+        // Preserve two transmission layers so a ray can enter and leave real glass,
+        // while the shader limits opaque/mirror reflection to one layer under this
+        // exceptional load. Primary visibility and every fragment remain full-
+        // resolution, current-frame DXR; only exponential secondary work is bounded.
+        if (extremeDebrisSecondaryLod)
+            realReflectionLayers = Math.Min(realReflectionLayers, 2);
+        LastOrdinaryReflectionDepthLimit = extremeDebrisSecondaryLod
+            ? Math.Min(realReflectionLayers, 1)
+            : Math.Min(realReflectionLayers,
+                LastHardwareQuality >= 3 ? 4 : LastHardwareQuality >= 2 ? 3 : 2);
+        LastTransparentReflectionDepthLimit = Math.Min(realReflectionLayers,
+            LastHardwareQuality >= 3 ? 8 : LastHardwareQuality >= 2 ? 6 : 4);
+        // Primary visibility is never reconstructed.  Every screen pixel receives a
+        // real current-frame ray; performance scaling belongs in secondary paths and
+        // debris batching, not in guessing half of the final image.
+        TemporalRayReuseEnabled = false;
+        uint temporalPhase = _temporalFrameIndex++ & 1u;
+        _lastTemporalPhase = temporalPhase;
         ActualRealReflectionLayers = realReflectionLayers;
         ApproximateReflectionLayers = Math.Max(0, targetMirrorLayers - realReflectionLayers);
         if (!_reflectionTailHistoryValid)
@@ -1433,25 +1589,37 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             _previousTailTanHalfFov = MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f);
             _previousTailAspect = _width / (float)_height;
         }
+        // The 20k-shard stress case already fills the close mirror hall with
+        // transparent traversal candidates. Rays beyond the hall add traversal
+        // cost without contributing useful visible detail. Keep ordinary scenes at
+        // the configured distance and bound only this exceptional debris workload.
+        float effectiveRayDistance = _world.PhysicsGrids.Count >= 10_000
+            ? MathF.Min(quality.HardwareRayTracingRayDistance, 96f)
+            : quality.HardwareRayTracingRayDistance;
         var constants = new CameraConstants(
             new Vector4(cameraPosition, MathF.Tan(camera.FieldOfViewDegrees * MathF.PI / 360f)),
             new Vector4(forward, _width / (float)_height),
-            new Vector4(right, 0), new Vector4(up, 0),
+            // Temporal primary-ray reuse is disabled; CameraRight.w therefore carries
+            // the exact logical AnalyticSpheres count for the root-SRV shader.
+            new Vector4(right, _world.AnalyticSpheres.Count),
+            new Vector4(up, extremeDebrisSecondaryLod ? 1f : 0f),
             new Vector4(primaryLightDirection, daylight),
             new Vector4(LastHardwareQuality, (int)quality.HardwareRayTracingRenderStyle,
                 _emissiveLightCount, cameraUnderwater ? 1f : 0f),
             new Vector4(realReflectionLayers, infiniteMirrorMode,
                 selection.HasValue ? 1f : 0f, quality.SelectionOutlineReflections ? 1f : 0f),
             new Vector4(infiniteMirrorMode, targetMirrorLayers,
-                _reflectionTailHistoryValid ? 1f : 0f, 4f),
-            new Vector4(quality.HardwareRayTracingRayDistance,
+                _reflectionTailHistoryValid ? 1f : 0f,
+                (float)((Environment.TickCount64 * 0.001) % 4096.0)),
+            new Vector4(effectiveRayDistance,
                 quality.HardwareRayTracingShadowStrength,
                 quality.HardwareRayTracingEmissionStrength,
                 quality.HardwareRayTracingReflectionStrength),
             new Vector4(_previousTailCameraPosition, _previousTailTanHalfFov),
             new Vector4(_previousTailCameraForward, _previousTailAspect),
             new Vector4(_previousTailCameraRight, 0),
-            new Vector4(_previousTailCameraUp, 0),
+            new Vector4(_previousTailCameraUp,
+                _world.GenerationSettings.Preset == WorldPreset.ExternalBridge ? 0f : 1f),
             new Vector4(selection?.X ?? -1, selection?.Y ?? -1, selection?.Z ?? -1,
                 selection.HasValue ? (float)Math.Min(selection.Value.GridId, 16_777_215UL) : 0f));
 
@@ -1478,6 +1646,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             (_dynamicVertexBuffer ?? _staticVertexBuffer).GPUVirtualAddress);
         if (_analyticSphereDataBuffer is not null)
             _commands.SetComputeRootShaderResourceView(5, _analyticSphereDataBuffer.GPUVirtualAddress);
+        _commands.SetComputeRootShaderResourceView(6,
+            (_settledDebrisVertexBuffer ?? _staticVertexBuffer).GPUVirtualAddress);
         _commands.EndQuery(_timestampQueryHeap, QueryType.Timestamp, 0);
         _commands.DispatchRays(new DispatchRaysDescription
         {
@@ -1617,6 +1787,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _readback.Unmap(0);
     }
 
+    internal static int PrimaryRayCount(int width, int height) =>
+        checked(Math.Max(0, width) * Math.Max(0, height));
+
     private static StaticWorldGeometryBuild? BuildStaticWorldGeometry(
         int version,
         IReadOnlyList<StaticChunkBuildInput> inputs,
@@ -1669,6 +1842,15 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
             int x = chunk.MinimumX + voxel.LocalX;
             int z = chunk.MinimumZ + voxel.LocalZ;
             BlockDefinition material = definitions[voxel.MaterialId];
+            if (MechanicalPartGeometry.IsMechanical(material))
+            {
+                MechanicalAxis axis = MechanicalPartGeometry.ResolveAxis(
+                    x, voxel.Y, z, meshingSnapshot.GetBlock, definitions);
+                Vector3 origin = new(x, voxel.Y, z);
+                AddMechanicalMesh(vertices, origin,
+                    MechanicalPartGeometry.BuildVisualMesh(material, axis), material,
+                    (x, voxel.Y, z), 0);
+            }
             if (material.IsFluid)
                 AddFluidFlowGeometry(vertices, meshingSnapshot, definitions, material, x, voxel.Y, z);
             if (TryCreateEmissiveLight(
@@ -1677,24 +1859,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         }
         foreach (StoredMicroVoxel micro in snapshot.MicroVoxels)
         {
-            float inverse = 1f / micro.Snapshot.Resolution;
-            foreach (MicroVoxelBox box in micro.Snapshot.Boxes)
-            {
-                int before = vertices.Count;
-                Vector3 minimum = new(
-                    chunk.MinimumX + micro.LocalX + box.MinX * inverse,
-                    micro.Y + box.MinY * inverse,
-                    chunk.MinimumZ + micro.LocalZ + box.MinZ * inverse);
-                Vector3 maximum = new(
-                    chunk.MinimumX + micro.LocalX + box.MaxX * inverse,
-                    micro.Y + box.MaxY * inverse,
-                    chunk.MinimumZ + micro.LocalZ + box.MaxZ * inverse);
-                BlockDefinition material = definitions[box.MaterialId];
-                AddBoxFaces(vertices, minimum, maximum, material, AllFaces, null);
-                microVoxelTriangles += (vertices.Count - before) / 3;
-                if (TryCreateEmissiveLight((minimum + maximum) * 0.5f, material, out EmissiveLight light))
-                    emissiveLights.Add(light);
-            }
+            microVoxelTriangles += AddMicroVoxelSurface(vertices, micro, chunk, definitions, emissiveLights);
         }
         return new CachedStaticChunkGeometry(
             vertices.ToArray(), emissiveLights.ToArray(), microVoxelTriangles);
@@ -1746,40 +1911,104 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         }
     }
 
-    private WorldVertex[] BuildPhysicsGridVertices()
+    private PhysicsGridGeometry BuildPhysicsGridVertices()
     {
-        var vertices = new List<WorldVertex>(16_000);
+        int activeCapacity = _world.PhysicsGrids.Count >= 10_000
+            ? Math.Max(16_000, _world.PhysicsGrids.Count * 24)
+            : 16_000;
+        var activeVertices = new List<WorldVertex>(activeCapacity);
         BlockDefinition[] definitions = _blocks.CreateLookupSnapshot();
-        TracedPhysicsGridCount = 0;
-        TracedPhysicsGridTriangleCount = 0;
-        var activeGridIds = _world.PhysicsGrids.Grids.Select(grid => grid.Id).ToHashSet();
-        foreach (ulong stale in _gridGeometryCache.Keys.Where(id => !activeGridIds.Contains(id)).ToArray())
-            _gridGeometryCache.Remove(stale);
+        int debrisCount = 0;
+        int sleepingDebrisCount = 0;
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
         {
-            if (!ShouldTraceGrid(grid)) continue;
-            if (!_gridGeometryCache.TryGetValue(grid.Id, out CachedGridGeometry? cached) ||
-                cached.TopologyVersion != grid.TopologyVersion)
-            {
-                cached = BuildLocalGridGeometry(grid, definitions);
-                _gridGeometryCache[grid.Id] = cached;
-                DynamicTopologyBuildCount++;
-            }
-            int before = vertices.Count;
-            foreach (WorldVertex vertex in cached.Vertices)
-            {
-                vertices.Add(vertex with
-                {
-                    Position = grid.LocalToWorld(vertex.Position),
-                    Normal = Vector3.Normalize(grid.LocalDirectionToWorld(vertex.Normal)),
-                });
-            }
-            int triangles = (vertices.Count - before) / 3;
-            if (triangles <= 0) continue;
-            TracedPhysicsGridCount++;
-            TracedPhysicsGridTriangleCount += triangles;
+            if (!grid.IsDebrisFragment) continue;
+            debrisCount++;
+            if (grid.IsSleeping) sleepingDebrisCount++;
         }
-        return vertices.ToArray();
+        // Moving one shard at a time from the dynamic BLAS to the settled BLAS
+        // changed both vertex counts and forced two complete 160k-triangle rebuilds
+        // almost every frame. During a heavy fall, retain every shard in one fixed
+        // dynamic batch so DXR can use PerformUpdate. Once 99.5% have settled, move
+        // the pile once into the immutable fast-trace tier. Waking a meaningful pile
+        // switches back to the dynamic batch; no fragment is hidden or deleted.
+        bool heavyDebrisBatch = debrisCount >= 10_000 &&
+            sleepingDebrisCount * 200 < debrisCount * 199;
+        if (heavyDebrisBatch != _batchHeavyDebrisAsDynamic)
+            _batchHeavyDebrisAsDynamic = heavyDebrisBatch;
+        long membershipRevision = _world.PhysicsGrids.GeometryMembershipRevision;
+        if (_cachedPhysicsMembershipRevision != membershipRevision ||
+            _cachedHeavyDebrisBatchMode != heavyDebrisBatch)
+        {
+            var liveGridIds = _world.PhysicsGrids.Grids.Select(grid => grid.Id).ToHashSet();
+            foreach (ulong stale in _gridGeometryCache.Keys.Where(id => !liveGridIds.Contains(id)).ToArray())
+                _gridGeometryCache.Remove(stale);
+
+            var settledVertices = new List<WorldVertex>(Math.Max(
+                16_000, _cachedSettledDebrisVertices.Length));
+            ulong settledSignature = 14_695_981_039_346_656_037UL;
+            int settledGridCount = 0;
+            int actualSettledDebrisVertexCount = 0;
+            foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
+            {
+                if (!grid.IsSleeping) continue;
+                if (heavyDebrisBatch && grid.IsDebrisFragment) continue;
+                CachedGridGeometry cached = GetOrBuildGridGeometry(grid, definitions);
+                if (!cached.WorldTransformMatches(grid))
+                {
+                    cached.UpdateWorldGeometry(grid);
+                    DynamicWorldTransformBuildCount++;
+                }
+                settledVertices.AddRange(cached.WorldVertices);
+                if (grid.IsDebrisFragment)
+                    actualSettledDebrisVertexCount += cached.WorldVertices.Length;
+                settledSignature ^= grid.Id;
+                settledSignature *= 1_099_511_628_211UL;
+                settledSignature ^= (uint)grid.TopologyVersion;
+                settledSignature *= 1_099_511_628_211UL;
+                settledGridCount++;
+            }
+            _cachedSettledDebrisVertices = settledVertices.ToArray();
+            _cachedSettledDebrisGeometrySignature = settledSignature;
+            _cachedSettledDebrisGridCount = settledGridCount;
+            _cachedActualSettledDebrisVertexCount = actualSettledDebrisVertexCount;
+            _cachedPhysicsMembershipRevision = membershipRevision;
+            _cachedHeavyDebrisBatchMode = heavyDebrisBatch;
+        }
+
+        int activeGridCount = 0;
+        foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
+        {
+            bool retainedHeavyDebris = heavyDebrisBatch && grid.IsDebrisFragment;
+            if ((!retainedHeavyDebris && grid.IsSleeping) || !ShouldTraceGrid(grid)) continue;
+            CachedGridGeometry cached = GetOrBuildGridGeometry(grid, definitions);
+            if (!cached.WorldTransformMatches(grid))
+            {
+                cached.UpdateWorldGeometry(grid);
+                DynamicWorldTransformBuildCount++;
+            }
+            activeVertices.AddRange(cached.WorldVertices);
+            activeGridCount++;
+        }
+
+        TracedPhysicsGridCount = activeGridCount + _cachedSettledDebrisGridCount;
+        TracedPhysicsGridTriangleCount =
+            (activeVertices.Count + _cachedSettledDebrisVertices.Length) / 3;
+        return new PhysicsGridGeometry(
+            activeVertices.ToArray(), _cachedSettledDebrisVertices,
+            _cachedSettledDebrisGeometrySignature);
+    }
+
+    private CachedGridGeometry GetOrBuildGridGeometry(
+        PhysicsGrid grid,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        if (_gridGeometryCache.TryGetValue(grid.Id, out CachedGridGeometry? cached) &&
+            cached.TopologyVersion == grid.TopologyVersion) return cached;
+        cached = BuildLocalGridGeometry(grid, definitions);
+        _gridGeometryCache[grid.Id] = cached;
+        DynamicTopologyBuildCount++;
+        return cached;
     }
 
     private bool ShouldTraceGrid(PhysicsGrid grid)
@@ -1798,9 +2027,28 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     {
         var vertices = new List<WorldVertex>(Math.Max(36, grid.Elements.Count * 18));
         var lights = new List<LocalEmissiveLight>();
+        var smoothCells = grid.SmoothSpheres
+            .Select(sphere => (sphere.CellX, sphere.CellY, sphere.CellZ, sphere.MaterialId))
+            .ToHashSet();
         foreach (PhysicsGridElement element in grid.Elements)
         {
+            if (smoothCells.Contains((element.CellX, element.CellY, element.CellZ, element.MaterialId))) continue;
             BlockDefinition material = definitions[element.MaterialId];
+            Vector3 expectedMinimum = new(element.CellX, element.CellY, element.CellZ);
+            if (MechanicalPartGeometry.IsMechanical(material) &&
+                Vector3.DistanceSquared(element.Minimum, expectedMinimum) <= 0.000001f &&
+                Vector3.DistanceSquared(element.Maximum, expectedMinimum + Vector3.One) <= 0.000001f)
+            {
+                MechanicalAxis axis = MechanicalPartGeometry.ResolveAxis(
+                    element.CellX, element.CellY, element.CellZ,
+                    (x, y, z) => grid.TryGetFullCellMaterial(x, y, z, out ushort id) ? id : (ushort)0,
+                    definitions);
+                uint mechanicalGridId = grid.Id > 16_777_215UL ? 16_777_215u : (uint)grid.Id;
+                AddMechanicalMesh(vertices, expectedMinimum,
+                    MechanicalPartGeometry.BuildVisualMesh(material, axis), material,
+                    (element.CellX, element.CellY, element.CellZ), mechanicalGridId);
+                continue;
+            }
             byte faceMask = 0;
             for (int face = 0; face < 6; face++)
                 if (ShouldRenderGridFace(grid, element, material, face, definitions)) faceMask |= (byte)(1 << face);
@@ -1811,7 +2059,76 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                     (element.Minimum + element.Maximum) * 0.5f, material, out EmissiveLight light))
                 lights.Add(new LocalEmissiveLight(light.Position, light.Radius, light.Color, light.Intensity));
         }
+        uint smoothGridId = grid.Id > 16_777_215UL ? 16_777_215u : (uint)grid.Id;
+        foreach (SoftBodySurfaceVertex vertex in SoftBodySurfaceBuilder.Build(grid.SmoothSpheres))
+            AddSoftBodySurfaceVertex(vertices, vertex, definitions[vertex.MaterialId], smoothGridId);
+        if (grid.IsDebrisFragment)
+        {
+            // Instance 2 identifies settled debris, but moving shards share the
+            // ordinary dynamic BLAS. Carry the debris identity in the vertex so the
+            // shader can bound glass recursion before the shard reaches sleep.
+            for (int index = 0; index < vertices.Count; index++)
+                vertices[index] = vertices[index] with
+                {
+                    MaterialFlags = vertices[index].MaterialFlags | (1u << 2),
+                };
+        }
         return new CachedGridGeometry(grid.TopologyVersion, vertices.ToArray(), lights.ToArray());
+    }
+
+    private static void AddSoftBodySurfaceVertex(
+        List<WorldVertex> vertices,
+        SoftBodySurfaceVertex vertex,
+        BlockDefinition material,
+        uint gridId)
+    {
+        uint flags = MaterialSemanticFlags(material) |
+                     ((uint)Math.Clamp((int)MathF.Round(material.IndexOfRefraction * 100f), 100, 255) << 8);
+        vertices.Add(new WorldVertex(
+            vertex.Position,
+            vertex.Normal,
+            vertex.Uv,
+            material.Id,
+            (uint)vertex.FaceIndex,
+            material.Roughness,
+            material.Metallic,
+            gridId,
+            material.Transmission,
+            flags,
+            vertex.CellX,
+            vertex.CellY,
+            vertex.CellZ,
+            material.Emission));
+    }
+
+    private static void AddMechanicalMesh(
+        List<WorldVertex> vertices,
+        Vector3 origin,
+        IReadOnlyList<MechanicalPartMeshVertex> mesh,
+        BlockDefinition material,
+        (int X, int Y, int Z) cell,
+        uint gridId)
+    {
+        uint flags = MaterialSemanticFlags(material) |
+                     ((uint)Math.Clamp((int)MathF.Round(material.IndexOfRefraction * 100f), 100, 255) << 8);
+        foreach (MechanicalPartMeshVertex vertex in mesh)
+        {
+            vertices.Add(new WorldVertex(
+                origin + vertex.Position,
+                vertex.Normal,
+                vertex.Uv,
+                material.Id,
+                (uint)vertex.AtlasFace,
+                material.Roughness,
+                material.Metallic,
+                gridId,
+                material.Transmission,
+                flags,
+                cell.X,
+                cell.Y,
+                cell.Z,
+                material.Emission));
+        }
     }
 
     private static bool TryCreateEmissiveLight(
@@ -1949,6 +2266,7 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         IReadOnlyList<BlockDefinition> definitions)
     {
         BlockDefinition material = definitions[materialId];
+        if (MechanicalPartGeometry.IsMechanical(material)) return false;
         if (material.IsFluid)
             return face == 0 && (neighborId == 0 || !definitions[neighborId].IsFluid);
         if (neighborId == 0) return true;
@@ -2026,7 +2344,8 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         PhysicsGrid? grid,
         Vector2 uvScale = default,
         (int X, int Y, int Z)? cell = null,
-        uint gridId = 0)
+        uint gridId = 0,
+        Vector2 uvOffset = default)
     {
         if (uvScale.X <= 0f || uvScale.Y <= 0f) uvScale = Vector2.One;
         for (int face = 0; face < 6; face++)
@@ -2059,17 +2378,128 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
                     2 => Vector2.One,
                     _ => Vector2.UnitY,
                 };
-                uv *= uvScale;
+                uv = uv * uvScale + uvOffset;
                 vertices.Add(new WorldVertex(position, transformedNormal, uv, material.Id,
                     atlasFace, material.Roughness, material.Metallic, gridId,
                     material.Transmission,
-                    (material.IsFluid ? 1u : 0u) | (material.IsTransparent ? 2u : 0u) |
+                    MaterialSemanticFlags(material) |
                     ((uint)Math.Clamp((int)MathF.Round(material.IndexOfRefraction * 100f), 100, 255) << 8),
                     cell?.X ?? 0, cell?.Y ?? 0, cell?.Z ?? 0,
                     material.Emission));
             }
         }
     }
+
+    private static uint MaterialSemanticFlags(BlockDefinition material)
+    {
+        uint flags = (material.IsFluid ? 1u : 0u) | (material.IsTransparent ? 2u : 0u);
+        foreach (string tag in material.Tags)
+        {
+            if (tag.Equals("foam", StringComparison.OrdinalIgnoreCase)) flags |= 1u << 3;
+            else if (tag.Equals("prismatic", StringComparison.OrdinalIgnoreCase)) flags |= 1u << 4;
+            else if (tag.Equals("frosted", StringComparison.OrdinalIgnoreCase)) flags |= 1u << 5;
+            else if (tag.Equals("etched", StringComparison.OrdinalIgnoreCase)) flags |= 1u << 6;
+            else if (tag.Equals("absorber", StringComparison.OrdinalIgnoreCase)) flags |= 1u << 7;
+            else if (tag.Equals("black-hole", StringComparison.OrdinalIgnoreCase)) flags |= 1u << 8;
+        }
+        return flags;
+    }
+
+    private static int AddMicroVoxelSurface(
+        List<WorldVertex> vertices,
+        StoredMicroVoxel micro,
+        ChunkCoordinate chunk,
+        IReadOnlyList<BlockDefinition> definitions,
+        List<EmissiveLight> emissiveLights)
+    {
+        MicroVoxelSnapshot snapshot = micro.Snapshot;
+        int resolution = snapshot.Resolution;
+        float inverse = 1f / resolution;
+        // Each entry is one unit face on the precision lattice. Opposing faces of
+        // adjacent boxes cancel before geometry reaches the BLAS; this is essential
+        // for transparent material because every hidden face would otherwise become
+        // another refractive interface and multiply the ray tree.
+        var faces = new Dictionary<MicroFaceKey, ushort>();
+
+        void AddFace(int face, int plane, int u, int v, ushort materialId)
+        {
+            int opposite = face switch { 0 => 5, 5 => 0, 1 => 2, 2 => 1, 3 => 4, _ => 3 };
+            var oppositeKey = new MicroFaceKey(opposite, plane, u, v);
+            if (faces.TryGetValue(oppositeKey, out ushort adjacent) && adjacent == materialId)
+            {
+                faces.Remove(oppositeKey);
+                return;
+            }
+            faces[new MicroFaceKey(face, plane, u, v)] = materialId;
+        }
+
+        foreach (MicroVoxelBox box in snapshot.Boxes)
+        {
+            for (int x = box.MinX; x < box.MaxX; x++)
+            for (int z = box.MinZ; z < box.MaxZ; z++)
+            {
+                AddFace(5, box.MinY, x, z, box.MaterialId);
+                AddFace(0, box.MaxY, x, z, box.MaterialId);
+            }
+            for (int z = box.MinZ; z < box.MaxZ; z++)
+            for (int y = box.MinY; y < box.MaxY; y++)
+            {
+                AddFace(1, box.MinX, z, y, box.MaterialId);
+                AddFace(2, box.MaxX, z, y, box.MaterialId);
+            }
+            for (int x = box.MinX; x < box.MaxX; x++)
+            for (int y = box.MinY; y < box.MaxY; y++)
+            {
+                AddFace(3, box.MinZ, x, y, box.MaterialId);
+                AddFace(4, box.MaxZ, x, y, box.MaterialId);
+            }
+
+            BlockDefinition material = definitions[box.MaterialId];
+            Vector3 lightMinimum = new(
+                chunk.MinimumX + micro.LocalX + box.MinX * inverse,
+                micro.Y + box.MinY * inverse,
+                chunk.MinimumZ + micro.LocalZ + box.MinZ * inverse);
+            Vector3 lightMaximum = new(
+                chunk.MinimumX + micro.LocalX + box.MaxX * inverse,
+                micro.Y + box.MaxY * inverse,
+                chunk.MinimumZ + micro.LocalZ + box.MaxZ * inverse);
+            if (TryCreateEmissiveLight((lightMinimum + lightMaximum) * 0.5f, material, out EmissiveLight light))
+                emissiveLights.Add(light);
+        }
+
+        int before = vertices.Count;
+        Vector3 origin = new(chunk.MinimumX + micro.LocalX, micro.Y, chunk.MinimumZ + micro.LocalZ);
+        foreach ((MicroFaceKey key, ushort materialId) in faces)
+        {
+            Vector3 minimum;
+            Vector3 maximum;
+            Vector2 uvOffset;
+            if (key.Face is 0 or 5)
+            {
+                minimum = origin + new Vector3(key.U * inverse, key.Plane * inverse, key.V * inverse);
+                maximum = minimum + new Vector3(inverse, 0f, inverse);
+                uvOffset = new Vector2(key.U, key.V) * inverse;
+            }
+            else if (key.Face is 1 or 2)
+            {
+                minimum = origin + new Vector3(key.Plane * inverse, key.V * inverse, key.U * inverse);
+                maximum = minimum + new Vector3(0f, inverse, inverse);
+                uvOffset = new Vector2(key.U, key.V) * inverse;
+            }
+            else
+            {
+                minimum = origin + new Vector3(key.U * inverse, key.V * inverse, key.Plane * inverse);
+                maximum = minimum + new Vector3(inverse, inverse, 0f);
+                uvOffset = new Vector2(key.U, key.V) * inverse;
+            }
+            AddBoxFaces(vertices, minimum, maximum, definitions[materialId],
+                (byte)(1 << key.Face), null, new Vector2(inverse),
+                (chunk.MinimumX + micro.LocalX, micro.Y, chunk.MinimumZ + micro.LocalZ), 0, uvOffset);
+        }
+        return (vertices.Count - before) / 3;
+    }
+
+    private readonly record struct MicroFaceKey(int Face, int Plane, int U, int V);
 
     private static Vector3 BoxFaceCorner(Vector3 minimum, Vector3 maximum, int face, int corner) =>
         (face, corner) switch
@@ -2179,8 +2609,14 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
     private void OnAnalyticSpheresChanged()
     {
         if (_world.AnalyticSpheres.Count != _lastAnalyticSphereCount)
+        {
             _analyticSphereTopologyDirty = true;
-        _physicsGeometryDirty = true;
+            _physicsGeometryDirty = true;
+            return;
+        }
+        // Sphere motion changes only instance transforms and material records.
+        // Do not refit the unrelated Physics Grid BLAS every time a ball rolls.
+        _analyticSphereTransformDirty = true;
     }
 
     private void DisposeGeometryResources()
@@ -2188,8 +2624,10 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _instanceBuffer?.Dispose(); _instanceBuffer = null;
         _tlas?.Dispose(); _tlas = null;
         _dynamicBlas?.Dispose(); _dynamicBlas = null;
+        _settledDebrisBlas?.Dispose(); _settledDebrisBlas = null;
         _staticBlas?.Dispose(); _staticBlas = null;
         _dynamicVertexBuffer?.Dispose(); _dynamicVertexBuffer = null;
+        _settledDebrisVertexBuffer?.Dispose(); _settledDebrisVertexBuffer = null;
         _dynamicUpdateScratch?.Dispose(); _dynamicUpdateScratch = null;
         _dynamicUpdateScratchBytes = 0;
         _staticVertexBuffer?.Dispose(); _staticVertexBuffer = null;
@@ -2199,6 +2637,9 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _emissiveLightCapacity = 0;
         _staticBlasBytes = 0;
         _dynamicBlasBytes = 0;
+        _settledDebrisBlasBytes = 0;
+        _settledDebrisVertexCount = 0;
+        _settledDebrisSignature = 0;
         _tlasBytes = 0;
     }
 
@@ -2207,12 +2648,17 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         _instanceBuffer?.Dispose(); _instanceBuffer = null;
         _tlas?.Dispose(); _tlas = null;
         _dynamicBlas?.Dispose(); _dynamicBlas = null;
+        _settledDebrisBlas?.Dispose(); _settledDebrisBlas = null;
         _dynamicVertexBuffer?.Dispose(); _dynamicVertexBuffer = null;
+        _settledDebrisVertexBuffer?.Dispose(); _settledDebrisVertexBuffer = null;
         _emissiveLightBuffer?.Dispose(); _emissiveLightBuffer = null;
         _analyticSphereDataBuffer?.Dispose(); _analyticSphereDataBuffer = null;
         _analyticSphereDataCapacity = 0;
         _emissiveLightCapacity = 0;
         _dynamicBlasBytes = 0;
+        _settledDebrisBlasBytes = 0;
+        _settledDebrisVertexCount = 0;
+        _settledDebrisSignature = 0;
         _tlasBytes = 0;
     }
 
@@ -2316,8 +2762,62 @@ public sealed unsafe class DxrHardwareRenderer : IRenderBackend, IMaterialPrevie
         float MaximumZ);
     private readonly record struct LocalEmissiveLight(
         Vector3 LocalPosition, float Radius, Vector3 Color, float Intensity);
-    private sealed record CachedGridGeometry(
-        int TopologyVersion, WorldVertex[] Vertices, LocalEmissiveLight[] Lights);
+    private readonly record struct PhysicsGridGeometry(
+        WorldVertex[] ActiveVertices,
+        WorldVertex[] SettledVertices,
+        ulong SettledSignature);
+    private sealed class CachedGridGeometry
+    {
+        public int TopologyVersion { get; }
+        public WorldVertex[] Vertices { get; }
+        public LocalEmissiveLight[] Lights { get; }
+        public WorldVertex[] WorldVertices { get; private set; } = Array.Empty<WorldVertex>();
+        public EmissiveLight[] WorldLights { get; private set; } = Array.Empty<EmissiveLight>();
+
+        private Vector3 _worldPosition;
+        private Quaternion _worldOrientation;
+        private bool _hasWorldTransform;
+
+        public CachedGridGeometry(
+            int topologyVersion,
+            WorldVertex[] vertices,
+            LocalEmissiveLight[] lights)
+        {
+            TopologyVersion = topologyVersion;
+            Vertices = vertices;
+            Lights = lights;
+        }
+
+        public bool WorldTransformMatches(PhysicsGrid grid) => _hasWorldTransform &&
+            Vector3.DistanceSquared(_worldPosition, grid.Position) <= 0.0000000001f &&
+            1f - MathF.Abs(Quaternion.Dot(_worldOrientation, grid.Orientation)) <= 0.0000001f;
+
+        public void UpdateWorldGeometry(PhysicsGrid grid)
+        {
+            if (WorldVertices.Length != Vertices.Length)
+                WorldVertices = new WorldVertex[Vertices.Length];
+            for (int index = 0; index < Vertices.Length; index++)
+            {
+                WorldVertex vertex = Vertices[index];
+                WorldVertices[index] = vertex with
+                {
+                    Position = grid.LocalToWorld(vertex.Position),
+                    Normal = Vector3.Normalize(grid.LocalDirectionToWorld(vertex.Normal)),
+                };
+            }
+            if (WorldLights.Length != Lights.Length)
+                WorldLights = new EmissiveLight[Lights.Length];
+            for (int index = 0; index < Lights.Length; index++)
+            {
+                LocalEmissiveLight light = Lights[index];
+                WorldLights[index] = new EmissiveLight(
+                    grid.LocalToWorld(light.LocalPosition), light.Radius, light.Color, light.Intensity);
+            }
+            _worldPosition = grid.Position;
+            _worldOrientation = grid.Orientation;
+            _hasWorldTransform = true;
+        }
+    }
     private sealed record CachedStaticChunkGeometry(
         WorldVertex[] Vertices, EmissiveLight[] EmissiveLights, int MicroVoxelTriangleCount);
     private sealed record StaticChunkBuildInput(

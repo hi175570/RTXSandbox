@@ -58,6 +58,7 @@ Texture2D<float4> MaterialAtlas : register(t2);
 Texture2D<float2> MaterialDetailAtlas : register(t3);
 StructuredBuffer<EmissiveLight> EmissiveLights : register(t4);
 StructuredBuffer<WorldVertex> DynamicVertices : register(t5);
+StructuredBuffer<WorldVertex> SettledDebrisVertices : register(t8);
 Texture2D<float4> ReflectionTailHistory : register(t6);
 StructuredBuffer<AnalyticSphereData> AnalyticSpheres : register(t7);
 
@@ -68,7 +69,9 @@ WorldVertex LoadVertex(uint index)
 {
     if (InstanceID() == 0)
         return StaticVertices[index];
-    return DynamicVertices[index];
+    if (InstanceID() == 1)
+        return DynamicVertices[index];
+    return SettledDebrisVertices[index];
 }
 
 int2 MaterialAtlasTexel(uint materialId, uint face, float2 uv)
@@ -78,6 +81,62 @@ int2 MaterialAtlasTexel(uint materialId, uint face, float2 uv)
                        (tile / MaterialTilesPerRow) * MaterialTileSize);
     int2 pixel = clamp(int2(floor(frac(uv) * MaterialTileSize)), 0, MaterialTileSize - 1);
     return origin + pixel;
+}
+
+uint MaterialVariantHash(WorldVertex vertex, float2 uv)
+{
+    // Dynamic structures retain local cell coordinates while they move. Static
+    // greedy faces use the integer UV tile. In both cases the variant is stable
+    // on the object instead of swimming in world space as the camera/object moves.
+    int2 tileCell = vertex.gridMarker != 0
+        ? (vertex.materialFace == 0u || vertex.materialFace == 2u
+            ? vertex.cell.xz
+            : (vertex.materialFace == 1u ? vertex.cell.zy : vertex.cell.xy))
+        : int2(floor(uv));
+    uint hash = asuint(tileCell.x) * 0x8da6b343u;
+    hash ^= asuint(tileCell.y) * 0xd8163841u;
+    hash ^= vertex.materialId * 0xcb1ab31fu;
+    hash ^= vertex.materialFace * 0x165667b1u;
+    hash ^= hash >> 15;
+    hash *= 0x2c1b3c6du;
+    hash ^= hash >> 12;
+    return hash;
+}
+
+float2 RotateMaterialUv(float2 value, uint rotation)
+{
+    if (rotation == 1u) return float2(value.y, 1.0 - value.x);
+    if (rotation == 2u) return 1.0 - value;
+    if (rotation == 3u) return float2(1.0 - value.y, value.x);
+    return value;
+}
+
+float2 RotateMaterialDelta(float2 value, uint rotation)
+{
+    if (rotation == 1u) return float2(value.y, -value.x);
+    if (rotation == 2u) return -value;
+    if (rotation == 3u) return float2(-value.y, value.x);
+    return value;
+}
+
+float2 MaterialVariantUv(WorldVertex vertex, float2 uv, out uint rotation)
+{
+    // Base iron (136), tread plate (157), and hazard stripes (158) use authored,
+    // edge-periodic layouts.
+    // Keeping one orientation makes adjacent voxel faces form a continuous surface.
+    if (vertex.materialId == 136u || vertex.materialId == 157u || vertex.materialId == 158u)
+    {
+        rotation = 0u;
+        return frac(uv);
+    }
+    uint hash = MaterialVariantHash(vertex, uv);
+    rotation = hash & 3u;
+    float2 local = RotateMaterialUv(frac(uv), rotation);
+    // Pixel-aligned toroidal offsets preserve the deliberately pixel-like atlas
+    // while providing 256 offsets in addition to four orientations. Adjacent
+    // bronze/iron blocks therefore no longer stamp the same 16x16 patch.
+    float2 offset = float2((hash >> 8) & 15u, (hash >> 16) & 15u) / MaterialTileSize;
+    return frac(local + offset);
 }
 
 cbuffer CameraConstants : register(b0)
@@ -127,12 +186,39 @@ float3 GlassInterfaceFilter(float3 tint, float transmission)
     return sqrt(saturate(volumeFilter * transmittedEnergy));
 }
 
+float3 GlassShadowFilter(uint materialId, uint face, float transmission, float roughness)
+{
+    // A shadow ray represents the finite solar disc, not a projector sampling one
+    // nearest atlas texel.  Average stable points across the material tile so a
+    // mosaic/frost pattern produces softly mixed transmitted light instead of a
+    // razor-sharp checkerboard painted onto the receiver.
+    int tile = int(materialId) * 3 + int(face);
+    int2 origin = int2((tile % MaterialTilesPerRow) * MaterialTileSize,
+                       (tile / MaterialTilesPerRow) * MaterialTileSize);
+    float3 tint = (
+        MaterialAtlas.Load(int3(origin + int2(2, 3), 0)).rgb +
+        MaterialAtlas.Load(int3(origin + int2(12, 2), 0)).rgb +
+        MaterialAtlas.Load(int3(origin + int2(4, 12), 0)).rgb +
+        MaterialAtlas.Load(int3(origin + int2(13, 13), 0)).rgb) * 0.25;
+    float peak = max(tint.r, max(tint.g, tint.b));
+    float3 chroma = peak > 0.001 ? saturate(tint / peak) : float3(1.0, 1.0, 1.0);
+    chroma = pow(max(chroma, float3(0.025, 0.025, 0.025)), 1.16);
+    float colorStrength = saturate(0.30 + transmission * 0.45 - roughness * 0.22);
+    float3 colored = lerp(float3(1.0, 1.0, 1.0), chroma, colorStrength);
+    float energy = lerp(0.34, 0.76, saturate(transmission)) *
+                   lerp(1.0, 0.72, saturate(roughness));
+    // A closed volume normally crosses two interfaces; sqrt makes their product
+    // converge on the intended volume attenuation without double-darkening.
+    return sqrt(saturate(colored * energy));
+}
+
 uint CurrentPrimitiveKey()
 {
-    // TLAS currently has static (0) and dynamic (1) geometry instances. Zero is
-    // reserved for "no primitive", allowing a child ray to ignore exactly the
-    // surface that spawned it without skipping a coplanar opaque neighbor.
-    return ((InstanceID() & 1u) << 31) | ((PrimitiveIndex() + 1u) & 0x7fffffffu);
+    // TLAS has static (0), active dynamic (1), and settled debris (2) triangle
+    // instances. Keep two bits for that identity; otherwise settled shards alias
+    // static-world triangles and child rays can ignore the wrong surface.
+    // Primitive zero remains reserved for "no primitive".
+    return ((InstanceID() & 3u) << 30) | ((PrimitiveIndex() + 1u) & 0x3fffffffu);
 }
 
 float3 SelectionOutline(WorldVertex vertex, float3 hitPosition, float3 geometricNormal,
@@ -156,9 +242,21 @@ float3 SelectionOutline(WorldVertex vertex, float3 hitPosition, float3 geometric
 void ResetMirrorState(inout Payload payload)
 {
     payload.lastMirrorPlane = float4(0.0, 0.0, 0.0, 0.0);
-    payload.mirrorTintAndGap = float4(1.0, 1.0, 1.0, 0.0);
+    // W carries conservative path throughput until a planar-mirror cycle uses it
+    // for its measured gap. It lets visually irrelevant diffuse tails terminate
+    // without changing the configured bounce limit for mirrors.
+    payload.mirrorTintAndGap = float4(1.0, 1.0, 1.0, 1.0);
     payload.mirrorCycleCount = 0;
     payload.padding = 0;
+}
+
+float PathThroughput(Payload payload)
+{
+    // Planar mirrors must always retain the user's full recursion depth. Their
+    // tail uses RGB tint/plane history instead of this scalar estimate.
+    return dot(payload.lastMirrorPlane.xyz, payload.lastMirrorPlane.xyz) > 0.25
+        ? 1.0
+        : saturate(payload.mirrorTintAndGap.w);
 }
 
 bool ProjectIntoPreviousCamera(float3 worldPosition, out float2 uv)
@@ -261,6 +359,521 @@ float3 ApproximateMirrorTail(float3 seedColor, float3 localColor, float3 hitPosi
     return clamp(reprojected, 0.0, 32.0);
 }
 
+bool IsBlackHole(AnalyticSphereData sphere)
+{
+    return sphere.metallicAndMaterial.z > 0.5 ||
+           (uint)round(sphere.metallicAndMaterial.y) == 208u;
+}
+
+bool FindBlackHoleInfluence(
+    float3 rayOrigin,
+    float3 rayDirection,
+    out float3 center,
+    out float radius,
+    out float entryDistance)
+{
+    center = 0.0;
+    radius = 0.0;
+    entryDistance = 1e30;
+    bool found = false;
+    // CameraRight.w contains the exact logical element count. Root SRVs do not
+    // carry a descriptor range, so GetDimensions is not reliable for this buffer.
+    uint sphereCount = (uint)max(round(CameraRight.w), 0.0);
+    for (uint index = 0; index < sphereCount; index++)
+    {
+        AnalyticSphereData sphere = AnalyticSpheres[index];
+        if (!IsBlackHole(sphere)) continue;
+        float candidateRadius = max(sphere.centerAndRadius.w, 0.0001);
+        float influenceRadius = candidateRadius * 9.0;
+        float3 offset = rayOrigin - sphere.centerAndRadius.xyz;
+        float projected = dot(offset, rayDirection);
+        float discriminant = projected * projected -
+            (dot(offset, offset) - influenceRadius * influenceRadius);
+        if (discriminant < 0.0) continue;
+        float root = sqrt(discriminant);
+        float enter = max(-projected - root, 0.0);
+        float leave = -projected + root;
+        if (leave <= 0.0 || enter >= entryDistance) continue;
+        found = true;
+        entryDistance = enter;
+        center = sphere.centerAndRadius.xyz;
+        radius = candidateRadius;
+    }
+    return found;
+}
+
+void AccumulateAccretionDiskSegment(
+    float3 rayOrigin,
+    float3 rayDirection,
+    float segmentLength,
+    float3 center,
+    float radius,
+    inout float3 radiance,
+    inout float transmittance)
+{
+    static const float3 DiskNormal = float3(0.081760, 0.980581, 0.178385);
+    if (segmentLength <= 0.00001 || transmittance <= 0.002) return;
+
+    float denominator = dot(rayDirection, DiskNormal);
+    float startHeight = dot(rayOrigin - center, DiskNormal);
+    float closestDistance = abs(denominator) > 0.00001
+        ? clamp(-startHeight / denominator, 0.0, segmentLength)
+        : segmentLength * 0.5;
+    float3 diskPoint = rayOrigin + rayDirection * closestDistance;
+    float3 offset = diskPoint - center;
+    float3 radialVector = offset - DiskNormal * dot(offset, DiskNormal);
+    float radialDistance = length(radialVector);
+    float ratio = radialDistance / max(radius, 0.0001);
+    if (ratio < 2.55 || ratio > 5.15) return;
+
+    float3 radialDirection = radialVector / max(radialDistance, 0.0001);
+    float3 tangent = normalize(cross(DiskNormal, radialDirection));
+    float innerHeat = 1.0 - smoothstep(2.55, 5.15, ratio);
+    float radialEnvelope = smoothstep(2.55, 2.78, ratio) *
+        (1.0 - smoothstep(4.70, 5.15, ratio));
+    float scaleHeight = lerp(0.075, 0.16, smoothstep(2.55, 5.15, ratio));
+    float heightRatio = abs(dot(offset, DiskNormal)) /
+        max(radius * scaleHeight, 0.0001);
+    float3 diskAxis = normalize(cross(DiskNormal, float3(0.0, 0.0, 1.0)));
+    float3 diskBitangent = cross(DiskNormal, diskAxis);
+    float azimuth = atan2(dot(radialDirection, diskBitangent), dot(radialDirection, diskAxis));
+    float densityWave = 0.82 + 0.18 *
+        (0.5 + 0.5 * sin(azimuth * 3.0 - ratio * 7.5));
+    float density = radialEnvelope * exp(-0.5 * heightRatio * heightRatio) * densityWave;
+    if (density <= 0.00001) return;
+
+    float pathLength = abs(denominator) > 0.00001
+        ? min(segmentLength, 2.506628 * radius * scaleHeight / abs(denominator))
+        : segmentLength;
+    float opticalDepth = density * pathLength / max(radius * 0.24, 0.0001);
+    float emittedFraction = 1.0 - exp(-opticalDepth * 0.82);
+    float attenuation = exp(-opticalDepth * 0.42);
+
+    float orbitalSpeed = sqrt(0.46 / max(ratio, 2.55));
+    float lineOfSight = dot(tangent, -rayDirection);
+    float doppler = pow(clamp(
+        1.0 / max(1.0 - orbitalSpeed * lineOfSight, 0.30),
+        0.46, 1.95), 2.35);
+    float gravitationalShift = sqrt(clamp(
+        1.0 - 1.0 / max(ratio, 1.001), 0.04, 1.0));
+    float3 gas = lerp(float3(0.11, 0.0015, 0.0002),
+        float3(2.8, 0.72, 0.055), pow(innerHeat, 0.70));
+    gas = lerp(gas, float3(4.8, 3.0, 1.05), pow(innerHeat, 2.55));
+    radiance += transmittance * gas * gravitationalShift * doppler *
+        emittedFraction * HardwareOptions.z;
+    transmittance *= attenuation;
+}
+
+void InitializePrimaryPayload(out Payload payload)
+{
+    payload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
+    payload.depth = 0;
+    payload.diagnosticFlags = 0;
+    ResetMirrorState(payload);
+}
+
+void ResetRadianceTraceResult(Payload seed, out Payload payload)
+{
+    payload = seed;
+    payload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
+    payload.diagnosticFlags = 0;
+}
+
+// Schwarzschild optical metric in isotropic coordinates. The analytic sphere
+// radius is the isotropic event horizon Rh = r_s / 4. Rather than applying a
+// tuned screen displacement, DXR integrates Fermat transport in
+// n(r) = (1 + Rh/r)^3 / (1 - Rh/r) for every radiance/visibility chord.
+float3 SchwarzschildOpticalGradient(float3 position, float3 center, float horizonRadius)
+{
+    float3 offset = position - center;
+    float radius = max(length(offset), horizonRadius * 1.001);
+    float a = clamp(horizonRadius / radius, 0.0, 0.999);
+    float radialDerivative = -a / radius *
+        (3.0 / (1.0 + a) + 1.0 / (1.0 - a));
+    return offset / radius * radialDerivative;
+}
+
+float3 SchwarzschildDirectionStep(
+    float3 position,
+    float3 direction,
+    float3 center,
+    float horizonRadius,
+    float distance)
+{
+    float3 gradient = SchwarzschildOpticalGradient(position, center, horizonRadius);
+    float3 curvature = gradient - direction * dot(direction, gradient);
+    return normalize(direction + curvature * distance);
+}
+
+// Advance a ray through the same optical metric used by the DXR trace without
+// querying scene geometry. Lighting uses this transport-only pass as the
+// forward model for a shooting solve: a finite emitter is a boundary condition,
+// not merely the direction of an initially straight shadow ray.
+void IntegrateSchwarzschildPath(
+    float3 rayOrigin,
+    float3 initialDirection,
+    float maximumDistance,
+    out float3 endpoint,
+    out float3 exitDirection,
+    out bool captured)
+{
+    endpoint = rayOrigin;
+    exitDirection = normalize(initialDirection);
+    captured = false;
+    if (maximumDistance <= 0.0001) return;
+
+    float3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!FindBlackHoleInfluence(rayOrigin, exitDirection,
+            blackHoleCenter, blackHoleRadius, entryDistance) ||
+        entryDistance >= maximumDistance)
+    {
+        endpoint += exitDirection * maximumDistance;
+        return;
+    }
+
+    float travelled = max(entryDistance, 0.0);
+    endpoint += exitDirection * travelled;
+    float previousRadius = length(endpoint - blackHoleCenter);
+    bool passedPeriapsis = false;
+    uint quality = (uint)round(RenderOptions.x);
+    uint maximumSteps = quality >= 3u ? 144u : (quality >= 2u ? 96u : 64u);
+    [loop]
+    for (uint stepIndex = 0; stepIndex < 144u; stepIndex++)
+    {
+        if (stepIndex >= maximumSteps || travelled >= maximumDistance) break;
+        float distanceToHole = length(endpoint - blackHoleCenter);
+        if (distanceToHole <= blackHoleRadius * 1.002)
+        {
+            captured = true;
+            return;
+        }
+
+        passedPeriapsis = passedPeriapsis ||
+            distanceToHole > previousRadius + blackHoleRadius * 0.002;
+        previousRadius = distanceToHole;
+        float segmentLength = min(maximumDistance - travelled, clamp(
+            (distanceToHole - blackHoleRadius) * 0.10,
+            blackHoleRadius * 0.004,
+            blackHoleRadius * 0.30));
+        float3 midpointDirection = SchwarzschildDirectionStep(
+            endpoint, exitDirection, blackHoleCenter, blackHoleRadius,
+            segmentLength * 0.50);
+        endpoint += midpointDirection * segmentLength;
+        travelled += segmentLength;
+        exitDirection = SchwarzschildDirectionStep(
+            endpoint, midpointDirection, blackHoleCenter, blackHoleRadius,
+            segmentLength * 0.50);
+        if (passedPeriapsis &&
+            length(endpoint - blackHoleCenter) > blackHoleRadius * 9.05)
+            break;
+    }
+
+    endpoint += exitDirection * max(maximumDistance - travelled, 0.0);
+}
+
+bool SolvePointLightGeodesic(
+    float3 rayOrigin,
+    float3 target,
+    out float3 localDirection,
+    out float pathDistance,
+    out float endpointError)
+{
+    float3 targetVector = target - rayOrigin;
+    float geometricDistance = length(targetVector);
+    localDirection = targetVector / max(geometricDistance, 0.0001);
+    pathDistance = geometricDistance;
+    endpointError = 0.0;
+    if (geometricDistance <= 0.0001) return true;
+
+    float3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!FindBlackHoleInfluence(rayOrigin, localDirection,
+            blackHoleCenter, blackHoleRadius, entryDistance) ||
+        entryDistance >= geometricDistance)
+        return true;
+
+    bool captured = false;
+    [unroll]
+    for (uint iteration = 0; iteration < 6u; iteration++)
+    {
+        float3 endpoint;
+        float3 finalDirection;
+        IntegrateSchwarzschildPath(rayOrigin, localDirection, pathDistance,
+            endpoint, finalDirection, captured);
+        float3 error = target - endpoint;
+        endpointError = length(error);
+        if (!captured && endpointError <= max(0.018, geometricDistance * 0.0015))
+            return true;
+
+        // Correct path length along the arriving tangent and initial angle in
+        // its tangent plane. Damping keeps the solve stable near the photon
+        // sphere, where multiple valid images and very large Jacobians exist.
+        pathDistance = clamp(pathDistance + dot(error, finalDirection) * 0.72,
+            geometricDistance * 0.72, geometricDistance * 2.5);
+        float3 transverseError = error - finalDirection * dot(error, finalDirection);
+        float3 angularCorrection = transverseError / max(pathDistance, 0.05);
+        if (captured)
+        {
+            float3 radial = normalize(blackHoleCenter - rayOrigin);
+            float3 away = localDirection - radial * dot(localDirection, radial);
+            if (dot(away, away) < 0.000001)
+                away = cross(localDirection, abs(localDirection.y) < 0.9
+                    ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0));
+            angularCorrection += normalize(away) * 0.055;
+        }
+        localDirection = normalize(localDirection + angularCorrection * 0.78);
+    }
+
+    float3 solvedEndpoint;
+    float3 solvedFinalDirection;
+    IntegrateSchwarzschildPath(rayOrigin, localDirection, pathDistance,
+        solvedEndpoint, solvedFinalDirection, captured);
+    endpointError = length(target - solvedEndpoint);
+    return !captured && endpointError <= max(0.055, geometricDistance * 0.006);
+}
+
+bool SolveDirectionalLightGeodesic(
+    float3 rayOrigin,
+    float3 directionAtInfinity,
+    out float3 localDirection)
+{
+    float3 targetDirection = normalize(directionAtInfinity);
+    localDirection = targetDirection;
+    float3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!FindBlackHoleInfluence(rayOrigin, localDirection,
+            blackHoleCenter, blackHoleRadius, entryDistance) ||
+        entryDistance >= HardwareOptions.x)
+        return true;
+
+    bool captured = false;
+    [unroll]
+    for (uint iteration = 0; iteration < 6u; iteration++)
+    {
+        float3 endpoint;
+        float3 finalDirection;
+        IntegrateSchwarzschildPath(rayOrigin, localDirection, HardwareOptions.x,
+            endpoint, finalDirection, captured);
+        if (!captured && dot(finalDirection, targetDirection) > 0.99996)
+            return true;
+        float3 angularError = targetDirection - finalDirection *
+            dot(targetDirection, finalDirection);
+        if (captured)
+        {
+            float3 radial = normalize(blackHoleCenter - rayOrigin);
+            float3 away = localDirection - radial * dot(localDirection, radial);
+            if (dot(away, away) < 0.000001)
+                away = cross(localDirection, abs(localDirection.y) < 0.9
+                    ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0));
+            angularError += normalize(away) * 0.055;
+        }
+        localDirection = normalize(localDirection + angularError * 0.82);
+    }
+
+    float3 solvedEndpoint;
+    float3 solvedDirection;
+    IntegrateSchwarzschildPath(rayOrigin, localDirection, HardwareOptions.x,
+        solvedEndpoint, solvedDirection, captured);
+    return !captured && dot(solvedDirection, targetDirection) > 0.9985;
+}
+
+// Integrate every radiance ray through the bounded gravitational field. Each
+// chord is submitted to the real TLAS, so primary, reflected and refracted light
+// paths are bent by transport itself instead of warping a completed camera image.
+void TraceCurvedRadiance(RayDesc initialRay, inout Payload payload)
+{
+    Payload seed = payload;
+    float3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!FindBlackHoleInfluence(initialRay.Origin, initialRay.Direction,
+            blackHoleCenter, blackHoleRadius, entryDistance))
+    {
+        ResetRadianceTraceResult(seed, payload);
+        TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, initialRay, payload);
+        return;
+    }
+
+    RayDesc segmentRay = initialRay;
+    float travelled = 0.0;
+    uint accumulatedFlags = 0;
+    float3 diskRadiance = 0.0;
+    float diskTransmittance = 1.0;
+    if (entryDistance > 0.0005)
+    {
+        segmentRay.TMin = initialRay.TMin;
+        segmentRay.TMax = min(entryDistance, initialRay.TMax);
+        ResetRadianceTraceResult(seed, payload);
+        TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, segmentRay, payload);
+        accumulatedFlags |= payload.diagnosticFlags;
+        if (payload.colorAndDistance.a >= 0.0) return;
+        segmentRay.Origin += segmentRay.Direction * segmentRay.TMax;
+        travelled += segmentRay.TMax;
+        if (travelled >= initialRay.TMax)
+        {
+            payload.diagnosticFlags = accumulatedFlags;
+            return;
+        }
+    }
+
+    float previousRadius = length(segmentRay.Origin - blackHoleCenter);
+    bool passedPeriapsis = false;
+    uint quality = (uint)round(RenderOptions.x);
+    uint maximumSteps = quality >= 3u ? 144u : (quality >= 2u ? 96u : 64u);
+    [loop]
+    for (uint stepIndex = 0; stepIndex < 144u; stepIndex++)
+    {
+        if (stepIndex >= maximumSteps || travelled >= initialRay.TMax) break;
+        float3 fromHole = segmentRay.Origin - blackHoleCenter;
+        float distanceToHole = length(fromHole);
+        if (distanceToHole <= blackHoleRadius * 1.002)
+        {
+            ResetRadianceTraceResult(seed, payload);
+            payload.colorAndDistance.rgb = diskRadiance;
+            payload.colorAndDistance.a = travelled;
+            payload.diagnosticFlags = accumulatedFlags | 1u;
+            return;
+        }
+
+        passedPeriapsis = passedPeriapsis ||
+            distanceToHole > previousRadius + blackHoleRadius * 0.002;
+        previousRadius = distanceToHole;
+        float remaining = initialRay.TMax - travelled;
+        float segmentLength = min(remaining, clamp(
+            (distanceToHole - blackHoleRadius) * 0.10,
+            blackHoleRadius * 0.004,
+            blackHoleRadius * 0.30));
+        float3 midpointDirection = SchwarzschildDirectionStep(
+            segmentRay.Origin, segmentRay.Direction, blackHoleCenter,
+            blackHoleRadius, segmentLength * 0.50);
+
+        segmentRay.TMin = 0.0005;
+        segmentRay.TMax = segmentLength;
+        segmentRay.Direction = midpointDirection;
+        ResetRadianceTraceResult(seed, payload);
+        TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, segmentRay, payload);
+        accumulatedFlags |= payload.diagnosticFlags;
+        float transportedDistance = payload.colorAndDistance.a >= 0.0
+            ? min(payload.colorAndDistance.a, segmentLength)
+            : segmentLength;
+        AccumulateAccretionDiskSegment(
+            segmentRay.Origin, midpointDirection, transportedDistance,
+            blackHoleCenter, blackHoleRadius, diskRadiance, diskTransmittance);
+        if (payload.colorAndDistance.a >= 0.0)
+        {
+            payload.colorAndDistance.rgb = diskRadiance +
+                diskTransmittance * payload.colorAndDistance.rgb;
+            payload.colorAndDistance.a += travelled;
+            payload.diagnosticFlags = accumulatedFlags;
+            return;
+        }
+
+        segmentRay.Origin += segmentRay.Direction * segmentLength;
+        travelled += segmentLength;
+        distanceToHole = max(length(blackHoleCenter - segmentRay.Origin),
+            blackHoleRadius * 1.001);
+        segmentRay.Direction = SchwarzschildDirectionStep(
+            segmentRay.Origin, midpointDirection, blackHoleCenter,
+            blackHoleRadius, segmentLength * 0.50);
+        if (passedPeriapsis && distanceToHole > blackHoleRadius * 9.05) break;
+    }
+
+    segmentRay.TMin = 0.0005;
+    segmentRay.TMax = max(initialRay.TMax - travelled, 0.0005);
+    ResetRadianceTraceResult(seed, payload);
+    TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, segmentRay, payload);
+    accumulatedFlags |= payload.diagnosticFlags;
+    payload.colorAndDistance.rgb = diskRadiance +
+        diskTransmittance * payload.colorAndDistance.rgb;
+    if (payload.colorAndDistance.a >= 0.0)
+        payload.colorAndDistance.a += travelled;
+    payload.diagnosticFlags = accumulatedFlags;
+}
+
+// Shadow and next-event-estimation rays are photons too.  March the actual
+// visibility path through the same field instead of checking a straight chord;
+// an event-horizon capture removes all remaining transported energy.
+void TraceCurvedVisibility(RayDesc initialRay, uint rayFlags, inout Payload payload)
+{
+    float3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!FindBlackHoleInfluence(initialRay.Origin, initialRay.Direction,
+            blackHoleCenter, blackHoleRadius, entryDistance))
+    {
+        TraceRay(Scene, rayFlags, 0xff, 0, 0, 1, initialRay, payload);
+        return;
+    }
+
+    RayDesc segmentRay = initialRay;
+    float travelled = 0.0;
+    if (entryDistance > 0.0005)
+    {
+        segmentRay.TMin = initialRay.TMin;
+        segmentRay.TMax = min(entryDistance, initialRay.TMax);
+        TraceRay(Scene, rayFlags, 0xff, 0, 0, 1, segmentRay, payload);
+        if (max(payload.colorAndDistance.r,
+                max(payload.colorAndDistance.g, payload.colorAndDistance.b)) < 0.004)
+            return;
+        segmentRay.Origin += segmentRay.Direction * segmentRay.TMax;
+        travelled += segmentRay.TMax;
+        if (travelled >= initialRay.TMax) return;
+    }
+
+    float previousRadius = length(segmentRay.Origin - blackHoleCenter);
+    bool passedPeriapsis = false;
+    uint quality = (uint)round(RenderOptions.x);
+    uint maximumSteps = quality >= 3u ? 144u : (quality >= 2u ? 96u : 64u);
+    [loop]
+    for (uint stepIndex = 0; stepIndex < 144u; stepIndex++)
+    {
+        if (stepIndex >= maximumSteps || travelled >= initialRay.TMax) break;
+        float3 fromHole = segmentRay.Origin - blackHoleCenter;
+        float distanceToHole = length(fromHole);
+        if (distanceToHole <= blackHoleRadius * 1.002)
+        {
+            payload.colorAndDistance.rgb = 0.0;
+            return;
+        }
+
+        passedPeriapsis = passedPeriapsis ||
+            distanceToHole > previousRadius + blackHoleRadius * 0.002;
+        previousRadius = distanceToHole;
+        float segmentLength = min(initialRay.TMax - travelled, clamp(
+            (distanceToHole - blackHoleRadius) * 0.10,
+            blackHoleRadius * 0.004,
+            blackHoleRadius * 0.30));
+        float3 midpointDirection = SchwarzschildDirectionStep(
+            segmentRay.Origin, segmentRay.Direction, blackHoleCenter,
+            blackHoleRadius, segmentLength * 0.50);
+
+        segmentRay.TMin = 0.0005;
+        segmentRay.TMax = segmentLength;
+        segmentRay.Direction = midpointDirection;
+        TraceRay(Scene, rayFlags, 0xff, 0, 0, 1, segmentRay, payload);
+        if (max(payload.colorAndDistance.r,
+                max(payload.colorAndDistance.g, payload.colorAndDistance.b)) < 0.004)
+            return;
+
+        segmentRay.Origin += midpointDirection * segmentLength;
+        travelled += segmentLength;
+        distanceToHole = max(length(blackHoleCenter - segmentRay.Origin),
+            blackHoleRadius * 1.001);
+        segmentRay.Direction = SchwarzschildDirectionStep(
+            segmentRay.Origin, midpointDirection, blackHoleCenter,
+            blackHoleRadius, segmentLength * 0.50);
+        if (passedPeriapsis && distanceToHole > blackHoleRadius * 9.05) break;
+    }
+
+    segmentRay.TMin = 0.0005;
+    segmentRay.TMax = max(initialRay.TMax - travelled, 0.0005);
+    TraceRay(Scene, rayFlags, 0xff, 0, 0, 1, segmentRay, payload);
+}
+
 [shader("raygeneration")]
 void RayGen()
 {
@@ -278,11 +891,8 @@ void RayGen()
     ray.TMax = HardwareOptions.x;
 
     Payload payload;
-    payload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
-    payload.depth = 0;
-    payload.diagnosticFlags = 0;
-    ResetMirrorState(payload);
-    TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, ray, payload);
+    InitializePrimaryPayload(payload);
+    TraceCurvedRadiance(ray, payload);
     if (RenderOptions.w > 0.5)
     {
         float underwaterDistance = payload.colorAndDistance.a > 0.0 ? payload.colorAndDistance.a : 36.0;
@@ -298,7 +908,10 @@ void RayGen()
     float3 safeOutput = all(isfinite(payload.colorAndDistance.rgb))
         ? clamp(payload.colorAndDistance.rgb, 0.0, 32.0)
         : float3(0.0, 0.0, 0.0);
-    Output[pixel] = float4(safeOutput, payload.diagnosticFlags / 255.0);
+    float presentationAlpha = PreviousCameraUp.w < 0.5
+        ? (payload.colorAndDistance.a >= 0.0 ? 1.0 : 0.0)
+        : payload.diagnosticFlags / 255.0;
+    Output[pixel] = float4(safeOutput, presentationAlpha);
     uint atlasScale = 4u;
     if (TailOptions.x > 0.5 && all((pixel % atlasScale) == 0u))
         ReflectionTailWrite[pixel / atlasScale] = float4(safeOutput, payload.colorAndDistance.a);
@@ -313,13 +926,34 @@ void ShadowMiss(inout Payload payload)
 [shader("miss")]
 void Miss(inout Payload payload)
 {
+    if (PreviousCameraUp.w < 0.5)
+    {
+        payload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
+        return;
+    }
     float3 direction = WorldRayDirection();
     float horizon = saturate(direction.y * 0.65 + 0.45);
     float daylight = saturate(SunDirection.w);
     float3 daySky = lerp(float3(0.52, 0.62, 0.76), float3(0.035, 0.16, 0.52), horizon);
     float3 nightSky = lerp(float3(0.0012, 0.0018, 0.0045), float3(0.00008, 0.0002, 0.0008), horizon);
+    // This is radiance at infinity, not a mesh around the black hole.  The
+    // final TraceRay uses the direction produced by null-ray integration, so
+    // the environment is lensed without placing fake glowing geometry in space.
+    float3 galacticNormal = normalize(float3(0.23, 0.91, -0.34));
+    float latitude = abs(dot(direction, galacticNormal));
+    float milkyWay = exp(-latitude * latitude * 95.0);
+    float3 fineCell = floor(direction * 920.0);
+    float3 brightCell = floor(direction * 410.0 + 17.0);
+    float fineHash = frac(sin(dot(fineCell, float3(12.9898, 78.233, 37.719))) * 43758.5453);
+    float brightHash = frac(sin(dot(brightCell, float3(39.346, 11.135, 83.155))) * 24634.6345);
+    float fineStar = smoothstep(0.9968 - milkyWay * 0.0020, 0.99995, fineHash);
+    float brightStar = smoothstep(0.9985, 0.99998, brightHash);
+    float temperature = frac(brightHash * 7.13 + fineHash * 3.71);
+    float3 starColor = lerp(float3(0.48, 0.68, 1.0), float3(1.0, 0.58, 0.28), temperature);
+    float3 starField = starColor * (fineStar * (0.75 + milkyWay * 1.1) + brightStar * 2.8);
+    float3 galacticGlow = float3(0.075, 0.095, 0.16) * milkyWay;
     payload.colorAndDistance = float4(
-        lerp(nightSky, daySky, daylight),
+        lerp(nightSky + starField + galacticGlow, daySky, daylight),
         -1.0);
 }
 
@@ -338,15 +972,15 @@ void AnyHit(inout Payload payload, Attributes attributes)
         }
         else if (shadowVertex.transmission > 0.001)
         {
-            WorldVertex shadowVertex1 = LoadVertex(first + 1);
-            WorldVertex shadowVertex2 = LoadVertex(first + 2);
-            float3 bary = float3(1.0 - attributes.barycentrics.x - attributes.barycentrics.y,
-                                 attributes.barycentrics.x, attributes.barycentrics.y);
-            float2 uv = shadowVertex.uv * bary.x + shadowVertex1.uv * bary.y + shadowVertex2.uv * bary.z;
-            float3 tint = MaterialAtlas.Load(int3(
-                MaterialAtlasTexel(shadowVertex.materialId, shadowVertex.materialFace, uv), 0)).rgb;
-            payload.colorAndDistance.rgb *= GlassInterfaceFilter(tint, shadowVertex.transmission);
+            payload.colorAndDistance.rgb *= GlassShadowFilter(
+                shadowVertex.materialId, shadowVertex.materialFace,
+                shadowVertex.transmission, shadowVertex.roughness);
+            bool shadowDebris = (shadowVertex.materialFlags & 4u) != 0;
+            if (shadowDebris)
+                payload.mirrorCycleCount++;
             if (max(payload.colorAndDistance.r, max(payload.colorAndDistance.g, payload.colorAndDistance.b)) < 0.004)
+                AcceptHitAndEndSearch();
+            else if (shadowDebris && payload.mirrorCycleCount >= 4u)
                 AcceptHitAndEndSearch();
             else
                 IgnoreHit();
@@ -369,14 +1003,23 @@ void AnyHit(inout Payload payload, Attributes attributes)
     // A recursion limit may stop spawning another ray, but it must never change
     // which solid surface the current ray hits. Ignoring reflective opaque hits
     // here made glass refraction see through walls in Wax/Reference modes.
-    uint maximumReflectionBounces = (uint)round(TraceOptions.x);
     uint first = PrimitiveIndex() * 3;
     WorldVertex vertex0 = LoadVertex(first);
+    bool debrisHit = (vertex0.materialFlags & 4u) != 0;
+    uint maximumReflectionBounces = (uint)round(TraceOptions.x);
+    uint transparentReflectionBounces = min(maximumReflectionBounces,
+        (uint)(RenderOptions.x >= 3.0 ? 8 : (RenderOptions.x >= 2.0 ? 6 : 4)));
+    // Settled shards are stored in one immutable BLAS (instance 2). A primary ray
+    // still traces every display pixel and intersects their exact triangles, but a
+    // deep pile must not branch into 6-8 recursive glass layers per shard.
+    if (debrisHit)
+        transparentReflectionBounces = min(transparentReflectionBounces,
+            InstanceID() == 2 ? 2u : 1u);
     if (vertex0.transmission > 0.001)
     {
         // Do not shade a transparent terminal surface as opaque. At the recursion
         // budget, continue to the next real surface instead of producing a gray wall.
-        if (payload.depth >= maximumReflectionBounces)
+        if (payload.depth >= transparentReflectionBounces)
             IgnoreHit();
         return;
     }
@@ -414,7 +1057,13 @@ void ClosestHit(inout Payload payload, Attributes attributes)
     uint materialFace = vertex0.materialFace;
     uint materialFlags = vertex0.materialFlags;
     bool fluidMaterial = (materialFlags & 1) != 0;
-    int2 atlasTexel = MaterialAtlasTexel(materialId, materialFace, uv);
+    bool porousFoam = (materialFlags & (1u << 3)) != 0;
+    bool prismaticGlass = (materialFlags & (1u << 4)) != 0;
+    bool frostedGlass = (materialFlags & (1u << 5)) != 0;
+    bool lightAbsorber = (materialFlags & (1u << 7)) != 0;
+    uint materialUvRotation = 0u;
+    float2 materialUv = MaterialVariantUv(vertex0, uv, materialUvRotation);
+    int2 atlasTexel = MaterialAtlasTexel(materialId, materialFace, materialUv);
     float3 albedo = fluidMaterial
         ? float3(0.035, 0.28, 0.48)
         : MaterialAtlas.Load(int3(atlasTexel, 0)).rgb;
@@ -428,17 +1077,22 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         vertex2.metallic * bary.z;
     float transmission = vertex0.transmission;
     float3 emission = vertex0.emission;
+    float3 hitPosition = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
 
     // Use the same baked height detail as the path tracer to keep material texture
     // and roughness consistent instead of shading every block as a smooth wax cube.
     float2 heightGradient = float2(0.0, 0.0);
     if (!fluidMaterial)
     {
-        int2 rightTexel = MaterialAtlasTexel(materialId, materialFace, uv + float2(1.0 / MaterialTileSize, 0.0));
-        int2 upTexel = MaterialAtlasTexel(materialId, materialFace, uv + float2(0.0, 1.0 / MaterialTileSize));
+        float2 rightDelta = RotateMaterialDelta(float2(1.0 / MaterialTileSize, 0.0), materialUvRotation);
+        float2 upDelta = RotateMaterialDelta(float2(0.0, 1.0 / MaterialTileSize), materialUvRotation);
+        int2 rightTexel = MaterialAtlasTexel(materialId, materialFace, materialUv + rightDelta);
+        int2 leftTexel = MaterialAtlasTexel(materialId, materialFace, materialUv - rightDelta);
+        int2 upTexel = MaterialAtlasTexel(materialId, materialFace, materialUv + upDelta);
+        int2 downTexel = MaterialAtlasTexel(materialId, materialFace, materialUv - upDelta);
         heightGradient = float2(
-            MaterialDetailAtlas.Load(int3(rightTexel, 0)).g - detail.g,
-            MaterialDetailAtlas.Load(int3(upTexel, 0)).g - detail.g);
+            (MaterialDetailAtlas.Load(int3(rightTexel, 0)).g - MaterialDetailAtlas.Load(int3(leftTexel, 0)).g) * 0.5,
+            (MaterialDetailAtlas.Load(int3(upTexel, 0)).g - MaterialDetailAtlas.Load(int3(downTexel, 0)).g) * 0.5);
     }
     float3 edge1 = vertex1.position - vertex0.position;
     float3 edge2 = vertex2.position - vertex0.position;
@@ -450,15 +1104,67 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         float inverse = 1.0 / determinant;
         float3 tangent = normalize((edge1 * uvEdge2.y - edge2 * uvEdge1.y) * inverse);
         float3 bitangent = normalize((edge2 * uvEdge1.x - edge1 * uvEdge2.x) * inverse);
-        normal = normalize(normal - tangent * heightGradient.x * 1.65 - bitangent * heightGradient.y * 1.65);
+        normal = normalize(normal - tangent * heightGradient.x * 3.2 - bitangent * heightGradient.y * 3.2);
+    }
+    else if (fluidMaterial && abs(geometricNormal.y) > 0.65)
+    {
+        // Optical water waves stay analytic in DXR. The BLAS remains static, while
+        // every ray sees the same continuous world-space phase across block/chunk
+        // boundaries, avoiding both grid seams and per-frame acceleration rebuilds.
+        float phase = TailOptions.w;
+        float2 gradient = float2(
+            cos(hitPosition.x * 0.72 + hitPosition.z * 0.31 + phase * 1.10) * 0.055 +
+                cos(hitPosition.x * 2.10 - hitPosition.z * 1.40 - phase * 0.73) * 0.020,
+            sin(hitPosition.z * 0.58 - hitPosition.x * 0.23 - phase * 0.83) * 0.055 +
+                sin(hitPosition.z * 1.80 + hitPosition.x * 1.25 + phase * 0.61) * 0.020);
+        float3 tangent = normalize(cross(float3(0.0, 0.0, 1.0), geometricNormal));
+        float3 bitangent = normalize(cross(geometricNormal, tangent));
+        normal = normalize(geometricNormal + tangent * gradient.x + bitangent * gradient.y);
+        roughness = 0.035;
+    }
+    if (frostedGlass)
+    {
+        // A subtle stable microfacet layer softens the view without turning a real
+        // frosted pane into noisy, violently refracting crystal.
+        int2 microCell = int2(floor(frac(materialUv) * 256.0));
+        uint microHash = asuint(microCell.x) * 0x9e3779b9u ^
+                         asuint(microCell.y) * 0x85ebca6bu ^
+                         materialId * 0xc2b2ae35u;
+        microHash ^= microHash >> 16;
+        float2 grain = float2(
+            float(microHash & 1023u) / 511.5 - 1.0,
+            float((microHash >> 10) & 1023u) / 511.5 - 1.0);
+        float3 frostTangent = normalize(abs(normal.y) < 0.92
+            ? cross(float3(0.0, 1.0, 0.0), normal)
+            : cross(float3(1.0, 0.0, 0.0), normal));
+        float3 frostBitangent = normalize(cross(normal, frostTangent));
+        normal = normalize(normal + frostTangent * grain.x * 0.085 +
+            frostBitangent * grain.y * 0.085);
+        roughness = max(roughness, 0.50);
     }
     uint quality = (uint)round(RenderOptions.x);
     uint maximumReflectionBounces = (uint)round(TraceOptions.x);
-    float3 hitPosition = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
+    uint transparentReflectionBounces = min(maximumReflectionBounces,
+        quality >= 3 ? 8u : (quality >= 2 ? 6u : 4u));
+    if (frostedGlass)
+        transparentReflectionBounces = min(transparentReflectionBounces, 4u);
+    bool debrisHit = (materialFlags & 4u) != 0;
+    if (debrisHit)
+        transparentReflectionBounces = min(transparentReflectionBounces,
+            InstanceID() == 2 ? 2u : 1u);
     float3 selectionOutline = SelectionOutline(vertex0, hitPosition, geometricNormal, uv, payload.depth);
     float3 displayEmission = DisplayEmission(emission) * HardwareOptions.z;
 
-    if (transmission > 0.001 && payload.depth < maximumReflectionBounces)
+    // Absorption is semantic and absolute. Do not route this material through the
+    // dielectric Fresnel fallback: reflection strength and render style must never
+    // turn it into a dim mirror. Keep only the explicit selection outline usable.
+    if (lightAbsorber)
+    {
+        payload.colorAndDistance = float4(selectionOutline, RayTCurrent());
+        return;
+    }
+
+    if (transmission > 0.001 && payload.depth < transparentReflectionBounces)
     {
         payload.diagnosticFlags |= 128;
         bool entering = dot(WorldRayDirection(), geometricNormal) < 0.0;
@@ -477,6 +1183,7 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         refractionPayload.depth = payload.depth + 1;
         refractionPayload.diagnosticFlags = 0;
         ResetMirrorState(refractionPayload);
+        refractionPayload.mirrorTintAndGap.w = PathThroughput(payload) * max(transmission, 0.05);
         RayDesc refractionRay;
         refractionRay.Direction = normalize(refractedDirection);
         // Start on the incident side and ignore only this triangle in AnyHit. If
@@ -486,31 +1193,84 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         refractionRay.TMin = 0.0001;
         refractionRay.TMax = HardwareOptions.x;
         refractionPayload.padding = CurrentPrimitiveKey();
-        TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, refractionRay, refractionPayload);
+        TraceCurvedRadiance(refractionRay, refractionPayload);
 
-        float3 reflectedColor = float3(0.08, 0.27, 0.62);
+        float3 refractedRadiance = refractionPayload.colorAndDistance.rgb;
+        if (prismaticGlass && payload.depth == 0 && quality >= 2 && !debrisHit)
+        {
+            // Real spectral separation: red and blue use different IOR rays while
+            // green keeps the base ray. This is material-specific dispersion, not a
+            // colored overlay, so silhouettes split only where refraction warrants it.
+            float redIor = max(1.01, materialIor - 0.030);
+            float blueIor = min(2.55, materialIor + 0.045);
+            float redEta = entering ? 1.0 / redIor : redIor;
+            float blueEta = entering ? 1.0 / blueIor : blueIor;
+            float3 redDirection = refract(WorldRayDirection(), facingNormal, redEta);
+            float3 blueDirection = refract(WorldRayDirection(), facingNormal, blueEta);
+            if (dot(redDirection, redDirection) < 0.001)
+                redDirection = reflect(WorldRayDirection(), facingNormal);
+            if (dot(blueDirection, blueDirection) < 0.001)
+                blueDirection = reflect(WorldRayDirection(), facingNormal);
+
+            Payload redPayload = refractionPayload;
+            redPayload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
+            redPayload.padding = CurrentPrimitiveKey();
+            RayDesc redRay = refractionRay;
+            redRay.Direction = normalize(redDirection);
+            TraceCurvedRadiance(redRay, redPayload);
+
+            Payload bluePayload = refractionPayload;
+            bluePayload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
+            bluePayload.padding = CurrentPrimitiveKey();
+            RayDesc blueRay = refractionRay;
+            blueRay.Direction = normalize(blueDirection);
+            TraceCurvedRadiance(blueRay, bluePayload);
+            refractedRadiance = float3(
+                redPayload.colorAndDistance.r,
+                refractionPayload.colorAndDistance.g,
+                bluePayload.colorAndDistance.b);
+        }
+
+        float viewCosine = saturate(dot(-WorldRayDirection(), facingNormal));
+        float fresnel = 0.02 + 0.98 * pow(1.0 - viewCosine, 5.0);
+        // At an internal near-normal interface the omitted reflection contributes
+        // only a few percent. Reusing the transmitted radiance is a stable local
+        // approximation and avoids an arbitrary blue cast when the branch is culled.
+        float3 reflectedColor = refractedRadiance;
         // Refraction remains recursive so a ray can cross both sides of glass.
         // Capping only the secondary Fresnel branch prevents an exponential ray
         // tree when glass is reflected between 29-layer mirrors (which can TDR the
         // device); opaque mirror recursion still uses the full configured depth.
-        if (quality >= 2 && payload.depth < 3)
+        float reflectedThroughput = PathThroughput(payload) * fresnel;
+        bool primaryInterface = payload.depth == 0;
+        // Front-facing clean glass is dominated by transmission (about 98%). Tracing
+        // a second exact reflection ray for every full-screen pixel nearly doubled
+        // close-up cost while contributing only a few percent. Keep real recursive
+        // refraction, and promote reflection to an exact ray only once its Fresnel
+        // energy is actually visible (grazing angles). No temporal guess or blur is
+        // involved; the culled energy reuses the already traced transmitted radiance.
+        bool visiblePrimaryReflection = primaryInterface &&
+            fresnel >= 0.055 && reflectedThroughput >= 0.018;
+        bool visibleInternalReflection = fresnel >= 0.16 && reflectedThroughput >= 0.028;
+        if (quality >= 2 && payload.depth < 3 && !debrisHit && !frostedGlass &&
+            (visiblePrimaryReflection || visibleInternalReflection))
         {
             Payload reflectedPayload;
             reflectedPayload.colorAndDistance = float4(0.0, 0.0, 0.0, -1.0);
             reflectedPayload.depth = payload.depth + 1;
             reflectedPayload.diagnosticFlags = 0;
             ResetMirrorState(reflectedPayload);
+            reflectedPayload.mirrorTintAndGap.w = reflectedThroughput;
             RayDesc reflectedRay;
             reflectedRay.Direction = normalize(reflect(WorldRayDirection(), facingNormal));
             reflectedRay.Origin = hitPosition - normalize(WorldRayDirection()) * 0.002;
             reflectedRay.TMin = 0.0001;
             reflectedRay.TMax = HardwareOptions.x;
             reflectedPayload.padding = CurrentPrimitiveKey();
-            TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, reflectedRay, reflectedPayload);
+            TraceCurvedRadiance(reflectedRay, reflectedPayload);
             reflectedColor = reflectedPayload.colorAndDistance.rgb;
         }
-        float fresnel = 0.02 + 0.98 * pow(1.0 - saturate(dot(-WorldRayDirection(), facingNormal)), 5.0);
-        float3 transmitted = refractionPayload.colorAndDistance.rgb *
+        float3 transmitted = refractedRadiance *
             (fluid ? lerp(float3(1.0, 1.0, 1.0), albedo, 0.32)
                    : GlassInterfaceFilter(albedo, transmission));
         if (fluid) transmitted = lerp(transmitted, float3(0.018, 0.18, 0.31), 0.18);
@@ -519,14 +1279,21 @@ void ClosestHit(inout Payload payload, Attributes attributes)
             RayTCurrent());
         return;
     }
-    float3 sunDirection = normalize(SunDirection.xyz);
+    float3 sunDirection;
+    bool sunPathSolved = SolveDirectionalLightGeodesic(
+        hitPosition + geometricNormal * 0.012, normalize(SunDirection.xyz), sunDirection);
     float geometricDirect = dot(geometricNormal, sunDirection);
-    float direct = geometricDirect > 0.001 ? max(dot(normal, sunDirection), 0.0) : 0.0;
+    float direct = sunPathSolved && geometricDirect > 0.001
+        ? max(dot(normal, sunDirection), 0.0) : 0.0;
     float3 visibility = float3(1.0, 1.0, 1.0);
 
     // This is a real secondary DXR shadow ray. Occlusion leaves visible at zero;
     // only the dedicated shadow miss record changes it to one.
-    if (quality >= 1 && direct > 0.0)
+    // In the 20k full-resolution stress tier, secondary reflection/refraction
+    // rays keep their real hit material and emitter surfaces but do not branch
+    // again into sun visibility rays. Primary shadows remain exact.
+    bool extremeSecondaryRay = CameraUp.w > 0.5 && payload.depth > 0;
+    if (quality >= 1 && direct > 0.0 && !extremeSecondaryRay)
     {
         payload.diagnosticFlags |= 2;
         Payload shadowPayload;
@@ -539,10 +1306,10 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         shadowRay.Direction = sunDirection;
         shadowRay.TMin = 0.003;
         shadowRay.TMax = HardwareOptions.x;
-        TraceRay(Scene,
+        TraceCurvedVisibility(shadowRay,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
                 RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-            0xff, 0, 0, 1, shadowRay, shadowPayload);
+            shadowPayload);
         visibility = lerp(float3(1.0, 1.0, 1.0),
             saturate(shadowPayload.colorAndDistance.rgb), saturate(HardwareOptions.y));
         if (min(visibility.r, min(visibility.g, visibility.b)) < 0.99)
@@ -555,9 +1322,22 @@ void ClosestHit(inout Payload payload, Attributes attributes)
     // light path. Retain only a very small night floor and daylight sky fill;
     // direct and emissive energy remain controlled by real visibility rays.
     float upwardAmbient = lerp(0.00035, 0.018 + 0.032 * max(normal.y, 0.0), daylight);
-    float3 localColor = albedo * (upwardAmbient + direct * visibility * directStrength) +
+    // Open-cell foam has strong diffuse interreflection inside its pores. Give only
+    // tagged foam a restrained rough bounce so a shadowed yellow sponge remains
+    // yellow instead of becoming a black metallic-looking knot.
+    if (porousFoam)
+        upwardAmbient += lerp(0.003, 0.040, daylight) *
+            (0.62 + 0.38 * abs(normal.y));
+    // The height channel contributes normal relief and cavity occlusion only.
+    // Reflection remains controlled solely by metallic/roughness, and emission
+    // remains the explicit emission channel.
+    float microOcclusion = fluidMaterial ? 1.0 : lerp(0.58, 1.0,
+        smoothstep(0.20, 0.66, detail.g));
+    float3 localColor = albedo * (upwardAmbient * microOcclusion + direct * visibility * directStrength) +
         displayEmission + selectionOutline;
-    uint emissiveCount = min((uint)round(RenderOptions.z), 32u);
+    uint emissiveCount = extremeSecondaryRay
+        ? 0u
+        : min((uint)round(RenderOptions.z), debrisHit ? 8u : 32u);
     for (uint lightIndex = 0; lightIndex < emissiveCount; lightIndex++)
     {
         EmissiveLight light = EmissiveLights[lightIndex];
@@ -565,8 +1345,16 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         float distanceToLight = length(toLight);
         if (distanceToLight >= light.radius || distanceToLight < 0.05) continue;
         float3 lightDirection = toLight / distanceToLight;
+        float solvedLightDistance = distanceToLight;
+        float lightEndpointError = 0.0;
+        bool lightPathSolved = SolvePointLightGeodesic(
+            hitPosition + geometricNormal * 0.004, light.position,
+            lightDirection, solvedLightDistance, lightEndpointError);
+        if (!lightPathSolved) continue;
         float attenuation = pow(saturate(1.0 - distanceToLight / light.radius), 2.0) /
             (1.0 + distanceToLight * distanceToLight * 0.08);
+        if (PathThroughput(payload) * light.intensity * attenuation < 0.00065)
+            continue;
         float geometricLightDiffuse = dot(geometricNormal, lightDirection);
         if (geometricLightDiffuse <= 0.002) continue;
         float lightDiffuse = max(dot(normal, lightDirection), 0.0) *
@@ -576,23 +1364,55 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         // A glowing block contributes only when the real segment to its bounding
         // surface is unobstructed. Stopping before the emitter avoids treating its
         // own geometry specially, while every intervening opaque face still blocks.
-        Payload emissiveShadowPayload;
-        emissiveShadowPayload.colorAndDistance = float4(1.0, 1.0, 1.0, -1.0);
-        emissiveShadowPayload.depth = 0;
-        emissiveShadowPayload.diagnosticFlags = 0;
-        ResetMirrorState(emissiveShadowPayload);
-        RayDesc emissiveShadowRay;
-        emissiveShadowRay.Origin = hitPosition + geometricNormal * 0.012;
-        emissiveShadowRay.Direction = lightDirection;
-        emissiveShadowRay.TMin = 0.003;
-        float targetClearance = 0.5 /
-            max(max(abs(lightDirection.x), abs(lightDirection.y)), abs(lightDirection.z)) + 0.012;
-        emissiveShadowRay.TMax = max(distanceToLight - targetClearance, 0.004);
+        // A single centre ray can pass exactly through a shared voxel edge. DXR is
+        // then allowed to miss both coplanar triangles and turns that numerical gap
+        // into a long, perfectly straight light leak. Sample the emitter interior
+        // at three stable locations and keep the most occluded value per channel.
+        // Real glass transmission is retained, while a single edge miss can no
+        // longer dominate the complete light contribution.
+        float3 tangent = normalize(abs(lightDirection.y) < 0.92
+            ? cross(lightDirection, float3(0.0, 1.0, 0.0))
+            : cross(lightDirection, float3(1.0, 0.0, 0.0)));
+        float3 bitangent = normalize(cross(lightDirection, tangent));
+        float3 emissiveVisibility = float3(1.0, 1.0, 1.0);
         payload.diagnosticFlags |= 2;
-        TraceRay(Scene,
-            RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-            0xff, 0, 0, 1, emissiveShadowRay, emissiveShadowPayload);
-        float3 emissiveVisibility = saturate(emissiveShadowPayload.colorAndDistance.rgb);
+        uint visibilitySampleCount = debrisHit ? 1u : (payload.depth == 0 ? 3u : 2u);
+        [loop]
+        for (uint visibilitySample = 0; visibilitySample < visibilitySampleCount; visibilitySample++)
+        {
+            float2 sampleOffset = visibilitySample == 0 ? float2(0.0, 0.0) :
+                (visibilitySample == 1 ? float2(0.17, -0.11) : float2(-0.13, 0.16));
+            float3 target = light.position + tangent * sampleOffset.x + bitangent * sampleOffset.y;
+            float3 sampleVector = target - hitPosition;
+            float sampleDistance = length(sampleVector);
+            float3 sampleDirection = sampleVector / max(sampleDistance, 0.0001);
+            float samplePathDistance = sampleDistance;
+            float sampleEndpointError = 0.0;
+            if (!SolvePointLightGeodesic(
+                    hitPosition + geometricNormal * 0.004, target,
+                    sampleDirection, samplePathDistance, sampleEndpointError))
+            {
+                emissiveVisibility = 0.0;
+                break;
+            }
+            Payload emissiveShadowPayload;
+            emissiveShadowPayload.colorAndDistance = float4(1.0, 1.0, 1.0, -1.0);
+            emissiveShadowPayload.depth = 0;
+            emissiveShadowPayload.diagnosticFlags = 0;
+            ResetMirrorState(emissiveShadowPayload);
+            RayDesc emissiveShadowRay;
+            emissiveShadowRay.Origin = hitPosition + geometricNormal * 0.004;
+            emissiveShadowRay.Direction = sampleDirection;
+            emissiveShadowRay.TMin = 0.0015;
+            float targetClearance = 0.48 /
+                max(max(abs(sampleDirection.x), abs(sampleDirection.y)), abs(sampleDirection.z)) + 0.012;
+            emissiveShadowRay.TMax = max(samplePathDistance - targetClearance, 0.002);
+            TraceCurvedVisibility(emissiveShadowRay,
+                RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+                emissiveShadowPayload);
+            emissiveVisibility = min(emissiveVisibility,
+                saturate(emissiveShadowPayload.colorAndDistance.rgb));
+        }
         if (max(emissiveVisibility.r, max(emissiveVisibility.g, emissiveVisibility.b)) < 0.004)
         {
             payload.diagnosticFlags |= 4;
@@ -618,7 +1438,14 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         return;
     }
     float dielectricReflection = 0.025 + saturate(1.0 - roughness) * 0.10;
-    float reflectivity = saturate(max(metallic * (1.0 - roughness * 0.72), dielectricReflection));
+    // Metallic is not a mirror-opacity slider. Conductors keep a coloured F0 and
+    // rough surfaces lose coherent reflected energy. The old scalar metallic blend
+    // replaced bronze, brass and iron alike with the same sharp environment image.
+    float3 specularF0 = lerp(float3(0.04, 0.04, 0.04), saturate(albedo), metallic);
+    float roughnessEnergy = saturate(1.0 - roughness * 0.82);
+    float reflectivity = saturate(max(
+        max(specularF0.r, max(specularF0.g, specularF0.b)) * roughnessEnergy,
+        dielectricReflection));
     if (waxMode)
         reflectivity = metallic > 0.15 ? saturate(reflectivity * 2.4) : min(reflectivity * 2.4, 0.30);
     reflectivity = saturate(reflectivity * HardwareOptions.w);
@@ -633,10 +1460,28 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         0.04, 1.0);
     uint infiniteMirrorMode = (uint)round(TraceOptions.y);
     float transitionStart = max(1.0, float(maximumReflectionBounces) - 5.0);
+    float viewFresnel = pow(1.0 - saturate(dot(-WorldRayDirection(), normal)), 5.0);
+    float reflectionWeight = saturate(reflectivity + viewFresnel * (1.0 - reflectivity));
+    float3 conductorReflectionWeight = saturate(
+        (specularF0 + (1.0 - specularF0) * viewFresnel) * roughnessEnergy * HardwareOptions.w);
+    if (waxMode)
+        conductorReflectionWeight = saturate(conductorReflectionWeight * 2.4);
+    float projectedContribution = PathThroughput(payload) * reflectionWeight;
+    bool persistentSpecular = planarMirror || (metallic > 0.90 && roughness < 0.035);
+    bool meaningfulReflection = persistentSpecular || payload.depth < 2 || projectedContribution >= 0.0015;
+    uint opaqueReflectionLimit = CameraUp.w > 0.5
+        ? min(maximumReflectionBounces, 1u)
+        : maximumReflectionBounces;
+    uint ordinaryReflectionBounces = min(opaqueReflectionLimit,
+        quality >= 3 ? 4u : (quality >= 2 ? 3u : 2u));
+    uint materialReflectionBounces = persistentSpecular
+        ? opaqueReflectionLimit
+        : ordinaryReflectionBounces;
     // At the requested limit, keep this hit's actual DXR direct lighting/shadows
     // but emit no extra reflection ray. This avoids both a black terminal layer
     // and a non-recursive "fake world" beyond the configured reflection count.
-    if (payload.depth < maximumReflectionBounces && reflectionAllowed && reflectivity > 0.015)
+    if (payload.depth < materialReflectionBounces && reflectionAllowed && reflectivity > 0.015 &&
+        meaningfulReflection)
     {
         payload.diagnosticFlags |= 8;
         if (waxMode && payload.depth >= 2)
@@ -661,12 +1506,11 @@ void ClosestHit(inout Payload payload, Attributes attributes)
         else
         {
             ResetMirrorState(reflectionPayload);
+            reflectionPayload.mirrorTintAndGap.w = projectedContribution;
         }
-        TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, reflectionRay, reflectionPayload);
+        TraceCurvedRadiance(reflectionRay, reflectionPayload);
         payload.diagnosticFlags |= reflectionPayload.diagnosticFlags;
 
-        float viewFresnel = pow(1.0 - saturate(dot(-WorldRayDirection(), normal)), 5.0);
-        float reflectionWeight = saturate(reflectivity + viewFresnel * (1.0 - reflectivity));
         float3 reflectedResult = reflectionPayload.colorAndDistance.rgb;
         if (infiniteMirrorMode > 0 && mirrorCycle && payload.depth + 1 >= (uint)transitionStart)
         {
@@ -685,7 +1529,15 @@ void ClosestHit(inout Payload payload, Attributes attributes)
                 float(payload.depth + 1));
             reflectedResult = lerp(reflectedResult, approximatedTail, transition * 0.82);
         }
-        if (metallic > 0.15 || referenceMode)
+        if (metallic > 0.15)
+        {
+            // Preserve the material's own lighting and tint each reflected channel by
+            // the conductor F0. Perfect mirrors still converge to full reflection;
+            // ordinary rough metals retain recognisable bronze/brass/iron colour.
+            localColor = localColor * (1.0 - conductorReflectionWeight) +
+                reflectedResult * conductorReflectionWeight;
+        }
+        else if (referenceMode)
         {
             localColor = lerp(localColor, reflectedResult, reflectionWeight);
         }
@@ -768,6 +1620,8 @@ void SphereClosestHit(inout Payload payload, SphereAttributes attributes)
     float3 albedo = saturate(sphere.albedoAndRoughness.rgb);
     float roughness = clamp(sphere.albedoAndRoughness.w, 0.001, 1.0);
     float metallic = saturate(sphere.metallicAndMaterial.x);
+    bool blackHole = sphere.metallicAndMaterial.z > 0.5 ||
+                     (uint)round(sphere.metallicAndMaterial.y) == 208u;
     uint quality = (uint)round(RenderOptions.x);
     uint maximumReflectionBounces = (uint)round(TraceOptions.x);
     if (payload.depth == 0)
@@ -775,11 +1629,19 @@ void SphereClosestHit(inout Payload payload, SphereAttributes attributes)
         payload.diagnosticFlags |= 1;
         payload.diagnosticFlags |= 32;
     }
+    if (blackHole)
+    {
+        payload.colorAndDistance = float4(0.0, 0.0, 0.0, RayTCurrent());
+        return;
+    }
 
-    float3 sunDirection = normalize(SunDirection.xyz);
-    float direct = max(dot(normal, sunDirection), 0.0);
+    float3 sunDirection;
+    bool sunPathSolved = SolveDirectionalLightGeodesic(
+        hitPosition + normal * 0.004, normalize(SunDirection.xyz), sunDirection);
+    float direct = sunPathSolved ? max(dot(normal, sunDirection), 0.0) : 0.0;
     float3 visibility = float3(1.0, 1.0, 1.0);
-    if (quality >= 1 && direct > 0.0)
+    bool extremeSecondaryRay = CameraUp.w > 0.5 && payload.depth > 0;
+    if (quality >= 1 && direct > 0.0 && !extremeSecondaryRay)
     {
         Payload shadowPayload;
         shadowPayload.colorAndDistance = float4(1.0, 1.0, 1.0, -1.0);
@@ -791,9 +1653,9 @@ void SphereClosestHit(inout Payload payload, SphereAttributes attributes)
         shadowRay.Direction = sunDirection;
         shadowRay.TMin = 0.002;
         shadowRay.TMax = HardwareOptions.x;
-        TraceRay(Scene,
+        TraceCurvedVisibility(shadowRay,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-            0xff, 0, 0, 1, shadowRay, shadowPayload);
+            shadowPayload);
         visibility = lerp(float3(1.0, 1.0, 1.0),
             saturate(shadowPayload.colorAndDistance.rgb), saturate(HardwareOptions.y));
         payload.diagnosticFlags |= 2;
@@ -818,13 +1680,34 @@ void SphereClosestHit(inout Payload payload, SphereAttributes attributes)
     }
 
     float dielectricReflection = 0.025 + saturate(1.0 - roughness) * 0.10;
-    float reflectivity = saturate(max(metallic * (1.0 - roughness * 0.72), dielectricReflection));
+    float3 specularF0 = lerp(float3(0.04, 0.04, 0.04), saturate(albedo), metallic);
+    float roughnessEnergy = saturate(1.0 - roughness * 0.82);
+    float reflectivity = saturate(max(
+        max(specularF0.r, max(specularF0.g, specularF0.b)) * roughnessEnergy,
+        dielectricReflection));
     if (waxMode)
         reflectivity = metallic > 0.15 ? saturate(reflectivity * 2.4) : min(reflectivity * 2.4, 0.30);
     reflectivity = saturate(reflectivity * HardwareOptions.w);
     bool reflectionAllowed = quality >= 2 &&
         (waxMode || referenceMode || metallic > 0.15 || roughness < (quality >= 3 ? 0.72 : 0.45));
-    if (payload.depth < maximumReflectionBounces && reflectionAllowed && reflectivity > 0.015)
+    float viewFresnel = pow(1.0 - saturate(dot(-WorldRayDirection(), normal)), 5.0);
+    float reflectionWeight = saturate(reflectivity + viewFresnel * (1.0 - reflectivity));
+    float3 conductorReflectionWeight = saturate(
+        (specularF0 + (1.0 - specularF0) * viewFresnel) * roughnessEnergy * HardwareOptions.w);
+    if (waxMode)
+        conductorReflectionWeight = saturate(conductorReflectionWeight * 2.4);
+    float projectedContribution = PathThroughput(payload) * reflectionWeight;
+    bool persistentSpecular = metallic > 0.90 && roughness < 0.035;
+    uint opaqueReflectionLimit = CameraUp.w > 0.5
+        ? min(maximumReflectionBounces, 1u)
+        : maximumReflectionBounces;
+    uint ordinaryReflectionBounces = min(opaqueReflectionLimit,
+        quality >= 3 ? 4u : (quality >= 2 ? 3u : 2u));
+    uint materialReflectionBounces = persistentSpecular
+        ? opaqueReflectionLimit
+        : ordinaryReflectionBounces;
+    if (payload.depth < materialReflectionBounces && reflectionAllowed && reflectivity > 0.015 &&
+        (persistentSpecular || payload.depth < 2 || projectedContribution >= 0.0015))
     {
         RayDesc reflectionRay;
         reflectionRay.Origin = hitPosition + normal * 0.004;
@@ -836,13 +1719,15 @@ void SphereClosestHit(inout Payload payload, SphereAttributes attributes)
         reflectionPayload.depth = payload.depth + 1;
         reflectionPayload.diagnosticFlags = 0;
         ResetMirrorState(reflectionPayload);
-        TraceRay(Scene, RAY_FLAG_NONE, 0xff, 0, 0, 0, reflectionRay, reflectionPayload);
+        reflectionPayload.mirrorTintAndGap.w = projectedContribution;
+        TraceCurvedRadiance(reflectionRay, reflectionPayload);
         payload.diagnosticFlags |= 8 | reflectionPayload.diagnosticFlags;
-        float viewFresnel = pow(1.0 - saturate(dot(-WorldRayDirection(), normal)), 5.0);
-        float reflectionWeight = saturate(reflectivity + viewFresnel * (1.0 - reflectivity));
-        localColor = metallic > 0.15 || referenceMode
-            ? lerp(localColor, reflectionPayload.colorAndDistance.rgb, reflectionWeight)
-            : localColor + reflectionPayload.colorAndDistance.rgb * min(reflectionWeight, 0.16);
+        localColor = metallic > 0.15
+            ? localColor * (1.0 - conductorReflectionWeight) +
+                reflectionPayload.colorAndDistance.rgb * conductorReflectionWeight
+            : referenceMode
+                ? lerp(localColor, reflectionPayload.colorAndDistance.rgb, reflectionWeight)
+                : localColor + reflectionPayload.colorAndDistance.rgb * min(reflectionWeight, 0.16);
     }
     payload.colorAndDistance = float4(localColor, RayTCurrent());
 }

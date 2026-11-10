@@ -341,7 +341,7 @@ public sealed partial class SandboxGame
             "rtxsandbox:glass", "rtxsandbox:blue_glass", "rtxsandbox:red_glass",
             "rtxsandbox:green_glass", "rtxsandbox:yellow_glass", "rtxsandbox:purple_glass",
             "rtxsandbox:smoked_glass", "rtxsandbox:diamond_glass", "rtxsandbox:prismatic_glass",
-            "rtxsandbox:frosted_glass", "rtxsandbox:matte_glass", "rtxsandbox:mosaic_glass",
+            "rtxsandbox:frosted_glass", "rtxsandbox:mosaic_glass",
             "rtxsandbox:acrylic_glass", "rtxsandbox:ribbed_glass", "rtxsandbox:etched_glass",
         };
         return keys.Select(key =>

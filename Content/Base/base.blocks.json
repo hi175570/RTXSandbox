@@ -100,7 +100,7 @@
       "displayName": "Snow",
       "category": "Nature / Soil",
       "albedo": [0.88, 0.93, 0.98],
-      "roughness": 0.72,
+      "roughness": 0.94,
       "hardnessSeconds": 0.3,
       "preferredToolType": "shovel",
       "affectedByGravity": true
@@ -364,15 +364,15 @@
       "displayName": "Frosted Glass",
       "category": "Optical / Specialty Glass",
       "albedo": [0.67, 0.83, 0.9],
-      "roughness": 0.72,
+      "roughness": 0.52,
       "metallic": 0.02,
       "hardnessSeconds": 0.3,
       "isTransparent": true,
-      "transmission": 0.72,
+      "transmission": 0.76,
       "indexOfRefraction": 1.48,
       "tags": ["glass", "frosted", "diffuse", "transparent"],
       "textureGenerator": "frosted_glass",
-      "textureVariation": 0.72,
+      "textureVariation": 0.34,
       "soundSet": "glass"
     },
     {

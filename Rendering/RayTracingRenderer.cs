@@ -3,7 +3,7 @@ using System.Numerics;
 using OpenTK.Graphics.OpenGL4;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.Gameplay;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.World;
 
 namespace RTXSandbox.Rendering;
@@ -150,6 +150,8 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         RenderQualitySettings quality,
         float exposure)
     {
+        if (_world.GenerationSettings.Preset == WorldPreset.ExternalBridge)
+            quality = quality with { PathEnvironmentIntensity = 0f };
         ChunkCoordinate wantedOrigin = ChunkCoordinate.FromVoxel(
             (int)MathF.Floor(cameraPosition.X) - VoxelWorld.Width / 2,
             (int)MathF.Floor(cameraPosition.Z) - VoxelWorld.Depth / 2);
@@ -196,7 +198,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             _dynamicGridsDirty = false;
         }
         Vector3 forward = camera.Forward;
-        Vector3 right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
+        Vector3 right = Vector3.Normalize(Vector3.Cross(forward, camera.Up));
         Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
 
         _compute.Use();
@@ -286,6 +288,10 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(_display.Uniform("uImage"), 0);
         GL.Uniform2(_display.Uniform("uViewport"), (float)_viewportWidth, (float)_viewportHeight);
         GL.Uniform1(_display.Uniform("uExposure"), exposure);
+        // Compute transport integrates the curved primary ray and intersects the
+        // world-space accretion disk itself. Applying the old screen-space lens
+        // here would bend the completed image a second time and look like a decal.
+        GL.Uniform1(_display.Uniform("uBlackHoleCount"), 0);
         GL.BindVertexArray(_vertexArray);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
 
@@ -446,6 +452,7 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
     {
         long uploadStarted = Stopwatch.GetTimestamp();
         var data = new List<float>();
+        BlockDefinition[] definitions = _blocks.CreateLookupSnapshot();
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
         {
             if (cameraPosition.HasValue &&
@@ -455,20 +462,63 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
 
             IReadOnlyList<PhysicsGridElement> elements = grid.Elements;
             if (elements.Count == 0) continue;
+            var smoothCells = grid.SmoothSpheres
+                .Select(sphere => (sphere.CellX, sphere.CellY, sphere.CellZ, sphere.MaterialId))
+                .ToHashSet();
+            SoftBodyBeamSegment[] smoothSegments = SoftBodySurfaceBuilder.BuildBeamSegments(grid.SmoothSpheres);
+            var renderBoxes = new List<(Vector3 Center, Vector3 Half, ushort MaterialId,
+                int CellX, int CellY, int CellZ)>();
+            ushort GridMaterialAt(int x, int y, int z) =>
+                grid.TryGetFullCellMaterial(x, y, z, out ushort materialId) ? materialId : (ushort)0;
+            foreach (PhysicsGridElement element in elements)
+            {
+                if (smoothCells.Contains((element.CellX, element.CellY, element.CellZ, element.MaterialId)))
+                    continue;
+                BlockDefinition definition = definitions[element.MaterialId];
+                Vector3 expectedMinimum = new(element.CellX, element.CellY, element.CellZ);
+                bool fullCell = Vector3.DistanceSquared(element.Minimum, expectedMinimum) < 0.000001f &&
+                                Vector3.DistanceSquared(element.Maximum, expectedMinimum + Vector3.One) < 0.000001f;
+                if (fullCell && MechanicalPartGeometry.IsMechanical(definition))
+                {
+                    MechanicalAxis axis = MechanicalPartGeometry.ResolveAxis(
+                        element.CellX, element.CellY, element.CellZ, GridMaterialAt, definitions);
+                    foreach (MechanicalPartBox part in MechanicalPartGeometry.Build(definition, axis))
+                    {
+                        renderBoxes.Add(((part.Minimum + part.Maximum) * 0.5f + expectedMinimum,
+                            (part.Maximum - part.Minimum) * 0.5f, element.MaterialId,
+                            element.CellX, element.CellY, element.CellZ));
+                    }
+                }
+                else
+                {
+                    renderBoxes.Add((element.Center, element.HalfExtents, element.MaterialId,
+                        element.CellX, element.CellY, element.CellZ));
+                }
+            }
+            int groupEntryCount = renderBoxes.Count + smoothSegments.Length;
+            if (groupEntryCount == 0) continue;
             Vector3 boundsMinimum = new(float.PositiveInfinity);
             Vector3 boundsMaximum = new(float.NegativeInfinity);
-            foreach (PhysicsGridElement element in elements)
+            foreach ((Vector3 center, Vector3 half, ushort _, int _, int _, int _) in renderBoxes)
             {
                 for (int corner = 0; corner < 8; corner++)
                 {
-                    Vector3 local = new(
-                        (corner & 1) == 0 ? element.Minimum.X : element.Maximum.X,
-                        (corner & 2) == 0 ? element.Minimum.Y : element.Maximum.Y,
-                        (corner & 4) == 0 ? element.Minimum.Z : element.Maximum.Z);
+                    Vector3 local = center + new Vector3(
+                        (corner & 1) == 0 ? -half.X : half.X,
+                        (corner & 2) == 0 ? -half.Y : half.Y,
+                        (corner & 4) == 0 ? -half.Z : half.Z);
                     Vector3 world = grid.LocalToWorld(local);
                     boundsMinimum = Vector3.Min(boundsMinimum, world);
                     boundsMaximum = Vector3.Max(boundsMaximum, world);
                 }
+            }
+            foreach (SoftBodyBeamSegment segment in smoothSegments)
+            {
+                Vector3 start = grid.LocalToWorld(segment.Start);
+                Vector3 end = grid.LocalToWorld(segment.End);
+                Vector3 halfWidth = new(segment.HalfWidth);
+                boundsMinimum = Vector3.Min(boundsMinimum, Vector3.Min(start, end) - halfWidth);
+                boundsMaximum = Vector3.Max(boundsMaximum, Vector3.Max(start, end) + halfWidth);
             }
             Vector3 boundsCenter = (boundsMinimum + boundsMaximum) * 0.5f;
             Vector3 boundsHalf = Vector3.Max(
@@ -477,19 +527,37 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             // Negative material/grid fields identify a group header. The shader tests
             // this AABB once and skips every following element when the ray misses it.
             data.Add(boundsCenter.X); data.Add(boundsCenter.Y); data.Add(boundsCenter.Z); data.Add(-1f);
-            data.Add(boundsHalf.X); data.Add(boundsHalf.Y); data.Add(boundsHalf.Z); data.Add(-elements.Count);
+            data.Add(boundsHalf.X); data.Add(boundsHalf.Y); data.Add(boundsHalf.Z); data.Add(-groupEntryCount);
             data.Add(0f); data.Add(0f); data.Add(0f); data.Add(1f);
             data.Add(0f); data.Add(0f); data.Add(0f); data.Add(0f);
 
-            foreach (PhysicsGridElement element in elements)
+            foreach ((Vector3 localCenter, Vector3 half, ushort materialId,
+                         int cellX, int cellY, int cellZ) in renderBoxes)
             {
-                Vector3 center = grid.LocalToWorld(element.Center);
-                Vector3 half = element.HalfExtents;
+                Vector3 center = grid.LocalToWorld(localCenter);
                 Quaternion rotation = grid.Orientation;
-                data.Add(center.X); data.Add(center.Y); data.Add(center.Z); data.Add(element.MaterialId);
+                data.Add(center.X); data.Add(center.Y); data.Add(center.Z); data.Add(materialId);
                 data.Add(half.X); data.Add(half.Y); data.Add(half.Z); data.Add(grid.Id);
                 data.Add(rotation.X); data.Add(rotation.Y); data.Add(rotation.Z); data.Add(rotation.W);
-                data.Add(element.CellX); data.Add(element.CellY); data.Add(element.CellZ); data.Add(0f);
+                data.Add(cellX); data.Add(cellY); data.Add(cellZ); data.Add(0f);
+            }
+            foreach (SoftBodyBeamSegment segment in smoothSegments)
+            {
+                Vector3 start = grid.LocalToWorld(segment.Start);
+                Vector3 end = grid.LocalToWorld(segment.End);
+                Vector3 delta = end - start;
+                float length = delta.Length();
+                Vector3 center = (start + end) * 0.5f;
+                Quaternion rotation = length > 0.0001f
+                    ? CreateBeamRotation(delta / length)
+                    : Quaternion.Identity;
+                data.Add(center.X); data.Add(center.Y); data.Add(center.Z); data.Add(segment.MaterialId);
+                data.Add(segment.HalfWidth);
+                data.Add(length > 0.0001f ? length * 0.5f + segment.HalfWidth : segment.HalfWidth);
+                data.Add(segment.HalfWidth);
+                data.Add(grid.Id);
+                data.Add(rotation.X); data.Add(rotation.Y); data.Add(rotation.Z); data.Add(rotation.W);
+                data.Add(segment.CellX); data.Add(segment.CellY); data.Add(segment.CellZ); data.Add(0f);
             }
         }
         foreach (AnalyticSphere sphere in _world.AnalyticSpheres.Spheres)
@@ -513,6 +581,15 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
         RecordVoxelUpload(ElapsedMilliseconds(uploadStarted), (long)upload.Length * sizeof(float));
         ResetAccumulation();
+    }
+
+    private static Quaternion CreateBeamRotation(Vector3 direction)
+    {
+        float dot = Math.Clamp(Vector3.Dot(Vector3.UnitY, direction), -1f, 1f);
+        if (dot > 0.99999f) return Quaternion.Identity;
+        if (dot < -0.99999f) return Quaternion.CreateFromAxisAngle(Vector3.UnitX, MathF.PI);
+        Vector3 axis = Vector3.Cross(Vector3.UnitY, direction);
+        return Quaternion.Normalize(new Quaternion(axis, 1f + dot));
     }
 
     private void OnPhysicsGridsChanged() => _dynamicGridsDirty = true;
@@ -697,6 +774,10 @@ public sealed class RayTracingRenderer : IRenderBackend, IMaterialPreviewSource
             emission[offset + 2] = definition.Emission.Z;
             emission[offset + 3] = definition.Metallic;
             flags[offset] = definition.IsFluid ? (byte)1 : (byte)0;
+            if (definition.Tags.Any(tag => tag.Equals("absorber", StringComparison.OrdinalIgnoreCase)))
+                flags[offset] |= 1 << 1;
+            if (definition.Tags.Any(tag => tag.Equals("black-hole", StringComparison.OrdinalIgnoreCase)))
+                flags[offset] |= 1 << 2;
             flags[offset + 1] = (byte)definition.SurfacePattern;
             flags[offset + 2] = (byte)Math.Clamp((int)MathF.Round(definition.Transmission * 255f), 0, 255);
             flags[offset + 3] = (byte)Math.Clamp((int)MathF.Round(definition.IndexOfRefraction * 100f), 100, 255);

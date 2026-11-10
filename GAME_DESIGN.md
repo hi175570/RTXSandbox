@@ -56,7 +56,7 @@ Mod 適合增加：特殊方塊、程序筆刷、材質／Shader、展示場景�
 - Natural：Auto 或鎖定七種生態，只生成地形、生態、植物、水系與山區洞穴，不生成任何人工建築。
 - Pure Nature：以宏觀帶狀分區確保沙漠、草原、森林、竹林／濕地、雪地與山脈有連續過渡，並以連續噪聲河帶切過地形。
 - Void：只有 9×9 測試平台、天空與一個底部光源。
-- Showcase：本體提供水池、玻璃林、材質展台與 RGB Lighting Lab。
+- Showcase：本體提供水／折射實驗室、特殊玻璃光譜牆、平行鏡廳、針孔暗箱、PBR 金屬庭院、軟體／剛體物理場與機械控制器。
 
 Preset 是世界的生成來源而非玩法規則。建立新世界前會保存現況，舊 Chunk 留在 `.bak`；preset、biome、seed、Flat 材質和生成開關則寫入第 4 版 Chunk 與 `level.json`。Mod 在每次新建／重新載入後都會重新收到 `WorldReady`，可以在自然世界上增加城市、道路或其他結構。
 
@@ -89,9 +89,9 @@ Natural v2 不生成生物或人工建築。地形由 domain warp、大陸度、
 
 - BepInEx 6 CoreCLR 由本體啟動；HarmonyX 可直接 patch。
 - Registry 使用 namespaced key，`force: true` 允許 last-writer-wins 覆蓋。
-- `IModContext` 提供 blocks、items、recipes、tools、world、events、event bus 和 service locator。
-- `BuildToolDefinition` 可直接寫 `IVoxelWorld`；本體會監聽該次 callback 的 voxel events，合併成單一 Undo 命令。
-- 舊的 item／recipe／survival 合約暫時保留為相容層，但不決定本體方向。
+- 不提供獨立 Mod API／service locator；插件直接引用 `RTXSandbox.dll`，使用公開成員、Reflection 或 Harmony patch。
+- `Engine/Contracts` 是編入遊戲與 Android Host 的內部共用邊界，不是限制模組能力的 SDK。
+- 模組可以直接改寫 item、recipe、world、renderer 與物理流程；衝突由 BepInEx 載入順序及 Harmony priority 處理。
 
 ## 完整遊戲的最低標準
 

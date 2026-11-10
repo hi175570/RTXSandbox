@@ -1,4 +1,4 @@
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 
 namespace RTXSandbox.World;
 
@@ -28,6 +28,8 @@ public sealed class WaterFlowSimulation : IDisposable
     private readonly VoxelWorld _world;
     private readonly Queue<Cell> _pending = new();
     private readonly HashSet<Cell> _queued = new();
+    private readonly Queue<Cell> _urgent = new();
+    private readonly HashSet<Cell> _urgentQueued = new();
     private readonly Queue<DisplacedWater> _displaced = new();
     private float _accumulator;
     private bool _applying;
@@ -58,13 +60,22 @@ public sealed class WaterFlowSimulation : IDisposable
             if (remaining > 0) _displaced.Enqueue(spill with { Amount = remaining });
         }
 
-        int workCount = Math.Min(_pending.Count, MaximumCellsPerStep);
+        int urgentWork = Math.Min(_urgent.Count, MaximumCellsPerStep);
+        int urgentProcessed = 0;
+        while (urgentProcessed < urgentWork && _urgent.TryDequeue(out Cell urgentCell) &&
+               changes < MaximumChangesPerStep)
+        {
+            urgentProcessed++;
+            if (!_urgentQueued.Remove(urgentCell)) continue;
+            _queued.Remove(urgentCell); // invalidate a stale normal-priority copy
+            ProcessCell(urgentCell, ref changes);
+        }
+
+        int workCount = Math.Min(_pending.Count, MaximumCellsPerStep - urgentProcessed);
         while (workCount-- > 0 && _pending.TryDequeue(out Cell cell) && changes < MaximumChangesPerStep)
         {
-            _queued.Remove(cell);
-            if (!IsWater(cell)) continue;
-            if (TryFall(cell, ref changes) || TryEqualizeHorizontal(cell, ref changes)) continue;
-            TryBalanceConnectedSurfaces(cell, ref changes);
+            if (!_queued.Remove(cell)) continue;
+            ProcessCell(cell, ref changes);
         }
     }
 
@@ -72,15 +83,59 @@ public sealed class WaterFlowSimulation : IDisposable
     {
         _pending.Clear();
         _queued.Clear();
+        _urgent.Clear();
+        _urgentQueued.Clear();
         _displaced.Clear();
         _accumulator = 0f;
+    }
+
+    /// <summary>
+    /// Applies a small, volume-conserving surface disturbance. It changes only a few
+    /// 1/16-level cells, so every renderer sees the same ripple through shared fluid
+    /// levels without running a second GPU water simulation.
+    /// </summary>
+    public int Disturb(System.Numerics.Vector3 position, float strength)
+    {
+        int centerX = (int)MathF.Floor(position.X);
+        int centerZ = (int)MathF.Floor(position.Z);
+        int startY = Math.Clamp((int)MathF.Floor(position.Y), VoxelWorld.MinimumY, VoxelWorld.MaximumY - 1);
+        Cell? center = null;
+        for (int y = startY + 1; y >= startY - 3; y--)
+        {
+            var candidate = new Cell(centerX, y, centerZ);
+            if (!IsWater(candidate)) continue;
+            center = candidate;
+            break;
+        }
+        if (!center.HasValue) return 0;
+
+        int pulses = Math.Clamp((int)MathF.Ceiling(MathF.Abs(strength) * 0.35f), 1, 4);
+        int moved = 0;
+        int rotation = PositiveHash(center.Value) & 3;
+        for (int index = 0; index < pulses; index++)
+        {
+            Cell donor = center.Value;
+            if (Amount(donor) <= 1) break;
+            (int dx, int _, int dz) = HorizontalDirections[(index + rotation) & 3];
+            Cell target = new(donor.X + dx, donor.Y, donor.Z + dz);
+            if (!CanHoldWater(target) || Amount(target) >= VoxelWorld.FluidCapacity) continue;
+            ApplyTransfer(donor, target, 1);
+            moved++;
+        }
+        return moved;
     }
 
     private void OnVoxelChanged(VoxelChangedEvent change)
     {
         if (_applying) return;
         var cell = new Cell(change.X, change.Y, change.Z);
-        EnqueueNeighborhood(cell);
+        // Excavation must not wait behind the normal ocean equalisation queue.
+        // In particular, removing a block below water must refill that cavity on
+        // the next simulation step instead of leaving a long-lived air pocket.
+        // Ordinary water placement stays in the budgeted queue and cannot flood
+        // this small priority lane while a pool is being constructed.
+        bool excavation = change.OldBlockId != 0 && change.NewBlockId == 0;
+        EnqueueNeighborhood(cell, urgent: excavation);
     }
 
     private void OnFluidDisplaced(FluidDisplacementEvent displacement)
@@ -104,6 +159,13 @@ public sealed class WaterFlowSimulation : IDisposable
         ApplyTransfer(cell, below, transfer);
         changes += 2;
         return true;
+    }
+
+    private void ProcessCell(Cell cell, ref int changes)
+    {
+        if (!IsWater(cell)) return;
+        if (TryFall(cell, ref changes) || TryEqualizeHorizontal(cell, ref changes)) return;
+        TryBalanceConnectedSurfaces(cell, ref changes);
     }
 
     private bool TryEqualizeHorizontal(Cell cell, ref int changes)
@@ -326,16 +388,22 @@ public sealed class WaterFlowSimulation : IDisposable
         _world.IsInside(cell.X, cell.Y, cell.Z) &&
         _world.IsChunkLoaded(ChunkCoordinate.FromVoxel(cell.X, cell.Z));
 
-    private void EnqueueNeighborhood(Cell cell)
+    private void EnqueueNeighborhood(Cell cell, bool urgent = false)
     {
-        EnqueueIfWater(cell);
+        EnqueueIfWater(cell, urgent);
         foreach ((int dx, int dy, int dz) in NeighborDirections)
-            EnqueueIfWater(new Cell(cell.X + dx, cell.Y + dy, cell.Z + dz));
+            EnqueueIfWater(new Cell(cell.X + dx, cell.Y + dy, cell.Z + dz), urgent);
     }
 
-    private void EnqueueIfWater(Cell cell)
+    private void EnqueueIfWater(Cell cell, bool urgent = false)
     {
-        if (IsWater(cell) && _queued.Add(cell)) _pending.Enqueue(cell);
+        if (!IsWater(cell)) return;
+        if (urgent)
+        {
+            if (_urgentQueued.Add(cell)) _urgent.Enqueue(cell);
+            return;
+        }
+        if (_queued.Add(cell)) _pending.Enqueue(cell);
     }
 
     private static int DistanceSquared(Cell left, Cell right)

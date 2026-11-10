@@ -8,7 +8,7 @@ using BepuPhysics.CollisionDetection;
 using BepuPhysics.Constraints;
 using BepuUtilities;
 using BepuUtilities.Memory;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.World;
 
@@ -22,6 +22,13 @@ public sealed class BepuPhysicsBackend : IDisposable
     private readonly ThreadDispatcher _dispatcher;
     private readonly Simulation _simulation;
     private readonly Dictionary<ulong, DynamicBody> _dynamicBodies = new();
+    private readonly HashSet<ulong> _lightweightDebris = new();
+    private readonly Dictionary<ulong, float> _debrisQuietSeconds = new();
+    private readonly List<PhysicsGrid> _lightweightMoving = new();
+    private readonly List<ulong> _lightweightStaleIds = new();
+    private readonly Dictionary<(int X, int Y, int Z), List<LightweightEntry>> _lightweightBuckets = new();
+    private readonly Stack<List<LightweightEntry>> _lightweightBucketPool = new();
+    private int _lightweightPhase;
     private readonly Dictionary<ulong, AnalyticSphereBody> _analyticSphereBodies = new();
     private readonly Dictionary<ChunkCoordinate, List<StaticBody>> _staticChunks = new();
     private readonly HashSet<ChunkCoordinate> _dirtyChunks = new();
@@ -45,15 +52,33 @@ public sealed class BepuPhysicsBackend : IDisposable
     private const double RepeatedColliderEditCoalesceMilliseconds = 75.0;
     private const int MaximumStaticBodiesRemovedPerFrame = 8;
     private const float FixedStepSeconds = 1f / 120f;
+    private const float MediumDebrisStepSeconds = 1f / 60f;
+    private const float HeavyDebrisStepSeconds = 1f / 30f;
     private const int MaximumCatchUpSteps = 2;
+    private const int MediumDynamicBodyThreshold = 256;
+    private const int HeavyDynamicBodyThreshold = 1_024;
+    // A 20k shard field cannot afford 20k compound bodies in a 30 Hz iterative
+    // constraint solve.  Nearby fragments keep exact BEPU contacts; excess debris
+    // retains motion and collision in the bounded spatial-hash solver below.  This is
+    // a physics LOD, not deletion: every shard remains a PhysicsGrid and can return to
+    // the exact tier when the population falls or it becomes relevant to the player.
+    private const int MaximumExactDebrisBodies = 8;
+    private const float LightweightGravity = -18f;
+    private const float LightweightCollisionCellSize = 0.5f;
+    private const float DebrisQuietLinearSpeed = 0.32f;
+    private const float DebrisQuietAngularSpeed = 1.15f;
+    private const float DebrisQuietSleepSeconds = 0.55f;
     private float _timeAccumulator;
     private Vector3 _pendingPlayerPosition;
     private Vector3 _pendingPlayerVelocity;
     private bool _hasPendingPlayerPush;
+    private bool _dynamicTopologyDirty = true;
     private bool _disposed;
 
     public string Name => "BEPUphysics 2";
     public int DynamicBodyCount => _dynamicBodies.Count + _analyticSphereBodies.Count;
+    public int LightweightDebrisCount => _lightweightDebris.Count;
+    public int VirtualizedDebrisCount => _world.PhysicsGrids.Grids.Count(ShouldVirtualizeDebris);
     public int AnalyticSphereBodyCount => _analyticSphereBodies.Count;
     public int StaticChunkBodyCount => _staticChunks.Values.Sum(list => list.Count);
     public int CollisionStepsLastFrame { get; private set; }
@@ -63,8 +88,10 @@ public sealed class BepuPhysicsBackend : IDisposable
     public double MaximumColliderBuildMilliseconds { get; private set; }
     public double MaximumDynamicReconcileMilliseconds { get; private set; }
     public double MaximumSimulationMilliseconds { get; private set; }
+    public double MaximumLightweightDebrisMilliseconds { get; private set; }
     public double MaximumSingleSimulationStepMilliseconds { get; private set; }
     public double MaximumStaticResidencyMilliseconds { get; private set; }
+    public int DynamicReconcileCount { get; private set; }
 
     public BepuPhysicsBackend(VoxelWorld world, Vector3 simulationFocus = default)
     {
@@ -88,6 +115,7 @@ public sealed class BepuPhysicsBackend : IDisposable
         _world.WorldReloaded += OnWorldReloaded;
         _world.ChunkGenerated += OnChunkGenerated;
         _world.BlockDefinitionsChanged += OnBlockDefinitionsChanged;
+        _world.PhysicsGrids.TopologyChanged += OnPhysicsGridTopologyChanged;
         MarkAllStaticDirty();
     }
 
@@ -101,34 +129,45 @@ public sealed class BepuPhysicsBackend : IDisposable
             MaximumStaticResidencyMilliseconds, ElapsedMilliseconds(residencyStarted));
         RebuildDirtyChunks(FrameWorkBudget.Default.MaximumColliderCommitsPerFrame);
         long dynamicStarted = Stopwatch.GetTimestamp();
-        ReconcileDynamicBodies();
+        if (_dynamicTopologyDirty)
+        {
+            _dynamicTopologyDirty = false;
+            ReconcileDynamicBodies();
+            DynamicReconcileCount++;
+        }
         ReconcileAnalyticSphereBodies();
+        ApplyExternalGridMotions();
         ApplyPendingPlayerPush();
         MaximumDynamicReconcileMilliseconds = Math.Max(
             MaximumDynamicReconcileMilliseconds, ElapsedMilliseconds(dynamicStarted));
         deltaSeconds = Math.Clamp(deltaSeconds, 0f, 0.25f);
-        _timeAccumulator = MathF.Min(
-            _timeAccumulator + deltaSeconds,
-            FixedStepSeconds * MaximumCatchUpSteps);
+        float stepSeconds = _dynamicBodies.Count >= HeavyDynamicBodyThreshold
+            ? HeavyDebrisStepSeconds
+            : _dynamicBodies.Count >= MediumDynamicBodyThreshold
+                ? MediumDebrisStepSeconds
+                : FixedStepSeconds;
+        int maximumSteps = stepSeconds == FixedStepSeconds ? MaximumCatchUpSteps : 1;
+        _timeAccumulator = MathF.Min(_timeAccumulator + deltaSeconds, stepSeconds * maximumSteps);
         CollisionStepsLastFrame = 0;
         long simulationStarted = Stopwatch.GetTimestamp();
-        while (_timeAccumulator + 0.0000001f >= FixedStepSeconds &&
-               CollisionStepsLastFrame < MaximumCatchUpSteps)
+        while (_timeAccumulator + 0.0000001f >= stepSeconds &&
+               CollisionStepsLastFrame < maximumSteps)
         {
             long singleStepStarted = Stopwatch.GetTimestamp();
             // Dispatching a tiny active-body set across every logical core costs more
             // than the collision work itself (especially while another game owns CPU
             // time). Keep the parallel path for genuinely large simulations.
-            if (DynamicBodyCount >= 64) _simulation.Timestep(FixedStepSeconds, _dispatcher);
-            else _simulation.Timestep(FixedStepSeconds);
+            if (DynamicBodyCount >= 64) _simulation.Timestep(stepSeconds, _dispatcher);
+            else _simulation.Timestep(stepSeconds);
             MaximumSingleSimulationStepMilliseconds = Math.Max(
                 MaximumSingleSimulationStepMilliseconds, ElapsedMilliseconds(singleStepStarted));
-            _timeAccumulator -= FixedStepSeconds;
+            _timeAccumulator -= stepSeconds;
             CollisionStepsLastFrame++;
         }
         MaximumSimulationMilliseconds = Math.Max(
             MaximumSimulationMilliseconds, ElapsedMilliseconds(simulationStarted));
-        SynchronizeGrids();
+        SynchronizeGrids(stepSeconds * CollisionStepsLastFrame);
+        AdvanceLightweightDebris(deltaSeconds);
         SynchronizeAnalyticSpheres();
     }
 
@@ -143,24 +182,367 @@ public sealed class BepuPhysicsBackend : IDisposable
 
     private void ReconcileDynamicBodies()
     {
-        HashSet<ulong> live = _world.PhysicsGrids.Grids.Select(grid => grid.Id).ToHashSet();
+        PhysicsGrid[] activeDebris = _world.PhysicsGrids.Grids
+            .Where(grid => grid.IsDebrisFragment && !grid.IsDeformable &&
+                           !grid.IsKinematicController && !ShouldVirtualizeDebris(grid))
+            .OrderBy(grid => Vector3.DistanceSquared(grid.Position, _simulationFocus))
+            .ThenBy(grid => grid.Id)
+            .ToArray();
+        var exactDebris = activeDebris.Take(MaximumExactDebrisBodies)
+            .Select(grid => grid.Id)
+            .ToHashSet();
+        _lightweightDebris.Clear();
+        foreach (PhysicsGrid debris in activeDebris)
+            if (!exactDebris.Contains(debris.Id)) _lightweightDebris.Add(debris.Id);
+
+        HashSet<ulong> live = _world.PhysicsGrids.Grids
+            .Where(grid => !grid.IsDeformable && !grid.IsKinematicController &&
+                           !ShouldVirtualizeDebris(grid) &&
+                           (!grid.IsDebrisFragment || exactDebris.Contains(grid.Id)))
+            .Select(grid => grid.Id)
+            .ToHashSet();
         foreach (ulong id in _dynamicBodies.Keys.Where(id => !live.Contains(id)).ToArray()) RemoveDynamic(id);
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
         {
+            if (ShouldVirtualizeDebris(grid))
+            {
+                // Loaded or freshly-created sleeping debris may never have owned a
+                // BEPU body. Still remove it from expensive collision participation;
+                // the complete shard remains selectable, renderable and saveable.
+                _world.PhysicsGrids.SetCollisionVirtualized(grid, virtualized: true);
+                continue;
+            }
+            if (grid.IsDeformable || grid.IsKinematicController) continue;
+            _world.PhysicsGrids.SetCollisionVirtualized(grid, virtualized: false);
+            if (_lightweightDebris.Contains(grid.Id)) continue;
             int signature = grid.TopologyVersion;
             if (_dynamicBodies.TryGetValue(grid.Id, out DynamicBody existing) && existing.Signature == signature) continue;
             if (_dynamicBodies.ContainsKey(grid.Id)) RemoveDynamic(grid.Id);
+            if (grid.RequiresSupportRevalidation && !IsPhysicsGridSupportReady(grid))
+            {
+                // A newly loaded or newly fractured body may be reconciled before a
+                // just-edited floor Chunk has completed its asynchronous collider
+                // build. Retry next frame instead of letting it fall through the
+                // visible floor during that short gap.
+                _dynamicTopologyDirty = true;
+                continue;
+            }
+            grid.RequiresSupportRevalidation = false;
             CreateDynamic(grid, signature);
+        }
+    }
+
+    private void AdvanceLightweightDebris(float deltaSeconds)
+    {
+        if (_lightweightDebris.Count == 0 || deltaSeconds <= 0f) return;
+        long started = Stopwatch.GetTimestamp();
+        float step = Math.Clamp(deltaSeconds, 0f, 0.05f);
+        _lightweightMoving.Clear();
+        _lightweightStaleIds.Clear();
+        foreach (ulong id in _lightweightDebris)
+        {
+            PhysicsGrid? grid = _world.PhysicsGrids.Get(id);
+            if (grid is null || grid.IsSleeping || !grid.IsDebrisFragment)
+            {
+                _lightweightStaleIds.Add(id);
+                continue;
+            }
+            _lightweightMoving.Add(grid);
+        }
+        foreach (ulong id in _lightweightStaleIds) _lightweightDebris.Remove(id);
+
+        // Broadphase is rebuilt from every current centre in O(n), so a shard in this
+        // frame's integration slice still collides with shards assigned to other
+        // slices. At extreme counts, time-slice only the integration/contact solve;
+        // each slice advances by the accumulated interval. This keeps all 20k bodies
+        // moving and collidable without making a single frame pay for 20k terrain
+        // probes, transforms and contact resolutions.
+        foreach (List<LightweightEntry> previousBucket in _lightweightBuckets.Values)
+        {
+            previousBucket.Clear();
+            _lightweightBucketPool.Push(previousBucket);
+        }
+        _lightweightBuckets.Clear();
+        foreach (PhysicsGrid grid in _lightweightMoving)
+        {
+            (Vector3 minimum, Vector3 maximum) = CalculateLightweightBounds(grid);
+            (int X, int Y, int Z) key = LightweightCell(grid.Position);
+            if (!_lightweightBuckets.TryGetValue(key, out List<LightweightEntry>? bucket))
+            {
+                if (!_lightweightBucketPool.TryPop(out bucket))
+                    bucket = new List<LightweightEntry>(2);
+                _lightweightBuckets.Add(key, bucket);
+            }
+            bucket.Add(new LightweightEntry(grid, minimum, maximum));
+        }
+
+        int batchCount = _lightweightMoving.Count >= 15_000 ? 5 :
+            _lightweightMoving.Count >= 7_500 ? 3 :
+            _lightweightMoving.Count >= 3_000 ? 2 : 1;
+        int phase = _lightweightPhase % batchCount;
+        _lightweightPhase = (_lightweightPhase + 1) % batchCount;
+        // Bound the accumulated approximation step so a badly delayed frame cannot
+        // tunnel a thin shard through both the static swept landing test and its hash
+        // neighbours. The bodies keep advancing; only the extreme-count LOD catches
+        // up over subsequent slices after a long hitch.
+        step = Math.Clamp(step * batchCount, 0f, 0.16f);
+        bool changed = false;
+        for (int movingIndex = phase; movingIndex < _lightweightMoving.Count; movingIndex += batchCount)
+        {
+            PhysicsGrid grid = _lightweightMoving[movingIndex];
+            Vector3 linear = grid.LinearVelocity;
+            linear.Y += LightweightGravity * step;
+            linear *= MathF.Max(0f, 1f - 0.035f * step);
+            Vector3 angular = grid.AngularVelocity * MathF.Max(0f, 1f - 0.08f * step);
+            Vector3 position = grid.Position + linear * step;
+            Quaternion orientation = IntegrateOrientation(grid.Orientation, angular, step);
+
+            (Vector3 oldMinimum, _) = CalculateLightweightBounds(grid);
+            Vector3 oldPosition = grid.Position;
+            Quaternion oldOrientation = grid.Orientation;
+            grid.Position = position;
+            grid.Orientation = orientation;
+            (Vector3 minimum, Vector3 maximum) = CalculateLightweightBounds(grid);
+
+            bool hasStaticSupport = TryFindStaticLandingHeight(
+                oldMinimum.Y, minimum, maximum, out float supportTop);
+            if (hasStaticSupport)
+            {
+                float correctionY = supportTop - minimum.Y;
+                grid.Position += new Vector3(0f, correctionY, 0f);
+                minimum.Y += correctionY;
+                maximum.Y += correctionY;
+                if (linear.Y < 0f) linear.Y = -linear.Y * 0.10f;
+                linear.X *= 0.68f;
+                linear.Z *= 0.68f;
+                angular *= 0.66f;
+            }
+
+            // Compare against the full prebuilt broadphase, including shards updated
+            // in other phases. Contacts therefore do not disappear just because their
+            // owners are integrated on different frames.
+            (int X, int Y, int Z) key = LightweightCell(grid.Position);
+            int resolved = 0;
+            Vector3 cellPosition = grid.Position / LightweightCollisionCellSize;
+            int adjacentX = cellPosition.X - MathF.Floor(cellPosition.X) < 0.5f ? -1 : 1;
+            int adjacentY = cellPosition.Y - MathF.Floor(cellPosition.Y) < 0.5f ? -1 : 1;
+            int adjacentZ = cellPosition.Z - MathF.Floor(cellPosition.Z) < 0.5f ? -1 : 1;
+            for (int dz = 0; dz <= 1 && resolved < 4; dz++)
+            for (int dy = 0; dy <= 1 && resolved < 4; dy++)
+            for (int dx = 0; dx <= 1 && resolved < 4; dx++)
+            {
+                var neighbourKey = (
+                    key.X + (dx == 0 ? 0 : adjacentX),
+                    key.Y + (dy == 0 ? 0 : adjacentY),
+                    key.Z + (dz == 0 ? 0 : adjacentZ));
+                if (!_lightweightBuckets.TryGetValue(neighbourKey, out List<LightweightEntry>? neighbours)) continue;
+                foreach (LightweightEntry neighbour in neighbours)
+                {
+                    if (resolved >= 4) break;
+                    PhysicsGrid other = neighbour.Grid;
+                    if (other.Id == grid.Id) continue;
+                    if (!TryAabbSeparation(minimum, maximum, neighbour.Minimum, neighbour.Maximum,
+                            out Vector3 correction)) continue;
+                    grid.Position += correction;
+                    Vector3 normal = Vector3.Normalize(correction);
+                    float closing = Vector3.Dot(linear - other.LinearVelocity, normal);
+                    if (closing < 0f)
+                    {
+                        Vector3 impulse = normal * (-closing * 0.38f);
+                        linear += impulse;
+                        other.LinearVelocity -= impulse;
+                    }
+                    angular *= 0.86f;
+                    minimum += correction;
+                    maximum += correction;
+                    resolved++;
+                }
+            }
+
+            float linearSpeedSquared = linear.LengthSquared();
+            float angularSpeedSquared = angular.LengthSquared();
+            bool sleeping = false;
+            if (linearSpeedSquared <= DebrisQuietLinearSpeed * DebrisQuietLinearSpeed &&
+                angularSpeedSquared <= DebrisQuietAngularSpeed * DebrisQuietAngularSpeed &&
+                hasStaticSupport)
+            {
+                float quiet = _debrisQuietSeconds.GetValueOrDefault(grid.Id) + step;
+                if (quiet >= DebrisQuietSleepSeconds)
+                {
+                    linear = Vector3.Zero;
+                    angular = Vector3.Zero;
+                    sleeping = true;
+                    _debrisQuietSeconds.Remove(grid.Id);
+                }
+                else _debrisQuietSeconds[grid.Id] = quiet;
+            }
+            else _debrisQuietSeconds.Remove(grid.Id);
+
+            Vector3 resolvedPosition = grid.Position;
+            grid.Position = oldPosition;
+            grid.Orientation = oldOrientation;
+            changed |= grid.SetPhysicsState(
+                resolvedPosition, orientation, linear, angular, sleeping);
+            if (sleeping)
+            {
+                _world.PhysicsGrids.SetCollisionVirtualized(grid, virtualized: true);
+                _lightweightDebris.Remove(grid.Id);
+            }
+        }
+        if (changed) _world.PhysicsGrids.NotifyChanged();
+        MaximumLightweightDebrisMilliseconds = Math.Max(
+            MaximumLightweightDebrisMilliseconds, ElapsedMilliseconds(started));
+    }
+
+    private static Quaternion IntegrateOrientation(Quaternion orientation, Vector3 angularVelocity, float seconds)
+    {
+        float speed = angularVelocity.Length();
+        if (speed <= 0.00001f) return orientation;
+        Quaternion delta = Quaternion.CreateFromAxisAngle(angularVelocity / speed, speed * seconds);
+        return Quaternion.Normalize(delta * orientation);
+    }
+
+    private bool TryFindStaticLandingHeight(
+        float oldBottom, Vector3 minimum, Vector3 maximum, out float supportTop)
+    {
+        supportTop = float.NegativeInfinity;
+        int firstY = (int)MathF.Floor(oldBottom - 0.001f);
+        int lastY = (int)MathF.Floor(minimum.Y - 0.001f);
+        Span<Vector2> samples = stackalloc Vector2[5]
+        {
+            new((minimum.X + maximum.X) * 0.5f, (minimum.Z + maximum.Z) * 0.5f),
+            new(minimum.X + 0.001f, minimum.Z + 0.001f),
+            new(maximum.X - 0.001f, minimum.Z + 0.001f),
+            new(minimum.X + 0.001f, maximum.Z - 0.001f),
+            new(maximum.X - 0.001f, maximum.Z - 0.001f),
+        };
+        // Lightweight fragments are normally far smaller than a voxel. Their centre
+        // occupies the same support cell as all four corners, so five identical world
+        // queries only multiply the 20k-piece cost. Retain corner sampling for an
+        // unusually large approximate body that can genuinely bridge cell edges.
+        int sampleCount = maximum.X - minimum.X <= 0.75f && maximum.Z - minimum.Z <= 0.75f
+            ? 1
+            : samples.Length;
+        foreach (Vector2 sample in samples[..sampleCount])
+        for (int y = firstY; y >= lastY; y--)
+        {
+            if (!_world.IsSolidForCollision((int)MathF.Floor(sample.X), y, (int)MathF.Floor(sample.Y)))
+                continue;
+            supportTop = MathF.Max(supportTop, y + 1f);
+            break;
+        }
+        return float.IsFinite(supportTop) && minimum.Y < supportTop && oldBottom >= supportTop - 0.08f;
+    }
+
+    private static (int X, int Y, int Z) LightweightCell(Vector3 position) =>
+        ((int)MathF.Floor(position.X / LightweightCollisionCellSize),
+         (int)MathF.Floor(position.Y / LightweightCollisionCellSize),
+         (int)MathF.Floor(position.Z / LightweightCollisionCellSize));
+
+    private static (Vector3 Minimum, Vector3 Maximum) CalculateLightweightBounds(PhysicsGrid grid)
+    {
+        if (grid.CollisionElements.Count != 1) return grid.CalculateWorldBounds();
+        PhysicsGridCollisionElement element = grid.CollisionElements[0];
+        Vector3 center = grid.LocalToWorld(element.Center);
+        Vector3 half = element.HalfExtents;
+        Matrix4x4 rotation = Matrix4x4.CreateFromQuaternion(grid.Orientation);
+        Vector3 extent = new(
+            MathF.Abs(rotation.M11) * half.X + MathF.Abs(rotation.M21) * half.Y +
+            MathF.Abs(rotation.M31) * half.Z,
+            MathF.Abs(rotation.M12) * half.X + MathF.Abs(rotation.M22) * half.Y +
+            MathF.Abs(rotation.M32) * half.Z,
+            MathF.Abs(rotation.M13) * half.X + MathF.Abs(rotation.M23) * half.Y +
+            MathF.Abs(rotation.M33) * half.Z);
+        return (center - extent, center + extent);
+    }
+
+    private static bool TryAabbSeparation(
+        Vector3 minimum, Vector3 maximum, Vector3 otherMinimum, Vector3 otherMaximum,
+        out Vector3 correction)
+    {
+        Vector3 overlap = Vector3.Min(maximum, otherMaximum) - Vector3.Max(minimum, otherMinimum);
+        correction = Vector3.Zero;
+        if (overlap.X <= 0f || overlap.Y <= 0f || overlap.Z <= 0f) return false;
+        Vector3 center = (minimum + maximum) * 0.5f;
+        Vector3 otherCenter = (otherMinimum + otherMaximum) * 0.5f;
+        if (overlap.X <= overlap.Y && overlap.X <= overlap.Z)
+            correction.X = center.X < otherCenter.X ? -overlap.X : overlap.X;
+        else if (overlap.Y <= overlap.Z)
+            correction.Y = center.Y < otherCenter.Y ? -overlap.Y : overlap.Y;
+        else correction.Z = center.Z < otherCenter.Z ? -overlap.Z : overlap.Z;
+        correction *= 0.52f;
+        return true;
+    }
+
+    private readonly record struct LightweightEntry(
+        PhysicsGrid Grid, Vector3 Minimum, Vector3 Maximum);
+
+    private bool IsPhysicsGridSupportReady(PhysicsGrid grid)
+    {
+        (Vector3 minimum, Vector3 maximum) = grid.CalculateWorldBounds();
+        int supportY = (int)MathF.Floor(minimum.Y - 0.08f);
+        int minimumX = (int)MathF.Floor(minimum.X + 0.001f);
+        int maximumX = (int)MathF.Floor(maximum.X - 0.001f);
+        int minimumZ = (int)MathF.Floor(minimum.Z + 0.001f);
+        int maximumZ = (int)MathF.Floor(maximum.Z - 0.001f);
+        var supportChunks = new HashSet<ChunkCoordinate>();
+        for (int z = minimumZ; z <= maximumZ; z++)
+        for (int x = minimumX; x <= maximumX; x++)
+        {
+            if (!_world.IsSolidForCollision(x, supportY, z)) continue;
+            supportChunks.Add(ChunkCoordinate.FromVoxel(x, z));
+        }
+
+        foreach (ChunkCoordinate chunk in supportChunks)
+        {
+            bool ready = _staticChunks.ContainsKey(chunk) &&
+                         !_partiallyEvictedStaticChunks.Contains(chunk) &&
+                         !_dirtyChunks.Contains(chunk);
+            if (ready) continue;
+            if (!_dirtyChunks.Contains(chunk)) MarkChunkDirty(chunk, urgent: true);
+            else _urgentDirtyChunks.Add(chunk);
+            return false;
+        }
+        return true;
+    }
+
+    private void OnPhysicsGridTopologyChanged(PhysicsGrid? grid)
+    {
+        // Deformable/kinematic systems own their bodies and can update render
+        // topology every simulation step. Only rigid topology, collection changes,
+        // or an explicit ownership transition requires a BEPU body-list rebuild.
+        if (grid is null || (!grid.IsDeformable && !grid.IsKinematicController))
+            _dynamicTopologyDirty = true;
+    }
+
+    private void ApplyExternalGridMotions()
+    {
+        // Gameplay impulses are authored on PhysicsGrid so soft bodies and rigid bodies
+        // share one API. Push only new externally-authored motion into BEPU; ordinary
+        // BEPU-to-grid synchronization leaves MotionVersion untouched and cannot form a
+        // feedback loop.
+        foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
+        {
+            if (!_dynamicBodies.TryGetValue(grid.Id, out DynamicBody entry) ||
+                entry.MotionVersion == grid.MotionVersion) continue;
+            BodyReference body = _simulation.Bodies[entry.Handle];
+            body.Velocity = new BodyVelocity(grid.LinearVelocity, grid.AngularVelocity);
+            body.Awake = true;
+            _dynamicBodies[grid.Id] = entry with { MotionVersion = grid.MotionVersion };
         }
     }
 
     private void ReconcileAnalyticSphereBodies()
     {
-        HashSet<ulong> live = _world.AnalyticSpheres.Spheres.Select(sphere => sphere.Id).ToHashSet();
+        HashSet<ulong> live = _world.AnalyticSpheres.Spheres
+            .Where(sphere => !sphere.IsKinematic)
+            .Select(sphere => sphere.Id)
+            .ToHashSet();
         foreach (ulong id in _analyticSphereBodies.Keys.Where(id => !live.Contains(id)).ToArray())
             RemoveAnalyticSphere(id);
         foreach (AnalyticSphere sphere in _world.AnalyticSpheres.Spheres)
         {
+            if (sphere.IsKinematic) continue;
             if (_analyticSphereBodies.ContainsKey(sphere.Id)) continue;
             if (!IsAnalyticSphereSupportReady(sphere)) continue;
             CreateAnalyticSphere(sphere);
@@ -286,7 +668,8 @@ public sealed class BepuPhysicsBackend : IDisposable
                 BodyReference sleepingBody = _simulation.Bodies[boxHandle];
                 sleepingBody.Awake = false;
             }
-            _dynamicBodies[grid.Id] = new DynamicBody(boxHandle, boxShape, centerOffset, signature);
+            _dynamicBodies[grid.Id] = new DynamicBody(
+                boxHandle, boxShape, centerOffset, signature, grid.MotionVersion);
             return;
         }
 
@@ -311,7 +694,7 @@ public sealed class BepuPhysicsBackend : IDisposable
             BodyReference sleepingBody = _simulation.Bodies[handle];
             sleepingBody.Awake = false;
         }
-        _dynamicBodies[grid.Id] = new DynamicBody(handle, shape, center, signature);
+        _dynamicBodies[grid.Id] = new DynamicBody(handle, shape, center, signature, grid.MotionVersion);
     }
 
     private static ContinuousDetection CollisionDetectionFor(PhysicsGrid grid)
@@ -326,19 +709,148 @@ public sealed class BepuPhysicsBackend : IDisposable
             : ContinuousDetection.Passive;
     }
 
-    private void SynchronizeGrids()
+    private void SynchronizeGrids(float simulatedSeconds)
     {
         bool changed = false;
+        List<ulong>? newlyVirtualized = null;
         foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
         {
             if (!_dynamicBodies.TryGetValue(grid.Id, out DynamicBody entry)) continue;
             BodyReference body = _simulation.Bodies[entry.Handle];
+            bool wasSleeping = grid.IsSleeping;
+            if (grid.IsDebrisFragment && body.Awake && simulatedSeconds > 0f)
+            {
+                float linearSpeedSquared = body.Velocity.Linear.LengthSquared();
+                float angularSpeedSquared = body.Velocity.Angular.LengthSquared();
+                if (linearSpeedSquared <= DebrisQuietLinearSpeed * DebrisQuietLinearSpeed &&
+                    angularSpeedSquared <= DebrisQuietAngularSpeed * DebrisQuietAngularSpeed)
+                {
+                    float quietSeconds = _debrisQuietSeconds.GetValueOrDefault(grid.Id) + simulatedSeconds;
+                    if (quietSeconds >= DebrisQuietSleepSeconds)
+                    {
+                        body.Velocity = default;
+                        body.Awake = false;
+                        _debrisQuietSeconds.Remove(grid.Id);
+                    }
+                    else
+                    {
+                        _debrisQuietSeconds[grid.Id] = quietSeconds;
+                    }
+                }
+                else
+                {
+                    _debrisQuietSeconds.Remove(grid.Id);
+                }
+            }
+            if (!grid.IsDebrisFragment && !body.Awake &&
+                TryGetPrecariousRestTipAxis(grid, out Vector3 tipAxis))
+            {
+                // A mathematically exact edge or corner balance can make a voxel body
+                // sleep forever even though the equilibrium is physically unstable.
+                // Wake it with a very small deterministic angular perturbation. Face
+                // supported bodies are excluded, so ordinary resting grids stay asleep.
+                BodyVelocity velocity = body.Velocity;
+                velocity.Angular += tipAxis * 0.16f;
+                body.Velocity = velocity;
+                body.Awake = true;
+            }
             Quaternion orientation = body.Pose.Orientation;
             Vector3 gridPosition = body.Pose.Position - Vector3.Transform(entry.CenterOffset, orientation);
             changed |= grid.SetPhysicsState(
                 gridPosition, orientation, body.Velocity.Linear, body.Velocity.Angular, !body.Awake);
+            if (wasSleeping != grid.IsSleeping)
+                _world.PhysicsGrids.NotifyGeometryMembershipChanged();
+            if (ShouldVirtualizeDebris(grid))
+                (newlyVirtualized ??= new List<ulong>()).Add(grid.Id);
         }
+        // A sleeping shard remains a complete selectable/renderable world entity, but
+        // it no longer consumes a BEPU compound body. It is re-created on demand when
+        // an impact wakes it. This is the difference between virtualising a settled
+        // 100k-piece pile and deleting/fading the pieces as an "optimization".
+        if (newlyVirtualized is not null)
+            foreach (ulong id in newlyVirtualized)
+            {
+                if (_world.PhysicsGrids.Get(id) is PhysicsGrid grid)
+                    _world.PhysicsGrids.SetCollisionVirtualized(grid, virtualized: true);
+                RemoveDynamic(id);
+            }
         if (changed) _world.PhysicsGrids.NotifyChanged();
+    }
+
+    private static bool ShouldVirtualizeDebris(PhysicsGrid grid) =>
+        grid.IsDebrisFragment && grid.IsSleeping;
+
+    private bool TryGetPrecariousRestTipAxis(PhysicsGrid grid, out Vector3 axis)
+    {
+        axis = Vector3.Zero;
+        Vector3 worldX = Vector3.Transform(Vector3.UnitX, grid.Orientation);
+        Vector3 worldY = Vector3.Transform(Vector3.UnitY, grid.Orientation);
+        Vector3 worldZ = Vector3.Transform(Vector3.UnitZ, grid.Orientation);
+        float faceAlignment = MathF.Max(
+            MathF.Abs(worldX.Y),
+            MathF.Max(MathF.Abs(worldY.Y), MathF.Abs(worldZ.Y)));
+        if (faceAlignment >= 0.985f) return false;
+
+        int supportCount = 0;
+        Vector2 supportSum = Vector2.Zero;
+        Vector2 supportMinimum = new(float.PositiveInfinity);
+        Vector2 supportMaximum = new(float.NegativeInfinity);
+        foreach (PhysicsGridCollisionElement element in grid.CollisionElements)
+        {
+            for (int z = 0; z <= 1; z++)
+            for (int y = 0; y <= 1; y++)
+            for (int x = 0; x <= 1; x++)
+            {
+                Vector3 localCorner = new(
+                    x == 0 ? element.Minimum.X : element.Maximum.X,
+                    y == 0 ? element.Minimum.Y : element.Maximum.Y,
+                    z == 0 ? element.Minimum.Z : element.Maximum.Z);
+                Vector3 worldCorner = grid.LocalToWorld(localCorner);
+                if (!HasStaticSupportImmediatelyBelow(worldCorner)) continue;
+                Vector2 point = new(worldCorner.X, worldCorner.Z);
+                supportSum += point;
+                supportMinimum = Vector2.Min(supportMinimum, point);
+                supportMaximum = Vector2.Max(supportMaximum, point);
+                supportCount++;
+            }
+        }
+
+        if (supportCount == 0) return false;
+        Vector2 supportSpan = supportMaximum - supportMinimum;
+        // A real face contact has area in both horizontal dimensions. A point or
+        // line contact is deliberately left possible, but cannot remain asleep
+        // indefinitely without an external brace.
+        if (supportSpan.X >= 0.20f && supportSpan.Y >= 0.20f) return false;
+
+        Vector2 supportCenter = supportSum / supportCount;
+        Vector3 radial = new(
+            grid.Position.X - supportCenter.X,
+            0f,
+            grid.Position.Z - supportCenter.Y);
+        if (radial.LengthSquared() > 0.0004f)
+        {
+            axis = Vector3.Normalize(Vector3.Cross(radial, -Vector3.UnitY));
+            return true;
+        }
+
+        float sign = (grid.Id & 1UL) == 0 ? 1f : -1f;
+        axis = supportSpan.Y > supportSpan.X
+            ? Vector3.UnitZ * sign
+            : Vector3.UnitX * sign;
+        return true;
+    }
+
+    private bool HasStaticSupportImmediatelyBelow(Vector3 point)
+    {
+        int y = (int)MathF.Floor(point.Y - 0.035f);
+        for (int offsetX = -1; offsetX <= 1; offsetX++)
+        for (int offsetZ = -1; offsetZ <= 1; offsetZ++)
+        {
+            int x = (int)MathF.Floor(point.X + offsetX * 0.025f);
+            int z = (int)MathF.Floor(point.Z + offsetZ * 0.025f);
+            if (_world.IsCollidableMaterial(_world.GetBlockId(x, y, z))) return true;
+        }
+        return false;
     }
 
     private void SynchronizeAnalyticSpheres()
@@ -564,6 +1076,7 @@ public sealed class BepuPhysicsBackend : IDisposable
 
     private void RemoveDynamic(ulong id)
     {
+        _debrisQuietSeconds.Remove(id);
         if (!_dynamicBodies.Remove(id, out DynamicBody entry)) return;
         _simulation.Bodies.Remove(entry.Handle);
         _simulation.Shapes.Remove(entry.Shape);
@@ -596,9 +1109,62 @@ public sealed class BepuPhysicsBackend : IDisposable
         bool oldCollidable = _world.IsCollidableMaterial(change.OldBlockId);
         bool newCollidable = _world.IsCollidableMaterial(change.NewBlockId);
         if (oldCollidable == newCollidable) return;
+        WakeBodiesAffectedByStaticEdit(change.X, change.Y, change.Z);
         MarkChunkDirty(change.X, change.Z, urgent: true);
     }
-    private void OnMicroVoxelCellChanged(int x, int y, int z) => MarkChunkDirty(x, z, urgent: true);
+    private void OnMicroVoxelCellChanged(int x, int y, int z)
+    {
+        WakeBodiesAffectedByStaticEdit(x, y, z);
+        MarkChunkDirty(x, z, urgent: true);
+    }
+
+    /// <summary>
+    /// BEPU can legitimately put a supported structure to sleep. Removing the voxel
+    /// that supplied that support does not itself touch the dynamic body, so without
+    /// an explicit wake the old sleeping state can survive after the static collider
+    /// has gone and leave a real rigid body suspended in air. Limit the wake to bodies
+    /// whose world bounds touch the edited cell; settled shard piles remain virtualized.
+    /// </summary>
+    private void WakeBodiesAffectedByStaticEdit(int x, int y, int z)
+    {
+        const float contactMargin = 0.12f;
+        Vector3 editMinimum = new(x - contactMargin, y - contactMargin, z - contactMargin);
+        Vector3 editMaximum = new(x + 1f + contactMargin, y + 1f + contactMargin, z + 1f + contactMargin);
+        bool gridMembershipChanged = false;
+        foreach ((ulong id, DynamicBody entry) in _dynamicBodies)
+        {
+            PhysicsGrid? grid = _world.PhysicsGrids.Get(id);
+            if (grid is null || grid.IsDebrisFragment || !grid.IsSleeping) continue;
+            (Vector3 minimum, Vector3 maximum) = grid.CalculateWorldBounds();
+            if (!BoundsOverlap(minimum, maximum, editMinimum, editMaximum)) continue;
+            BodyReference body = _simulation.Bodies[entry.Handle];
+            body.Awake = true;
+            grid.Wake();
+            gridMembershipChanged = true;
+        }
+        if (gridMembershipChanged) _world.PhysicsGrids.NotifyGeometryMembershipChanged();
+
+        bool sphereChanged = false;
+        foreach ((ulong id, AnalyticSphereBody entry) in _analyticSphereBodies)
+        {
+            AnalyticSphere? sphere = _world.AnalyticSpheres.Get(id);
+            if (sphere is null || !sphere.IsSleeping) continue;
+            Vector3 radius = new(sphere.Radius);
+            if (!BoundsOverlap(sphere.Center - radius, sphere.Center + radius, editMinimum, editMaximum))
+                continue;
+            BodyReference body = _simulation.Bodies[entry.Handle];
+            body.Awake = true;
+            sphere.IsSleeping = false;
+            sphereChanged = true;
+        }
+        if (sphereChanged) _world.AnalyticSpheres.NotifyChanged();
+    }
+
+    private static bool BoundsOverlap(
+        Vector3 minimum, Vector3 maximum, Vector3 otherMinimum, Vector3 otherMaximum) =>
+        minimum.X <= otherMaximum.X && maximum.X >= otherMinimum.X &&
+        minimum.Y <= otherMaximum.Y && maximum.Y >= otherMinimum.Y &&
+        minimum.Z <= otherMaximum.Z && maximum.Z >= otherMinimum.Z;
     private void OnWorldReloaded()
     {
         // A fractional step belongs to the old world. Never carry it across a load or
@@ -616,6 +1182,7 @@ public sealed class BepuPhysicsBackend : IDisposable
         _colliderDirtyCounts.Clear();
         _colliderEpoch++;
         _colliderResidencySignature = int.MinValue;
+        _dynamicTopologyDirty = true;
         MarkAllStaticDirty();
     }
 
@@ -685,8 +1252,10 @@ public sealed class BepuPhysicsBackend : IDisposable
         hash.Add(ChunkCoordinate.FromVoxel(
             (int)MathF.Floor(_simulationFocus.X),
             (int)MathF.Floor(_simulationFocus.Z)));
-        foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
+        foreach (ulong gridId in _dynamicBodies.Keys)
         {
+            PhysicsGrid? grid = _world.PhysicsGrids.Get(gridId);
+            if (grid is null) continue;
             (Vector3 minimum, Vector3 maximum) = grid.CalculateWorldBounds();
             hash.Add(grid.Id);
             hash.Add(ChunkCoordinate.FromVoxel((int)MathF.Floor(minimum.X), (int)MathF.Floor(minimum.Z)));
@@ -710,8 +1279,10 @@ public sealed class BepuPhysicsBackend : IDisposable
         if (Math.Max(Math.Abs(chunk.X - focus.X), Math.Abs(chunk.Z - focus.Z)) <=
             PlayerColliderRadiusChunks) return true;
 
-        foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
+        foreach (ulong gridId in _dynamicBodies.Keys)
         {
+            PhysicsGrid? grid = _world.PhysicsGrids.Get(gridId);
+            if (grid is null) continue;
             (Vector3 minimum, Vector3 maximum) = grid.CalculateWorldBounds();
             ChunkCoordinate first = ChunkCoordinate.FromVoxel(
                 (int)MathF.Floor(minimum.X) - ChunkCoordinate.Size,
@@ -806,12 +1377,18 @@ public sealed class BepuPhysicsBackend : IDisposable
         _world.WorldReloaded -= OnWorldReloaded;
         _world.ChunkGenerated -= OnChunkGenerated;
         _world.BlockDefinitionsChanged -= OnBlockDefinitionsChanged;
+        _world.PhysicsGrids.TopologyChanged -= OnPhysicsGridTopologyChanged;
         _simulation.Dispose();
         _dispatcher.Dispose();
         _pool.Clear();
     }
 
-    private readonly record struct DynamicBody(BodyHandle Handle, TypedIndex Shape, Vector3 CenterOffset, int Signature);
+    private readonly record struct DynamicBody(
+        BodyHandle Handle,
+        TypedIndex Shape,
+        Vector3 CenterOffset,
+        int Signature,
+        int MotionVersion);
     private readonly record struct AnalyticSphereBody(BodyHandle Handle, TypedIndex Shape);
     private readonly record struct StaticBody(StaticHandle Handle, TypedIndex Shape);
     private sealed record ColliderBuildJob(

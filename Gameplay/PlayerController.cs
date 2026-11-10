@@ -75,12 +75,11 @@ public sealed class PlayerController
         if (FlightMode || NoClip)
         {
             IsCrouching = false;
-            // Flight translation uses stable world axes. Looking up, down or to
-            // either side must not rotate W/A/S/D movement.
-            Vector3 flyForward = -Vector3.UnitZ;
-            Vector3 flyRight = Vector3.UnitX;
+            // Flight keeps the same camera-relative horizontal controls as walking.
+            // Pitch only affects where the player looks; Space/Shift own the vertical
+            // axis so looking up cannot accidentally turn W into an ascend control.
             float verticalInput = (jump ? 1f : 0f) - (descend ? 1f : 0f);
-            Vector3 flyMotion = flyForward * moveInput.Y + flyRight * moveInput.X + Vector3.UnitY * verticalInput;
+            Vector3 flyMotion = desired + Vector3.UnitY * verticalInput;
             if (flyMotion.LengthSquared() > 1f) flyMotion = Vector3.Normalize(flyMotion);
             float flySpeed = sprint ? 18f : 8f;
             Vector3 displacement = flyMotion * flySpeed * deltaTime;
@@ -207,12 +206,21 @@ public sealed class PlayerController
         Vector3 direction = FindHorizontalEscapeDirection();
         if (direction.LengthSquared() < 0.5f)
         {
-            // Vertical correction is a last resort only. It remains rate-limited, so a
-            // completely boxed-in player can still escape without being teleported.
-            Vector3 fallback = correction / correctionLength;
-            direction = fallback.Y > 0.1f && IsStaticSafe(Position - Vector3.UnitY * 0.1f)
-                ? -Vector3.UnitY
-                : fallback;
+            // A wide falling structure may cover more than the 2.4 m complete-escape
+            // search radius. Keep making bounded progress toward the nearest side. An
+            // upward MTV would otherwise carry the player all the way through the body
+            // and deposit them on its roof, which looks like a teleport rather than a
+            // collision response.
+            direction = FindLeastPenetratingHorizontalDirection();
+        }
+        if (direction.LengthSquared() < 0.5f)
+        {
+            Vector3 horizontal = new(correction.X, 0f, correction.Z);
+            direction = horizontal.LengthSquared() > 0.000001f
+                ? Vector3.Normalize(horizontal)
+                : _externalPushDirection.LengthSquared() > 0.5f
+                    ? _externalPushDirection
+                    : Vector3.UnitX;
         }
         _externalPushDirection = direction;
         // This is an anti-stuck recovery, not collision impulse transfer. A fast Grid
@@ -258,6 +266,35 @@ public sealed class PlayerController
                 }
                 break;
             }
+        }
+        return best;
+    }
+
+    private Vector3 FindLeastPenetratingHorizontalDirection()
+    {
+        Vector3[] directions =
+        {
+            Vector3.UnitX, -Vector3.UnitX, Vector3.UnitZ, -Vector3.UnitZ,
+            Vector3.Normalize(Vector3.UnitX + Vector3.UnitZ),
+            Vector3.Normalize(Vector3.UnitX - Vector3.UnitZ),
+            Vector3.Normalize(-Vector3.UnitX + Vector3.UnitZ),
+            Vector3.Normalize(-Vector3.UnitX - Vector3.UnitZ),
+        };
+        Vector3 best = Vector3.Zero;
+        float bestScore = float.PositiveInfinity;
+        foreach (Vector3 direction in directions)
+        {
+            Vector3 candidate = Position + direction * 0.1f;
+            if (!IsStaticSafe(candidate)) continue;
+            float score = _world.PhysicsGrids.TryCalculatePlayerPenetration(
+                BoundsMin(candidate), BoundsMax(candidate), out Vector3 candidateCorrection, out _)
+                ? candidateCorrection.LengthSquared()
+                : 0f;
+            if (_externalPushDirection.LengthSquared() > 0.5f &&
+                Vector3.Dot(direction, _externalPushDirection) > 0.98f) score -= 0.0001f;
+            if (score >= bestScore) continue;
+            bestScore = score;
+            best = direction;
         }
         return best;
     }
@@ -319,8 +356,10 @@ public sealed class PlayerController
         for (int x = minX; x <= maxX; x++)
         {
             _collisionBoxes.Clear();
-            if (includeDynamicGrids) _world.GetCollisionBoxes(x, y, z, _collisionBoxes);
-            else _world.GetStaticCollisionBoxes(x, y, z, _collisionBoxes);
+            // Dynamic grids are resolved once from their actual oriented/deformed
+            // geometry below. Feeding their broad-phase AABBs through this voxel loop
+            // creates invisible vertical steps along an otherwise smooth bent strip.
+            _world.GetStaticCollisionBoxes(x, y, z, _collisionBoxes);
             foreach (VoxelAabb box in _collisionBoxes)
             {
                 if (!box.Intersects(minimum, maximum)) continue;
@@ -353,6 +392,61 @@ public sealed class PlayerController
                         ? MathF.Min(candidate.Z, box.Minimum.Z - Radius)
                         : MathF.Max(candidate.Z, box.Maximum.Z + Radius);
                 }
+            }
+        }
+
+        if (includeDynamicGrids)
+        {
+            for (int iteration = 0; iteration < 4; iteration++)
+            {
+                minimum = BoundsMin(candidate);
+                maximum = BoundsMax(candidate);
+                if (!_world.PhysicsGrids.TryCalculatePlayerPenetration(
+                        minimum, maximum, out Vector3 correction, out _)) break;
+                collided = true;
+
+                if (axis == 1)
+                {
+                    bool landing = amount < 0f && correction.Y > 0.00001f;
+                    bool hittingCeiling = amount > 0f && correction.Y < -0.00001f;
+                    if (!landing && !hittingCeiling)
+                    {
+                        candidate.Y -= amount;
+                        break;
+                    }
+                    candidate.Y += correction.Y;
+                    if (landing)
+                    {
+                        LastLandingSpeed = MathF.Max(LastLandingSpeed, -_verticalVelocity);
+                        LandedThisFrame = LastLandingSpeed > 0f;
+                        IsGrounded = true;
+                    }
+                    _verticalVelocity = 0f;
+                    continue;
+                }
+
+                // A small upward-only correction is the walkable skin of a bent cell.
+                // Preserve the requested horizontal displacement and step onto the
+                // continuous surface. Walls/undersides instead block the active axis.
+                if (correction.Y > 0.00001f && correction.Y <= 0.461f)
+                {
+                    candidate.Y += correction.Y;
+                    IsGrounded = true;
+                    _verticalVelocity = MathF.Max(0f, _verticalVelocity);
+                    continue;
+                }
+
+                float alongAxis = axis == 0 ? correction.X : correction.Z;
+                if (MathF.Abs(alongAxis) < 0.00001f || MathF.Sign(alongAxis) == MathF.Sign(amount))
+                {
+                    candidate = axis == 0
+                        ? candidate with { X = candidate.X - amount }
+                        : candidate with { Z = candidate.Z - amount };
+                    break;
+                }
+                candidate = axis == 0
+                    ? candidate with { X = candidate.X + alongAxis }
+                    : candidate with { Z = candidate.Z + alongAxis };
             }
         }
 

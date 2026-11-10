@@ -31,22 +31,58 @@ layout(location = 4) out vec4 gMotion;
 const int TILE_SIZE = 16;
 const int TILES_PER_ROW = 128;
 
+uint materialVariantHash()
+{
+    ivec2 uvTile = ivec2(floor(vUv));
+    uint value = uint(vCell.x + uvTile.x) * 0x8da6b343u;
+    value ^= uint(vCell.y + vCell.z + uvTile.y) * 0xd8163841u;
+    value ^= uint(vMaterial) * 0xcb1ab31fu;
+    value ^= uint(vFace) * 0x165667b1u;
+    value ^= value >> 15;
+    value *= 0x2c1b3c6du;
+    return value ^ (value >> 12);
+}
+
+vec2 rotateMaterialUv(vec2 value, uint rotation)
+{
+    if (rotation == 1u) return vec2(value.y, 1.0 - value.x);
+    if (rotation == 2u) return vec2(1.0) - value;
+    if (rotation == 3u) return vec2(1.0 - value.y, value.x);
+    return value;
+}
+
+ivec2 rotateMaterialOffset(ivec2 value, uint rotation)
+{
+    if (rotation == 1u) return ivec2(value.y, -value.x);
+    if (rotation == 2u) return -value;
+    if (rotation == 3u) return ivec2(-value.y, value.x);
+    return value;
+}
+
+ivec2 materialPixel(ivec2 offset)
+{
+    uint variant = materialVariantHash();
+    uint rotation = variant & 3u;
+    vec2 localUv = rotateMaterialUv(fract(vUv), rotation);
+    ivec2 shift = ivec2(int((variant >> 8) & 15u), int((variant >> 16) & 15u));
+    ivec2 pixel = ivec2(floor(localUv * float(TILE_SIZE))) + shift +
+        rotateMaterialOffset(offset, rotation);
+    return ivec2((pixel.x % TILE_SIZE + TILE_SIZE) % TILE_SIZE,
+                 (pixel.y % TILE_SIZE + TILE_SIZE) % TILE_SIZE);
+}
+
 vec3 atlasColor()
 {
     int tile = vMaterial * 3 + vFace;
     ivec2 origin = ivec2((tile % TILES_PER_ROW) * TILE_SIZE, (tile / TILES_PER_ROW) * TILE_SIZE);
-    ivec2 pixel = clamp(ivec2(floor(fract(vUv) * float(TILE_SIZE))), ivec2(0), ivec2(TILE_SIZE - 1));
-    return texelFetch(uMaterialAtlas, origin + pixel, 0).rgb;
+    return texelFetch(uMaterialAtlas, origin + materialPixel(ivec2(0)), 0).rgb;
 }
 
 vec2 atlasDetail(ivec2 offset)
 {
     int tile = vMaterial * 3 + vFace;
     ivec2 origin = ivec2((tile % TILES_PER_ROW) * TILE_SIZE, (tile / TILES_PER_ROW) * TILE_SIZE);
-    ivec2 pixel = clamp(
-        ivec2(floor(fract(vUv) * float(TILE_SIZE))) + offset,
-        ivec2(0), ivec2(TILE_SIZE - 1));
-    return texelFetch(uMaterialDetailAtlas, origin + pixel, 0).rg;
+    return texelFetch(uMaterialDetailAtlas, origin + materialPixel(offset), 0).rg;
 }
 
 vec3 safeNormalize(vec3 value, vec3 fallback)

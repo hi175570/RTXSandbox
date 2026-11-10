@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "id": "rtxsandbox.base.physics_tools",
+  "name": "Physics Materials and Tools",
+  "version": "2.0.0",
+  "blocks": [
+    { "id": 204, "key": "rtxsandbox:gel", "displayName": "透明凝膠", "category": "物理 / 軟體", "tags": ["soft-body", "physics", "gel", "elastic"], "albedo": [0.12,0.62,0.95], "roughness": 0.16, "metallic": 0.0, "density": 1.05, "isTransparent": true, "transmission": 0.62, "indexOfRefraction": 1.37, "hardnessSeconds": 0.30, "surfacePattern": "Grid", "soundSet": "slime", "particleEffect": "soft" },
+    { "id": 205, "key": "rtxsandbox:rubber", "displayName": "彈性橡膠", "category": "物理 / 軟體", "tags": ["soft-body", "physics", "rubber", "elastic"], "albedo": [0.88,0.06,0.08], "roughness": 0.42, "metallic": 0.0, "density": 1.35, "hardnessSeconds": 0.38, "surfacePattern": "Fabric", "soundSet": "slime", "particleEffect": "soft" },
+    { "id": 206, "key": "rtxsandbox:foam", "displayName": "柔軟泡棉", "category": "物理 / 軟體", "tags": ["soft-body", "physics", "foam", "elastic"], "albedo": [0.95,0.72,0.16], "roughness": 0.91, "metallic": 0.0, "density": 0.35, "hardnessSeconds": 0.20, "textureGenerator": "foam", "textureVariation": 0.48, "surfacePattern": "Fabric", "soundSet": "wool", "particleEffect": "soft" },
+    { "id": 207, "key": "rtxsandbox:animation_controller", "displayName": "動畫控制器", "category": "控制 / 動畫", "tags": ["animation-controller", "controller", "physics", "tech"], "albedo": [0.055,0.20,0.30], "roughness": 0.34, "metallic": 0.46, "density": 2.40, "surfacePattern": "Circuit", "emission": [0.02,0.22,0.42], "soundSet": "machine" },
+    { "id": 209, "key": "rtxsandbox:energy_projector", "displayName": "創造物理槍", "category": "物理 / 工具", "tags": ["energy-projector", "physics-gun", "tool", "physics", "tech"], "albedo": [0.03,0.15,0.25], "roughness": 0.16, "metallic": 0.68, "density": 2.10, "surfacePattern": "Circuit", "emission": [0.05,0.72,1.80], "soundSet": "energy", "particleEffect": "energy_arc" }
+  ]
+}

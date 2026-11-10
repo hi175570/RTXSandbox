@@ -11,13 +11,17 @@ The current world remains a bounded, deterministic prototype. Infinite chunk str
 ```text
                           BepInEx plugins
                                 |
+                    direct RTXSandbox.dll calls
+                       and Harmony patches
                                 v
-Game systems -------> RTXSandbox.ModAPI <------- ModHost / BepInEx adapter
+                         Game systems
      |
      +-- Rendering/RenderBackendHost
      |      +-- Compute Path Tracing
      |      +-- PBR Forward Raster
      |      +-- Classic Raster
+     |      +-- Deferred / Hybrid Raster
+     |      +-- D3D12 DXR (Windows)
      |
      +-- World/VoxelWorld + generation presets
      +-- Gameplay/building + physics + player collision
@@ -25,7 +29,10 @@ Game systems -------> RTXSandbox.ModAPI <------- ModHost / BepInEx adapter
      +-- UI/Screens
 ```
 
-`RTXSandbox.ModAPI` targets `netstandard2.1` and does not reference OpenTK, ImGui, BepInEx or the game executable. BepInEx is the bundled loader and patching adapter; gameplay code communicates with mods through `ModHost` and the public API.
+There is intentionally no separate public Mod API or service locator. BepInEx is
+the bundled loader and HarmonyX is the interception layer. Plugins target the
+current game assembly directly; this keeps unrestricted hooks possible but gives
+no binary-compatibility promise across internal game updates.
 
 ## World storage
 
@@ -46,25 +53,31 @@ The main menu discovers only parseable world manifests (falling back to manifest
 | Compute Path Tracing | Available | Progressive GI, dielectric Fresnel reflections, transmission and micro-voxels on OpenGL compute |
 | PBR Forward | Available | Real-time mesh rendering, procedural atlas, sunlight, approximate sky reflection and transparency |
 | Classic | Available | Low-cost textured voxel rendering for editing and compatibility |
-| Hardware Ray Tracing | Planned/locked | Future DXR or Vulkan RT acceleration structures and shaders |
-| Deferred Lighting | Planned/locked | Future chunk meshes, GBuffer and lighting pass |
+| Hardware Ray Tracing | Windows available | D3D12 DXR BLAS/TLAS, shader table, ray generation/miss/closest-hit and analytic spheres |
+| Deferred Lighting | Available | MRT G-buffer, lighting, shadows, transparency and debug views |
+| Hybrid PBR Raster | Available | Deferred geometry plus reflection/ambient extensions; Android V1 includes screen-space reflection |
 
 All selectable backends must render ordinary voxels, precision geometry, material previews and the selection indicator. A catalog test prevents an unfinished backend from becoming selectable.
 
+Black holes deliberately split by renderer capability. Compute Path Tracing and D3D12 DXR integrate the primary null-ray approximation in adaptive world-space chords, query the actual voxel/TLAS scene on every chord, terminate captured rays at the event horizon, and intersect a world-space emissive accretion disk. Their final display pass disables the legacy screen-space lens, so distant geometry and analytic lights are genuinely sampled along the bent path. Raster backends retain an explicitly approximate analytic-sphere shader because they do not own a ray traversal loop; this approximation must never be described as hardware ray tracing or relativistic transport.
+
 PBR Forward and Classic own one GPU mesh per 16×16 horizontal chunk. Regular and precision-voxel edits rebuild only their owner and any face-neighbor chunk at the boundary. Bulk world/micro-volume loads still invalidate every loaded chunk. Moving Physics Grids use a separate dynamic mesh, so they never force the static terrain to be rebuilt.
 
-## Mod API layout
+## Engine contracts
 
 ```text
-RTXSandbox.ModAPI
-├── Blocks/BlockContracts.cs
-├── World/WorldContracts.cs
-├── Rendering/RenderContracts.cs
-├── Physics/PhysicsContracts.cs
-└── ModContracts.cs        (shared and legacy-compatible contracts)
+Engine/Contracts
+├── BlockContracts.cs
+├── WorldContracts.cs
+├── RenderContracts.cs
+├── PhysicsContracts.cs
+└── CoreContracts.cs
 ```
 
-Mods should prefer `IModContext.GetService<IRenderBackendService>()`, `IVoxelPhysicsService` and `IMicroVoxelService`. Referencing `RTXSandbox.dll` remains an intentional unrestricted escape hatch, and Harmony patches can still force private behavior changes.
+These contracts are game-internal shared interfaces compiled into
+`RTXSandbox.dll` (and linked into the Android host), not a standalone Mod SDK.
+Plugins reference the game and may use public members, reflection or Harmony
+patches directly.
 
 ## Next structural milestones
 
@@ -73,6 +86,6 @@ Mods should prefer `IModContext.GetService<IRenderBackendService>()`, `IVoxelPhy
 3. Move fluid state out of block identity into a sparse cell layer, then add flow and optical surface data.
 4. Split the remaining inventory, toolbox, world creation and settings code into `UI/Screens` controllers.
 5. Create a loader adapter project so the executable can run with a null loader or BepInEx without gameplay referencing loader packages.
-6. Add a render graph/resource lifetime layer before Deferred or native hardware RT.
+6. Add a render graph/resource lifetime layer before expanding the existing Deferred and DXR implementations.
 
 This order preserves the working game while removing coupling at boundaries that future features actually need.

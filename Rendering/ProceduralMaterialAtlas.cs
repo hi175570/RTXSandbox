@@ -1,5 +1,5 @@
 using System.Numerics;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.World;
 
 namespace RTXSandbox.Rendering;
@@ -29,6 +29,27 @@ public sealed class ProceduralMaterialAtlas
 
     public byte[] ColorPixels { get; } = new byte[Width * Height * 4];
     public byte[] DetailPixels { get; } = new byte[Width * Height * 2];
+    // Deliberately hand-drawn voxel art. Large connected value regions read as
+    // hammered iron; there are no panel borders, photographic grain, or random pixels.
+    private static readonly string[] ForgedIronPattern =
+    [
+        "2223222222332222",
+        "2234333223443222",
+        "2345443334454322",
+        "3455543345554333",
+        "3454432234543333",
+        "2333221223432222",
+        "2222112222322222",
+        "2221233332222112",
+        "2232344433221222",
+        "2343455544332232",
+        "2333445443322342",
+        "2223334332223452",
+        "2122223221233442",
+        "2221122212233332",
+        "2322222123343322",
+        "2223222222332222",
+    ];
 
     public ProceduralMaterialAtlas(BlockRegistry registry)
     {
@@ -204,10 +225,13 @@ public sealed class ProceduralMaterialAtlas
                 int row = y / 4;
                 int shiftedX = (x + (row & 1) * 2) % TileSize;
                 bool mortar = y % 4 == 0 || shiftedX % 8 == 0;
+                int distanceToHorizontalJoint = Math.Min(y % 4, 4 - y % 4);
+                int distanceToVerticalJoint = Math.Min(shiftedX % 8, 8 - shiftedX % 8);
+                float brickBevel = Math.Clamp(Math.Min(distanceToHorizontalJoint, distanceToVerticalJoint) / 2f, 0f, 1f);
                 color = mortar
                     ? new Vector3(0.31f, 0.3f, 0.285f)
                     : Vary(definition.Albedo, broad, variation);
-                height = mortar ? 0.26f : 0.58f + (fine - 0.5f) * 0.07f;
+                height = mortar ? 0.18f : 0.48f + brickBevel * 0.24f + (fine - 0.5f) * 0.07f;
                 roughness = mortar ? 0.96f : roughness;
                 break;
 
@@ -227,8 +251,11 @@ public sealed class ProceduralMaterialAtlas
 
             case "tiles":
                 bool grout = x % 8 == 0 || y % 8 == 0;
+                int tileDx = Math.Min(x % 8, 8 - x % 8);
+                int tileDy = Math.Min(y % 8, 8 - y % 8);
+                float tileBevel = Math.Clamp(Math.Min(tileDx, tileDy) / 2f, 0f, 1f);
                 color = grout ? definition.Albedo * 0.3f : Vary(definition.Albedo, broad, variation * 0.55f);
-                height = grout ? 0.25f : 0.58f;
+                height = grout ? 0.20f : 0.48f + tileBevel * 0.22f;
                 roughness = grout ? MathF.Max(roughness, 0.9f) : roughness;
                 break;
 
@@ -251,6 +278,193 @@ public sealed class ProceduralMaterialAtlas
                 roughness = trace ? 0.22f : roughness;
                 break;
 
+            case "brushed_metal":
+                float brushLine = MathF.Sin((face == MaterialFace.Side ? v : u) * MathF.PI * 38f + broad * 1.4f);
+                float brushScratch = Noise(seed ^ 0xe19b01a5u, face == MaterialFace.Side ? y : x, 0, 211);
+                color = definition.Albedo * (0.91f + brushLine * 0.045f + (fine - 0.5f) * 0.035f);
+                height = 0.5f + brushLine * 0.055f + (brushScratch - 0.5f) * 0.025f;
+                roughness = Math.Clamp(definition.Roughness + MathF.Abs(brushLine) * 0.055f, 0.04f, 0.82f);
+                break;
+
+            case "hammered_metal":
+                float hammerCell = OctaveNoise(seed ^ 0x8da6b343u, x / 2, y / 2, 223);
+                float hammerPit = SmoothStep(0.58f, 0.92f, hammerCell);
+                color = definition.Albedo * (0.82f + broad * 0.25f - hammerPit * 0.12f);
+                height = 0.58f - hammerPit * 0.34f + (fine - 0.5f) * 0.035f;
+                roughness = Math.Clamp(definition.Roughness + hammerPit * 0.14f, 0.08f, 0.9f);
+                break;
+
+            case "cast_metal":
+                float castPore = Noise(seed ^ 0xa24baed5u, x, y, 239);
+                float castShape = OctaveNoise(seed ^ 0x9fb21c65u, x, y, 241);
+                bool deepPore = castPore > 0.91f;
+                color = definition.Albedo * (0.80f + castShape * 0.30f) * (deepPore ? 0.62f : 1f);
+                height = 0.43f + castShape * 0.24f - (deepPore ? 0.22f : 0f);
+                roughness = Math.Clamp(definition.Roughness + (castPore - 0.5f) * 0.13f, 0.12f, 0.95f);
+                break;
+
+            case "forged_iron_pixel":
+                int ironValue = ForgedIronPattern[y][x] - '0';
+                float ironTone = ironValue switch
+                {
+                    1 => 0.72f,
+                    2 => 0.89f,
+                    3 => 1.00f,
+                    4 => 1.10f,
+                    _ => 1.18f,
+                };
+                color = definition.Albedo * ironTone;
+                height = ironValue switch
+                {
+                    1 => 0.36f,
+                    2 => 0.46f,
+                    3 => 0.54f,
+                    4 => 0.62f,
+                    _ => 0.68f,
+                };
+                roughness = Math.Clamp(definition.Roughness + (3 - ironValue) * 0.025f, 0.26f, 0.46f);
+                break;
+
+            case "hazard_stripes":
+                int stripePhase = (x + y) & 7;
+                bool yellowStripe = stripePhase < 4;
+                bool stripeHighlight = stripePhase is 0 or 4;
+                color = yellowStripe
+                    ? definition.Albedo * (stripeHighlight ? 1.12f : 0.96f)
+                    : new Vector3(stripeHighlight ? 0.105f : 0.052f, 0.055f, 0.038f);
+                height = stripeHighlight ? 0.57f : yellowStripe ? 0.53f : 0.47f;
+                roughness = yellowStripe ? 0.45f : 0.52f;
+                break;
+
+            case "industrial_tread_plate":
+                // One continuous steel sheet with alternating raised anti-slip
+                // treads. There is intentionally no per-voxel frame or grout line.
+                int treadX = x & 7;
+                int treadY = y & 7;
+                bool forwardTread = (treadX == 1 && treadY == 1) ||
+                                    (treadX == 2 && treadY == 2);
+                bool backwardTread = (treadX == 6 && treadY == 5) ||
+                                     (treadX == 5 && treadY == 6);
+                bool tread = forwardTread || backwardTread;
+                bool treadBevel = !tread && (
+                    (treadX == 0 && treadY == 1) || (treadX == 1 && treadY == 2) ||
+                    (treadX == 2 && treadY == 3) || (treadX == 7 && treadY == 5) ||
+                    (treadX == 6 && treadY == 6) || (treadX == 5 && treadY == 7));
+                float plateTone = ((treadX + treadY) & 1) == 0 ? 0.68f : 0.65f;
+                color = tread
+                    ? definition.Albedo * 1.30f
+                    : treadBevel ? definition.Albedo * 0.91f : definition.Albedo * plateTone;
+                height = tread ? 0.72f : treadBevel ? 0.56f : 0.42f;
+                roughness = tread ? 0.25f : treadBevel ? 0.31f : 0.39f;
+                break;
+
+            case "foam":
+                // Clustered open-cell pores read as sponge/foam; the former panel
+                // generator made a soft block look like a folded machine casing.
+                float poreField = OctaveNoise(seed ^ 0x4cf5ad43u, x * 2, y * 2, 271);
+                float poreSeed = Noise(seed ^ 0x632be5abu, x, y, 277);
+                float pore = SmoothStep(0.70f, 0.91f, poreField * 0.62f + poreSeed * 0.38f);
+                float foamCell = MathF.Sin((u + broad * 0.08f) * MathF.PI * 18f) *
+                                 MathF.Sin((v - broad * 0.06f) * MathF.PI * 20f);
+                color = Vary(definition.Albedo, broad, variation * 0.20f) *
+                        (pore > 0.02f ? 0.34f : 0.96f + foamCell * 0.035f);
+                height = Math.Clamp(0.58f + foamCell * 0.08f - pore * 0.46f, 0.06f, 0.76f);
+                roughness = Math.Clamp(definition.Roughness + pore * 0.07f, 0.82f, 1f);
+                break;
+
+            case "polished_metal":
+                float polishWave = MathF.Sin((u * 0.77f + v * 0.21f) * MathF.PI * 21f + broad * 0.65f);
+                color = definition.Albedo * (0.975f + polishWave * 0.018f);
+                height = 0.5f + polishWave * 0.012f;
+                roughness = Math.Clamp(definition.Roughness + MathF.Abs(polishWave) * 0.012f, 0.008f, 0.22f);
+                break;
+
+            case "motor":
+                float motorX = u - 0.5f;
+                float motorY = v - 0.5f;
+                float motorRadius = MathF.Sqrt(motorX * motorX + motorY * motorY);
+                bool motorVent = face == MaterialFace.Side && y is >= 4 and <= 11 && (x & 3) == 1;
+                bool motorHub = motorRadius < 0.18f;
+                color = motorVent
+                    ? new Vector3(0.025f, 0.03f, 0.035f)
+                    : motorHub
+                        ? new Vector3(0.72f, 0.38f, 0.09f)
+                        : Vary(definition.Albedo, broad, variation);
+                height = motorVent ? 0.22f : motorHub ? 0.72f : 0.52f;
+                roughness = motorHub ? 0.18f : roughness;
+                break;
+
+            case "shaft":
+                bool shaftBand = face == MaterialFace.Side ? x % 5 == 0 :
+                    MathF.Abs(MathF.Sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f)) - 0.30f) < 0.07f;
+                color = shaftBand ? definition.Albedo * 0.48f : Vary(definition.Albedo * 1.12f, fine, variation);
+                height = shaftBand ? 0.34f : 0.62f;
+                roughness = shaftBand ? roughness + 0.12f : roughness;
+                break;
+
+            case "gear":
+                float gearX = u - 0.5f;
+                float gearY = v - 0.5f;
+                float gearRadius = MathF.Sqrt(gearX * gearX + gearY * gearY);
+                float gearAngle = MathF.Atan2(gearY, gearX);
+                float teeth = MathF.Sin(gearAngle * 8f) * 0.025f;
+                bool gearTooth = gearRadius > 0.28f && gearRadius < 0.43f + teeth;
+                bool gearHub = gearRadius < 0.14f;
+                color = gearTooth || gearHub
+                    ? definition.Albedo * 1.28f
+                    : definition.Albedo * (0.38f + broad * 0.16f);
+                height = gearTooth ? 0.74f : gearHub ? 0.67f : 0.32f;
+                roughness = gearTooth ? MathF.Max(0.12f, roughness - 0.08f) : roughness;
+                break;
+
+            case "bearing":
+                float bearingRadius = MathF.Sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
+                bool bearingRace = bearingRadius is > 0.22f and < 0.39f;
+                bool bearingCore = bearingRadius < 0.13f;
+                color = bearingRace ? definition.Albedo * 1.32f :
+                    bearingCore ? definition.Albedo * 0.26f : definition.Albedo * 0.62f;
+                height = bearingRace ? 0.76f : bearingCore ? 0.25f : 0.46f;
+                roughness = bearingRace ? MathF.Max(0.08f, roughness - 0.10f) : roughness;
+                break;
+
+            case "piston":
+                bool pistonRod = face == MaterialFace.Side
+                    ? y is >= 6 and <= 9
+                    : MathF.Abs(u - 0.5f) < 0.16f || MathF.Abs(v - 0.5f) < 0.16f;
+                bool pistonSeal = x is 2 or 13 || y is 2 or 13;
+                color = pistonSeal ? new Vector3(0.025f, 0.03f, 0.035f) :
+                    pistonRod ? definition.Albedo * 1.48f : definition.Albedo * (0.60f + broad * 0.22f);
+                height = pistonSeal ? 0.24f : pistonRod ? 0.72f : 0.48f;
+                roughness = pistonRod ? MathF.Max(0.08f, roughness - 0.12f) : roughness;
+                break;
+
+            case "belt":
+                bool beltRib = face == MaterialFace.Side ? x % 3 == 0 : y % 3 == 0;
+                bool beltRoller = x is < 3 or > 12;
+                color = beltRoller ? definition.Albedo * 1.35f :
+                    beltRib ? definition.Albedo * 0.42f : definition.Albedo * 0.72f;
+                height = beltRoller ? 0.68f : beltRib ? 0.35f : 0.52f;
+                roughness = beltRoller ? 0.20f : MathF.Max(roughness, 0.58f);
+                break;
+
+            case "flywheel":
+                float flyRadius = MathF.Sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
+                bool flyRim = flyRadius is > 0.34f and < 0.48f;
+                bool flySpoke = MathF.Abs(u - 0.5f) < 0.055f || MathF.Abs(v - 0.5f) < 0.055f;
+                color = flyRim || flySpoke ? definition.Albedo * 1.25f : definition.Albedo * 0.32f;
+                height = flyRim ? 0.78f : flySpoke ? 0.66f : 0.26f;
+                roughness = flyRim ? MathF.Max(0.08f, roughness - 0.08f) : roughness;
+                break;
+
+            case "brake":
+                bool brakeStripe = (x + y) % 7 < 3;
+                bool brakeEdge = x is 0 or 15 || y is 0 or 15;
+                color = brakeEdge ? new Vector3(0.045f) :
+                    brakeStripe ? definition.Albedo * 1.18f : new Vector3(0.12f, 0.105f, 0.095f);
+                height = brakeEdge ? 0.30f : brakeStripe ? 0.62f : 0.48f;
+                roughness = MathF.Max(roughness, 0.56f);
+                break;
+
             case "fabric":
                 float weave = ((x + y) & 1) == 0 ? 1.12f : 0.78f;
                 color = definition.Albedo * weave;
@@ -265,29 +479,29 @@ public sealed class ProceduralMaterialAtlas
                 break;
 
             case "frosted_glass":
-                // Frosted glass has visible medium-sized grains. Quantizing the
-                // noise coordinates keeps it distinct from the much finer matte
-                // finish while remaining finer than the 4x4 mosaic cells.
-                int frostX = x / 2;
-                int frostY = y / 2;
+                // Real acid-etched glass is a translucent sheet with restrained,
+                // low-frequency haze. It is not a block of white pixel noise.
+                int frostX = x;
+                int frostY = y;
                 float frostCloud = OctaveNoise(seed ^ 0xd1b54a35u, frostX, frostY, 83);
                 float frostGrain = Noise(seed ^ 0x94d049bbu, frostX, frostY, 97);
                 color = Vector3.Lerp(
-                    Vary(definition.Albedo, frostCloud, variation * 0.22f),
+                    Vary(definition.Albedo, frostCloud, variation * 0.07f),
                     Vector3.One,
-                    0.04f + frostGrain * 0.1f);
-                height = 0.3f + frostCloud * 0.42f + (frostGrain - 0.5f) * 0.2f;
-                roughness = Math.Clamp(definition.Roughness + (frostGrain - 0.5f) * 0.2f, 0.45f, 1f);
+                    0.025f + frostGrain * 0.035f);
+                height = 0.47f + (frostCloud - 0.5f) * 0.10f + (frostGrain - 0.5f) * 0.025f;
+                roughness = 0.46f + frostCloud * 0.10f + (frostGrain - 0.5f) * 0.025f;
                 break;
 
-            case "matte_glass":
-                // Matte glass uses per-texel grain: its surface is cloudy, but the
-                // individual structure is finer than frosted and mosaic glass.
-                float matteGrain = Noise(seed ^ 0x369dea0fu, x, y, 109);
-                float matteCloud = OctaveNoise(seed ^ 0x7f4a7c15u, x, y, 131);
-                color = Vary(definition.Albedo, matteCloud * 0.35f + matteGrain * 0.65f, variation * 0.08f);
-                height = 0.44f + (matteGrain - 0.5f) * 0.12f;
-                roughness = Math.Clamp(definition.Roughness + (matteGrain - 0.5f) * 0.07f, 0.78f, 1f);
+            case "prismatic_glass":
+                float spectral = u * 5.0f + v * 2.0f + broad * 0.18f;
+                Vector3 coldSpectrum = new(
+                    0.42f + 0.16f * MathF.Sin(spectral * MathF.Tau),
+                    0.78f + 0.13f * MathF.Sin(spectral * MathF.Tau + 2.094f),
+                    0.98f + 0.02f * MathF.Sin(spectral * MathF.Tau + 4.188f));
+                color = Vector3.Lerp(definition.Albedo, coldSpectrum, 0.38f);
+                height = 0.48f + MathF.Sin(spectral * MathF.Tau) * 0.055f;
+                roughness = definition.Roughness;
                 break;
 
             case "mosaic_glass":
@@ -324,12 +538,15 @@ public sealed class ProceduralMaterialAtlas
                 break;
 
             case "etched_glass":
-                float etchedWave = MathF.Sin((u + v) * MathF.PI * 8f) *
-                                    MathF.Sin((u - v) * MathF.PI * 8f);
-                float etchedMask = SmoothStep(0.28f, 0.72f, MathF.Abs(etchedWave));
-                color = Vector3.Lerp(definition.Albedo * 0.82f, definition.Albedo * 1.08f, etchedMask);
-                height = 0.35f + etchedMask * 0.3f + (fine - 0.5f) * 0.08f;
-                roughness = Math.Clamp(definition.Roughness + (1f - etchedMask) * 0.22f, 0.36f, 0.92f);
+                float etchedWave = MathF.Sin((u + v) * MathF.PI * 10f) *
+                                    MathF.Sin((u - v) * MathF.PI * 10f);
+                float etchedMask = 1f - SmoothStep(0.06f, 0.20f, MathF.Abs(etchedWave));
+                float etchedRosette = 1f - SmoothStep(0.035f, 0.10f,
+                    MathF.Abs(MathF.Sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f)) - 0.29f));
+                etchedMask = MathF.Max(etchedMask, etchedRosette);
+                color = Vector3.Lerp(definition.Albedo, Vector3.One, etchedMask * 0.34f);
+                height = 0.50f - etchedMask * 0.25f;
+                roughness = Math.Clamp(0.07f + etchedMask * 0.76f, 0.06f, 0.86f);
                 break;
 
             default:
@@ -382,11 +599,17 @@ public sealed class ProceduralMaterialAtlas
     {
         "solid" => 0f,
         "glass" => 0.025f,
-        "frosted_glass" => 0.65f,
-        "matte_glass" => 0.38f,
+        "frosted_glass" => 0.34f,
+        "prismatic_glass" => 0.26f,
         "mosaic_glass" or "ribbed_glass" or "etched_glass" => 0.42f,
         "acrylic_glass" => 0.16f,
         "grid" or "circuit" or "tiles" or "panels" => 0.055f,
+        "motor" or "shaft" or "gear" or "bearing" or "piston" or "belt" or "flywheel" or "brake" => 0.045f,
+        "forged_iron_pixel" or "hazard_stripes" or "industrial_tread_plate" => 0f,
+        "foam" => 0.48f,
+        "brushed_metal" => 0.12f,
+        "hammered_metal" or "cast_metal" => 0.24f,
+        "polished_metal" => 0.025f,
         "brick" => 0.09f,
         "sand" => 0.12f,
         "marble" or "patina" => 0.15f,

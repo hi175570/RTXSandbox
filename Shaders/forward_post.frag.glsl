@@ -16,11 +16,13 @@ uniform int uReflectionQuality;
 uniform int uVolumetricQuality;
 uniform int uPostQuality;
 uniform int uBloomEnabled;
+uniform float uBloomStrength;
 uniform int uToneMapping;
 uniform int uTaaEnabled;
 uniform int uHasHistory;
 uniform int uDebugView;
 uniform int uUpscalingMode;
+uniform int uEnvironmentVisible;
 
 in vec2 vUv;
 layout(location = 0) out vec4 outColor;
@@ -184,7 +186,7 @@ vec3 addBloom(vec3 color, vec2 uv)
 {
     if (uBloomEnabled == 0 || uPostQuality <= 0) return color;
     vec3 bloom = vec3(0.0);
-    float weight = 0.0;
+    float kernelWeight = 0.0;
     int radius = uPostQuality >= 3 ? 3 : 2;
     for (int y = -3; y <= 3; y++)
     for (int x = -3; x <= 3; x++)
@@ -193,11 +195,19 @@ vec3 addBloom(vec3 color, vec2 uv)
         vec2 sampleUv = clamp(uv + vec2(x, y) * uTexelSize * (1.4 + float(uPostQuality) * 0.65),
             vec2(0.001), vec2(0.999));
         vec3 sampleColor = texture(uHdrColor, sampleUv).rgb;
-        float contribution = smoothstep(1.0, 2.7, luminanceOf(sampleColor));
-        bloom += sampleColor * contribution;
-        weight += contribution;
+        float luminance = luminanceOf(sampleColor);
+        float excess = max(luminance - 1.45, 0.0) / max(luminance, 1e-4);
+        float spatialWeight = 1.0 / (1.0 + float(x * x + y * y));
+        bloom += sampleColor * excess * spatialWeight;
+        kernelWeight += spatialWeight;
     }
-    if (weight > 1e-4) color += bloom / weight * (0.055 + float(uPostQuality) * 0.025);
+    if (kernelWeight > 1e-4)
+    {
+        bloom /= kernelWeight;
+        float bloomLuminance = luminanceOf(bloom);
+        bloom *= min(1.0, 3.0 / max(bloomLuminance, 1e-4));
+        color += bloom * clamp(uBloomStrength, 0.0, 1.0);
+    }
     return color;
 }
 
@@ -245,13 +255,16 @@ vec3 applyFsrSharpen(vec3 source, vec2 uv)
 void main()
 {
     float depth = texture(uDepth, vUv).r;
+    float presentationAlpha = depth < 0.99999 || uEnvironmentVisible != 0 ? 1.0 : 0.0;
     vec4 surface = texture(uSurface, vUv);
     vec3 normal = safeNormalize(surface.rgb * 2.0 - 1.0, vec3(0.0, 1.0, 0.0));
     float roughness = clamp(surface.a, 0.045, 1.0);
     vec3 worldPosition = reconstructWorld(vUv, depth);
     vec3 color = texture(uHdrColor, vUv).rgb;
     if (depth >= 0.99999)
-        color = atmosphere(safeNormalize(worldPosition - uCameraPosition, vec3(0.0, 1.0, 0.0)));
+        color = uEnvironmentVisible != 0
+            ? atmosphere(safeNormalize(worldPosition - uCameraPosition, vec3(0.0, 1.0, 0.0)))
+            : vec3(0.0);
 
     float ao = screenAmbientOcclusion(vUv, worldPosition, normal, depth);
     vec4 reflection = depth < 0.99999
@@ -261,28 +274,28 @@ void main()
     if (uDebugView == 3)
     {
         float linearized = depth >= 0.99999 ? 1.0 : clamp(length(worldPosition - uCameraPosition) / 220.0, 0.0, 1.0);
-        outColor = vec4(vec3(linearized), 1.0);
+        outColor = vec4(vec3(linearized), presentationAlpha);
         return;
     }
     if (uDebugView == 7)
     {
-        outColor = vec4(vec3(ao), 1.0);
+        outColor = vec4(vec3(ao), presentationAlpha);
         return;
     }
     if (uDebugView == 11)
     {
-        outColor = vec4(pow(max(reflection.rgb * reflection.a, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+        outColor = vec4(pow(max(reflection.rgb * reflection.a, vec3(0.0)), vec3(1.0 / 2.2)), presentationAlpha);
         return;
     }
     if (uDebugView == 13)
     {
         bool invalid = any(isnan(color)) || any(isinf(color)) || any(isnan(normal)) || any(isinf(normal));
-        outColor = vec4(invalid ? vec3(1.0, 0.0, 1.0) : vec3(0.02), 1.0);
+        outColor = vec4(invalid ? vec3(1.0, 0.0, 1.0) : vec3(0.02), presentationAlpha);
         return;
     }
     if (uDebugView != 0)
     {
-        outColor = vec4(pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2)), 1.0);
+        outColor = vec4(pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2)), presentationAlpha);
         return;
     }
 
@@ -344,5 +357,5 @@ void main()
     }
 
     if (any(isnan(mapped)) || any(isinf(mapped))) mapped = vec3(0.0);
-    outColor = vec4(clamp(mapped, 0.0, 1.0), 1.0);
+    outColor = vec4(clamp(mapped, 0.0, 1.0), presentationAlpha);
 }

@@ -1,4 +1,4 @@
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 
 namespace RTXSandbox.Gameplay;
 
@@ -17,7 +17,7 @@ internal static class CreativePaletteOrdering
         "brown_glass", "red_glass", "orange_glass", "yellow_glass", "lime_glass", "green_glass",
         "cyan_glass", "aqua_glass", "light_blue_glass", "blue_glass", "purple_glass",
         "magenta_glass", "pink_glass", "rose_glass", "smoked_glass", "diamond_glass",
-        "prismatic_glass", "frosted_glass", "matte_glass", "mosaic_glass", "acrylic_glass",
+        "prismatic_glass", "frosted_glass", "mosaic_glass", "acrylic_glass",
         "ribbed_glass", "etched_glass",
     };
 
@@ -46,9 +46,11 @@ internal static class CreativePaletteOrdering
             "metal" => 3,
             "optical" => 5,
             "technology" => 6,
-            "lighting" => 7,
-            "special" => 8,
-            _ => 9,
+            "tools" => 7,
+            "lighting" => 8,
+            "spheres" => 9,
+            "special" => 10,
+            _ => 11,
         };
     }
 

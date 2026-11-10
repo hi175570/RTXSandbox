@@ -1,5 +1,93 @@
 # RTX Sandbox Roadmap
 
+## 本輪：DXR 漏光、延遲反射、流體與可破壞結構回歸（2026-10-11）
+
+| 項目 | 狀態 | 驗證證據／限制 |
+|---|---|---|
+| DXR LED 四條直線漏光 | 🟡 **程式修正與硬體回歸通過，待玩家原場景目視** | 截圖中的紅色確認為鄰近紅玻璃的合法透射染色；真正問題是 LED／體素接縫向外延伸的四條筆直亮線。根因是單一中心可見性射線剛好沿三角形／體素邊界漏過後，整盞燈仍被視為可見。現在主射線以 3 個穩定發光體內部樣本、次級反射以 2 個樣本取逐色最保守遮擋值，並縮小起點偏移；玻璃仍可染色，低貢獻深層燈光提前略過。最終 HLSL 已在 RTX 5050 runtime 編譯；玻璃遮擋 smoke 的牆存在／移除亮度為 **18.88／222.48**、transparent hits **279,893**。自動測試尚不能取代使用者同一存檔同一視角對四條線的目視確認。 |
+| 密閉暗室與鏡面漏光 | ✅ **硬體驗證通過** | 移除固定環境亮底，只保留極低夜間基線與真正可見的太陽／發光體路徑；密閉鏡面房午夜 luminance **4.22**，hits／reflections 各 **518,400**。不把鏡面最大反射次數或畫質設定偷偷降低。 |
+| 延遲反射方形亮點 | 🟡 **根因修正，待原畫面目視** | Deferred SSR 增加反射深度命中接近度拒絕，避免把遠離實際交點的高亮 G-buffer 方塊誤當命中；另以導數估計法線貼圖的像素內變異，只提高該像素的光照粗糙度，抑制每個法線 atlas texel 變成方形鏡面／firefly。Release Deferred Quality 實跑 **69 frames**，G-buffer active **430,657**、invalid **0**、HDR invalid **0**，沒有 shader fallback；是否完全消除截圖位置亮點仍需玩家目視。 |
+| PBR 凹凸與材質反射解耦 | ✅ **已完成並跨 Raster 驗證** | Raster／Forward／Deferred／Hybrid 與 DXR 都使用中央高度梯度產生微表面法線；高度只影響法線與 cavity ambient occlusion，不再直接產生 emission 或強迫反射。磚、石與磁磚的程序高度加入倒角、凸面及較深縫隙；材質仍由自己的 metallic／roughness 決定是否反射。 |
+| 玻璃透射、影子與碎裂 | ✅ **V2.2 已完成** | 透明陰影使用 4 個穩定 atlas 樣本保留彩色透射。舊版先曾產生 `8×8×8` 粉末，後續的六個長方體雖控制了成本，外形仍不是真正碎片。現由命中點向四邊生成八片具隨機邊界的三角棱柱，每片是獨立剛體，使用明確角點表皮與片內緊縮碰撞代理；單片禁止無意義的 Catmull-Clark 倍增。Physics Save V3／單檔世界 V9 會保存程序表皮。既有 Micro Voxel 玻璃仍禁止乘法式二次細分。安裝版 `world1` 先前已精確清除舊 `1/8`／`1/4` 粉末簽名，正常建築不在清理條件內。 |
+| 水下挖洞自動回填 | ✅ **已完成** | 確認問題不是水量不足，而是大水體既有佇列使新挖空洞排在大量普通工作後面。挖除水下固體時改以 urgent queue 優先喚醒相鄰水格，並使舊普通佇列副本失效；18×18×2 水池壓力回歸要求下一次 step 就回填中心空洞且守恆。流體仍是有限體積格級模擬，不宣稱連續 Navier–Stokes。 |
+| 軟體表面材質跟隨形變 | ✅ **已完成** | 軟體表皮 UV 改綁定 rest-position lattice，再由目前角點變形插值；彎曲、剪切與旋轉時紋理跟著表面變形，不再每格重新貼一張未扭曲方圖。硬方塊保持剛體，不會被軟體 solver 捏成一團。 |
+| 機械外形與真正傳動網路 | ✅ **V2.1 已修正整機漂浮** | 確認舊 `Drive()` 每幀強制改寫整個機械 Physics Grid 位姿，造成馬達外殼、傳動與負載一起漂浮／擺動。現在只有接觸靜態碰撞支撐的機架可運轉；機架位姿固定，輸出接觸區只向獨立剛體負載施力，最後支撐移除後整組立即回到普通 BEPU 剛體。新增大小直齒輪、傘齒輪、齒條、離合器、萬向接頭、鏈輪與皮帶輪，並讓桌面／Android 物品欄使用機械剪影而非換色立方體。跨 Grid 的實體軸約束與齒輪嚙合編排 GUI 仍未完成，不冒充已做。 |
+| 六條桌面 Renderer 回歸 | ✅ **Release 實跑通過** | 最新來源回歸：Classic **69 frames**、PBR Forward **69**、Deferred **71**、Hybrid **70**、Compute PT **33**、Hardware DXR **81**。DXR 實際使用 RTX 5050、14,928 triangles、332,963 reflection rays、184,205 transparent hits，DispatchRays **4.37 ms**；沒有 renderer fallback。安裝版沿用使用者較高品質設定再跑 DXR 58 frames、DispatchRays 49.19 ms，僅證明功能通過，不冒充高負載 FPS 達標。 |
+| 建置與自測 | ✅ **本輪通過** | Desktop Release solution **0 warnings／0 errors**；Release self-test **106/106**、inventory **8/8**、BepInEx direct-hook Mod smoke 通過。Android Release 以現有 `C:\Users\USER\AppData\Local\Android\Sdk` 建置四 ABI（arm64、arm、x64、x86）**0 warnings／0 errors**；本輪未重裝 VM，因此只標建置驗證。 |
+| games 安裝副本 | ✅ **V2.2 已安全覆蓋並驗證** | 既有全包部署保留；本轮仅以明确 allowlist 覆盖主 DLL 与官方材质形变插件，保留 `settings.json`、存档、BepInEx 设置和第三方插件。主 DLL SHA-256 `531CAD76...975DE0B`，形变插件 `42D33ECB...34154BF`，来源／安装值逐字相同；回滚备份为 `artifacts/games-before-glass-metal-20261011-184001`。安装版 self-test **106/106**，BepInEx 实际加载两插件，连续金属凹面 smoke 与 Compute PT 33 帧通过。`world1` 未在本轮被改写。 |
+
+> 本節記錄的是目前來源狀態。DXR 四條直線與 Deferred 方形亮點均已針對截圖中確認存在的根因修改並完成自動 GPU 回歸，但仍保留原存檔、原鏡頭的人工視覺驗收，不把 smoke test 冒充目視結果。
+
+## 本輪：核心軟體物理、能量投射、機械與 RTX 展示世界（2026-10-11）
+
+| 項目 | 狀態 | 驗證證據／限制 |
+|---|---|---|
+| 連續軟體物理移入本體 | ✅ **已完成** | `SoftBodyPhysicsSystem` 直接隨遊戲建立；凝膠／橡膠／泡棉與混合硬方塊以完整 Physics Grid 為單位、120 Hz 求解，接觸面固定，最後支撐移除後受重力下落。自檢實際量測支撐梁彎曲、移除支撐後下降，並確認輸出逐格平滑表皮。上限為 32 結構、每結構 512 格；布料、繩索及軟體互撞未做。 |
+| Impact Plasticity V2 Mod | ✅ **V2.1 已完成** | 插件直接 Harmony patch 私有能量命中流程，不依賴 Mod API。已確認舊金屬路徑實際刪除 `8×8×8` Micro Voxel，必然形成像素階梯；現在金屬受擊格轉成 6×6 共頂點連續表面，以超橢圓壓痕與方向性折面塑形，碰撞保持簡化、表面與靜態狀態可保存。土／凝膠與其他脆性材質仍使用各自反應；只在命中時計算，不持續模擬全世界。 |
+| 能量投射器 | ✅ **已完成** | 創造物品欄新增獨立「工具」分頁，可直接選取投射器；左鍵發射，右鍵開啟設定。低／中／高力度與 0.15～4 格受力半徑相互獨立；可推動 Physics Grid 與解析球。右鍵 UI 顯示力、壓力與半徑。 |
+| 程序玻璃碎裂 | ✅ **V2.2 已完成** | 低壓命中仍以命中位置、法線與穩定隨機種子產生放射／分支裂紋；完整碎裂改為八片覆蓋原受擊面的不規則三角棱柱，具獨立物理、角速度與可保存表皮。碰撞代理刻意比視覺碎片簡化以避免重疊棱柱使 BEPU 爆炸，但畫面不再是粉末或矩形切片。 |
+| 機械動力與傳動 V2 | ✅ **已由頂部 V2.1 修正** | 舊版曾以「供電後整個 Grid 移動」作為驗收，這正是使用者截圖中的漂浮根因，不能視為正確機械。V2.1 已改成固定機架與獨立輸出負載，並新增無支撐整機必須下落的 BEPU 回歸測試；本列保留作為錯誤驗收被取代的紀錄。 |
+| 凝膠變形面放置 | ✅ **本輪完成** | 確認舊 Raycast 只命中未變形 Cell AABB，導致彎曲後側面無法放置。現在 smooth skin 的六個面直接以實際八角點三角形求交，回傳變形後法線；106 項自檢中的 `deformed soft-body faces remain editable` 實際由側面命中後放置相鄰格。 |
+| 創造物品欄收尾 | ✅ **本輪完成** | 移除舊球形增添／挖除建造按鈕，保留鐵球／鏡面球直接物品；Shift＋點擊垃圾桶會清空游標、45 格背包及九格快捷欄。inventory self-test 8/8。 |
+| 金屬微表面差異 | ✅ **本輪完成** | 鑄造、拉絲、錘紋、拋光四組程序表面套用至不同金屬，並調整各自 albedo／roughness；鍍鉻仍可近完美鏡面，其餘金屬不再共用純色低粗糙鏡面。六條 Renderer 共用同一 Atlas／材質資料。 |
+| DXR 轉頭鏡面歷史 | 🟡 **根因修正，待玩家視覺確認** | 確認攝影機每次微小移動都呼叫 `ResetAccumulation()` 並清掉 Reflection Tail 歷史，造成轉頭期間每幀回到暗色 seed。DXR 現在保留一般視角變化的雙緩衝歷史，仍在資源重建或大幅相機跳躍時丟棄。RTX 5050 一般 DXR smoke 42 frames、Infinite Mirror 55 frames 均通過；自動 smoke 尚未量化實際滑鼠連續轉頭的黑幀，因此不標為完整視覺驗收。 |
+| 物理入水波紋 | ✅ **已完成** | Physics Grid／解析球進水或在水中移動會觸發局部、帶 cooldown 的流體重分配；回歸確認產生波動且總水量守恆。視覺為格級流體波動，非連續 Navier–Stokes 水花。 |
+| RTX 展示園區 | ✅ **V2.1 已覆蓋 world1** | 凝膠比較梁保存為與實體牆相連的世界方塊，由 soft-body extractor 保留固定點再接管。機械場已把五組動力機架固定到基岩，並把受力平台／橫梁拆成獨立 Physics Grid，不再把馬達、致動器與貨物序列化成同一個會懸空擺動的剛體。staging 與 `C:\D\games\RTXSandbox\Saves\world1` 均經無視窗重載驗證為 **18 grids／7 spheres**；玩家原視角動態外觀仍需人工驗收。 |
+| 本輪建置／實跑 | ✅ **來源與安裝版已驗證** | Debug／Release solution 均 0 warnings／0 errors；來源與安裝版完整 self-test **106/106**、inventory **8/8**。RTX 5050 一般 DXR 42 frames，3,078 triangles、326,238 reflection rays、DispatchRays 4.01 ms；安裝版 Infinite Mirror 56 frames，真 DXR 29 層＋近似尾端至 1000；最終場景語意修正後再跑安裝版 DXR 73 frames／14,718 triangles，framebuffer 通過且未 fallback。 |
+| games 安裝副本 | ✅ **已由頂部 V2.1 部署取代** | 最新安装证据、雜湊与回滚目录见 Roadmap 顶部 `games 安裝副本`；本列旧 `B509106F...` 仅保留历史，不是当前二进制。 |
+
+> 下方「BepInEx 軟體物理 Mod V1.3」保留為歷史驗證紀錄；其「solver 沒有搬進核心」與 V1.3 限制已被本節 V2 架構取代。
+
+## 本輪：直接 Hook 模組、解析球、DXR 預算與 Android 光影（2026-10-11）
+
+| 項目 | 狀態 | 驗證證據／限制 |
+|---|---|---|
+| 獨立 Mod API | ✅ **已移除** | 刪除 `RTXSandbox.ModAPI` project／DLL 與 `ModHost`／service locator；共用遊戲介面移入 `Engine/Contracts` 並編入本體。Example 與軟體物理都直接引用 `RTXSandbox.dll`、使用 BepInEx／Harmony Hook。Release Mod smoke 實際載入兩個插件並看到 `Content pack and direct BepInEx/Harmony game hook verified.`。舊 Roadmap 中 ModAPI 狀態均由本節取代。 |
+| 遊戲內模組編譯 | ✅ **已更新** | `ModWorkspace` 以正在執行的 Host major TFM（預設 `net9.0`）編譯，引用 `Managed`、`BepInEx/core` 與 plugins；不再因硬編 net6 而跳過主遊戲程序集。原始碼仍保留，沒有自動 Hot Reload。 |
+| 解析球直接放置 | ✅ **已完成** | 鐵球／鏡面球加入本體創造物品欄「球體」分類；右鍵直接建立既有 analytic sphere，左鍵可用一般破壞流程移除，不再經建造工具選單。完整 self-test 含直接物品驗收。 |
+| 軟體物理回歸 | ✅ **已實跑** | Compute smoke：`bend=0.442`、`strain=0.296`、`rigidError=0.0000`、金屬下落 `2.891`、支撐解除下落 `2.650`、shape `0.031→0.000`；DXR smoke：金屬下落 `5.045`、支撐解除下落 `2.580`、`rigidError=0.0000`。兩條路徑均完成逐格拆分、固定端解除與回彈。 |
+| DXR 動態更新預算 | 🟡 **已減輕，仍需繼續量測** | 解析球只動 transform 時改為 TLAS-only；Physics Grid BLAS refit 最快 33 ms 一次，球體與 Grid dirty flag 分離。RTX 5050 高負載軟體物理 smoke 完成 319 frames，最終 3,984 triangles、183 dynamic refits、181 TLAS updates；`DispatchRays` 實測約 9–19 ms 且仍有尖峰，因此不宣稱達到穩定 100/120 FPS。 |
+| DXR 深層反射工作量 | ✅ **保留畫質的安全終止** | HLSL payload 追蹤 throughput；能量低於 0.0015 的非完美鏡面深層路徑才終止，前兩層與平面完美鏡保持設定的真實反射深度。沒有降低解析度、samples、ray distance 或設定反射次數。RTX 5050 HLSL runtime compile／DispatchRays／framebuffer smoke 通過。 |
+| Android Renderer 差異 | ✅ **五條非 DXR 管線已在 VM 逐條重驗** | Classic Lambert、PBR Forward GGX、Deferred MRT、Hybrid PBR 與 GLES 3.1 Compute PT 均在同一 Android 11／API 30 x86_64 VM、同一個 75,240 vertices 世界啟動並持續出圖；穩態觀察區間依序約 `44–53／42–56／38–48／39–47／48–59 FPS`，無 shader、FBO 或 AndroidRuntime fatal。Hybrid 不再只是環境色混合，使用 G-buffer depth ray march SSR、邊緣淡出及相機方向視差；截圖 `artifacts/android-hybrid-real.png` 與 `artifacts/android-compute-real-2.png` 的狀態列及畫面均確認實際後端。Hardware DXR 仍只屬 Windows。 |
+| 工具鏈 | ✅ **已修復** | 新增 `global.json` 固定已安裝的 .NET SDK 9.0.318，保留 Visual Studio 2022 相容性；修復 Android workload 9.0.20 packs 後，內含四 ABI 的 Release build 通過。 |
+| 本輪建置／自測 | ✅ **已驗證** | Desktop Debug／Release solution 0 warnings／0 errors；完整 self-test 101/101、inventory 8/8；Android Release universal APK 四 ABI 0 warnings／0 errors；Preloader 整合測試全通過；x64 APK 以 `adb install -r` 覆蓋既有安裝並完成五 Renderer 的 VM runtime／截圖重驗。 |
+| games 安裝副本 | ✅ **已部署並驗證** | 覆蓋 `C:\D\games\RTXSandbox` 的 69 個程式／內容／Shader 檔案，保留 Saves、settings、BepInEx/core 與其他玩家插件；精確移除舊 `Managed/RTXSandbox.ModAPI.dll`。來源／安裝版主 DLL、兩個官方插件與 HLSL SHA-256 均一致；安裝版 101/101 self-tests、Preloader／Chainloader 及兩個直接 Hook 插件診斷通過。回滾備份：`artifacts/games-before-direct-hooks-20261011-005731`。 |
+
+## 本輪：BepInEx 軟體物理 Mod V1.3（2026-10-10）
+
+| 項目 | 狀態 | 驗證證據／限制 |
+|---|---|---|
+| Mod 形態 | ✅ **已完成** | `Examples/SoftBodyPhysicsMod`／`rtxsandbox.soft-body-physics` 保持獨立 BepInEx／Harmony Mod；spring solver 沒有搬進核心。版本已升為 **1.3.0**。 |
+| 軟體材質 | ✅ **已完成** | 新增中文「透明凝膠／彈性橡膠／柔軟泡棉」三種可放置方塊，分別使用不同剛度、阻尼、形狀恢復與透明參數，集中在「軟體物理」分類。 |
+| 靜態軟體自動啟用 | ✅ **本輪確認並修復** | 截圖證明舊版只接管已存在的 Physics Grid，支撐中的世界方塊根本沒有進入 solver。V1.3 在 WorldReady 掃描已載入 Chunk，編輯後以 0.75 秒 debounce 處理；軟體材質必定啟用求解，支撐只固定接觸面。實跑同時辨識到存檔既有 4 格結構（108 質點）與靜態搭建的五格驗收梁。 |
+| 固定端與可見彎曲 | ✅ **已修復並實跑** | 硬分支若連到地形／Bedrock 會留作靜態支撐，有限且未接地的硬分支會隨軟體成為同一結構。來源 Cell 現在保存八個明確角點；貼牆固定面的角點保持在世界座標原位，表皮只讓自由側隨求解質點彎曲，不再以 Cell 中心近似而造成固定邊下沉。回歸額外要求固定面漂移不超過 **0.001 格**。 |
+| 真實質量／密度 | ✅ **已完成** | `BlockDefinition` 與內容 JSON 新增 `Density`；Physics Grid 的總質量、質心與慣量都按體積×密度計算，不再拿 Metallic／Roughness 當重量。鐵塊為 **7.87 t/格**，目標方塊與物品提示會在既有材質行顯示「質量」。Mod 註冊材質也提供各自密度。 |
+| 平滑外觀與方塊輪廓 | ✅ **本輪重新確認並修復** | 兩次實機截圖先後證明逐格球體與全梁 Capsule 都不符合需求；舊判定作廢。現在 Raster／Forward／Deferred／Hybrid／DXR 由相鄰軟 Cell 建立單一封閉拓撲外殼，只在同一來源面內平滑彎曲，頂／側／端面之間保留 sharp crease，因此仍是可彎的方塊梁與方形截面，不會變成珠串或圓柱。Compute PT 移除 Capsule 求交，改用三段相連的可旋轉方形 Box Beam。回歸同時驗證 straight beam 邊界精確為 `0..4 × 0..1 × 0..1`、法線保持軸向平面，且所有網格邊恰好由兩個三角形共用。 |
+| 硬方塊剛性與銜接旋轉 | ✅ **本輪修復並實跑** | 確認金屬雖不是 soft skin，舊 solver 仍會讓它的內部質點跟著軟約束變形，且旋轉後的質點 AABB 會把可見盒膨脹，因此畫面成為不規則白色團塊。現在面相連的硬 Cell 形成獨立 shape-matching 剛性群；可由軟材質傳力並整體位移／旋轉，但群內形狀不變。Physics Grid 的渲染／碰撞方向跟隨主要剛性群，鐵塊與軟梁銜接處共用同一旋轉基準。硬 Cell 保留來源尺寸，標準鐵塊始終是一格；最终來源與安裝版 Compute／DXR smoke 的 `rigidError` 均為 **0.0000**。 |
+| 走行／碰撞 | ✅ **已修復並測試** | 視覺表面與物理碰撞分離；每個來源方塊只有一個連續變形碰撞包圍盒，不再讓數十個求解小方塊把玩家彈飛。新增落下、站穩、走過五格平滑 Grid 的回歸測試，Y 維持 1.000。 |
+| 逐格破壞／支撐解除 | ✅ **已修復並實跑** | 破壞按原始來源 Cell 處理，不再一擊刪除整個軟體。核心拆分期間暫停 Mod 重入，完成後同幀接管仍含軟材質的連通碎片；普通硬碎片立即交回 BEPU。確認舊版移除最後支撐時仍保留原始 `RestOffset`／spring rest length，會把累積形變當成彈弓能量釋放。現在最後支撐消失即以當前形狀重設自由體基準、清除內部角向速度，再由重力接管。最終安裝版 Compute／DXR 實跑的整體下落分別為 **3.395／3.399 格**，水平漂移僅 **0.121／0.120 格**。 |
+| 運行中組裝 | ✅ **本輪完成並實跑** | 普通整格放置會暫時交回核心、將變形結構映射回局部格線、完成拓撲編輯後重建 solver；smoke 已實際在彎曲中的五格梁加到六格，再移除新增 Cell 並繼續逐格斷裂。Micro Voxel 運行中加料仍列限制。 |
+| 飛行控制 | ✅ **已修復** | 飛行的 W/A/S/D 使用與步行相同的相機水平朝向；相機俯仰不再改變前進高度，Space／Shift 獨立控制上／下。 |
+| 建置／測試 | ✅ **已驗證** | Debug／Release solution 均 0 warnings、0 errors；Release **99/99** self-tests 通過，包含 explicit-corner 固定面回歸。來源 Release Compute PT + Mod 實跑：bend **2.490**、strain **0.262**、rigidError **0.0000**、支撐解除下落 **3.395 格**、水平漂移 **0.121 格**；RTX 5050 DXR + Mod 實跑：bend **2.551**、strain **0.270**、rigidError **0.0000**、支撐解除下落 **4.186 格**、水平漂移 **0.099 格**。 |
+| games 安裝副本 | ✅ **已部署並實跑** | 最終修正已覆蓋 `C:\D\games\RTXSandbox` 的主 DLL／PDB與 SoftBody Mod DLL；主 DLL SHA-256 `A61307EC...86B82`、Mod `E2900912...55862`，來源／目標逐檔一致，未改存檔或設定。原版備份位於 `artifacts/games-before-soft-support-release-20261010-234015`，最終角點刷新修正前的增量備份位於 `artifacts/games-before-soft-corner-refresh-20261010-234336`。安裝版 Compute PT **196 frames**，支撐解除下落 **3.395 格**、漂移 **0.121 格**；RTX 5050 DXR **211 frames**，下落 **3.399 格**、漂移 **0.120 格**；兩者 `rigidError=0.0000`。 |
+| 後續限制 | 🟡 **明確保留** | 表皮現在是無縫連續曲面，但它是由來源體素外殼細分而來，不是有限元素體積曲面；非常大的結構會降低細分層級以限制拓撲更新成本。存檔保留 Physics Grid 幾何但不保存 spring 的瞬時內部狀態；Micro Voxel 運行中組裝、軟體互撞、布料、繩索、撕裂、塑性與 GPU solver 尚未做。直接依賴 net9 遊戲內部，不宣稱 Android／ARM RuntimeDetour 相容。 |
+
+## 本輪：遊戲本體創造物品欄分類分頁（2026-10-10）
+
+- **已完成：45 格背包与单一材质引用**：修改前确认当前版本仍是 9×9／81 格且会显示 1／64 堆叠。本轮改为独立侧边背包 **9×5＝45 格**，与物品库格子同尺寸；搜索常驻、收藏固定在顶部分类末尾。普通点与 Shift 点物品库都只取得一个材质引用，不再伪造 64；同类放回会清空游标，右下垃圾桶独立于 45 格。
+- **資料安全**：創造配置獨立於原有生存背包。旧 81 格配置会按原顺序压缩迁移到 45 格，count 归一为 0／1；未完成的游标搬运采用交易快照，关闭取消整次未完成交换。2,000 次随机操作验证不会复制材质引用。
+- **已部署至 games（2026-10-10）**：以项目规定的 `Managed` 发布结构更新 `C:\D\games\RTXSandbox` 的 apphost、主 DLL／PDB 与 3 个水面 Shader，共 6 个文件；47 个程序／Shader 文件与发布来源 SHA-256 一致，77 个未覆盖文件哈希不变，包含存档、设定、Content 与 BepInEx 模组／框架。已安装 EXE 通过 7/7 物品栏专测、Classic 67 frames、PBR 68 frames 与 RTX 5050 DXR 67 frames。完整更新备份位于 `artifacts/games-before-inventory-20261010-191852`，最终水面顶点 Shader 的追加备份位于 `artifacts/games-before-inventory-20261010-192025`；没有删除或搬移 BepInEx/core。
+- **本輪已驗證**：Debug／Release 零警告零錯誤；Release **96/96 自检通过**；`--inventory-self-test` **7/7 通过**，覆盖 2,000 次随机操作、JSON 往返、真实 ImGui 点击／拖放、45 格、分页箭头、侧边背包、垃圾桶、800×480／480×800／1920×1080、叉叉回滚、可见 UI 释放鼠标与 IME ownership。Classic GPU smoke **70 frames**，`artifacts/creative-backpack-45-final.bmp` 已目视检查。Android x64 Debug **0 warnings／0 errors**，但本轮没有再次安装到模拟器，因此不冒充装置操作验收。
+- **保留異常證據**：中途全量自檢曾發生既有非同步 Chunk 提交測試 10 秒超時；最終獨立重測該項 520 ms 通過。未修改串流程式或宣稱已修复環境負載下的計時不穩定。Mouse Tweaks 為操作參考，未載入 Minecraft 模組，也不宣稱完整複製其全部功能。
+
+- **分頁外觀回饋已處理**：移除右側上下堆疊的預設 ImGui 翻頁按鈕；左右端箭頭改用相同凹凸格框，分頁改成上緣標籤、選中凸起且下緣連接面板，收藏改為星形圖示，標題列顯示頁碼。分類與整列捲動未變；93/93 自檢、Release GPU smoke 33 frames 通過，`artifacts/creative-tabs-refined.bmp` 已目視確認。
+- **已完成**：取代桌面創造物品欄的分類下拉選單與大卡片；使用淺灰面板、凹凸格框、圖示＋名稱分類分頁、9×5 物品格及底部九格快捷欄。搜尋、取用、收藏保留；新增「玻璃」分類集中全部玻璃，原有顏色排序保留。不修改模組管理 UI、不變更方塊 ID。
+- **已完成**：捲軸使用整數起始列；滾輪累積到一格刻度才換列、拖動捲軸也只顯示完整列。切分類／搜尋重設頂列，末列不足九格時補空槽。分類太多可翻頁，外部新 Category 自動接入。
+- **已完成**：桌面與 Android 庫畫面直接共用 `UI/CreativeInventoryPanel.cs`、`Gameplay/CreativeInventoryModel.cs`；分頁繁中／簡中／英文齊全。
+- **驗證**：Debug／Release build 成功；93/93 self-tests 通過。新增模型與真實 ImGui 輸入測試覆蓋分類、跨分頁點選、收藏、搜尋空結果、滾輪、捲軸首尾、800×480／480×800／1920×1080 邊界與完整格子。GPU smoke 實際渲染新版物品欄，截圖 `artifacts/creative-inventory-final.bmp` 已目視確認；未操作 OS 焦點。Android x64 Debug build 通過；本輪尚未在 Android 裝置操作驗收。
+- **後續狀態更新**：當時依使用者指示暫停的軟體方塊，現已由上方獨立 BepInEx 軟體物理 Mod V1 完成；創造物品欄本體仍未混入專用物理邏輯。
+- **參考而非複製遊戲資產**：[Java 版創造欄位映射](https://maven.fabricmc.net/docs/yarn-1.21%2Bbuild.9/net/minecraft/client/gui/screen/ingame/CreativeInventoryScreen.CreativeScreenHandler.html) 的 row／scroll 分離介面，以及 [Mojang 1.19.3 分類說明](https://feedback.minecraft.net/hc/en-us/articles/11280166737293-Minecraft-Java-Edition-1-19-3)。保留本專案程序材質圖示。
+
 ## 本輪：桌面 BepInEx 啟動前補丁（2026-10-10）
 
 | 項目 | 狀態 | 驗證證據／限制 |
@@ -78,7 +166,7 @@
 |---|---|---|
 | Shift 蹲下與可編輯按鍵 | ✅ **【已完成－本輪】** | 桌面預設改為 WASD、Space 跳躍、Shift 蹲下、Ctrl＋前進或 0.30 秒內連按兩次前進衝刺；移動、跳躍、蹲下、衝刺、物品欄、建造、精密與暫停都可在按鍵頁修改並保存。設定 round-trip 與預設回歸測試通過。 |
 | 衝刺視覺 | ✅ **【已完成－本輪】** | 衝刺時 FOV 以指數平滑方式最多增加 7 度，停止後平滑恢復；基礎 FOV 與暫時動畫值分離，不會把衝刺值寫回設定，Path Tracing accumulation 會在 FOV 改變時正確重置。 |
-| Windows IME／遊戲英文輸入 | 🟡 **【程式完成－人工 IME 待複驗】** | 保留既有 ImGui composition／候選窗定位；滑鼠捕捉且沒有 UI 時啟用英文鍵盤配置並關閉 IME，使 Shift 保留給蹲下。英文 HKL 只載入一次，避免每幀重載。不同 Windows 輸入法的實際組字行為仍需使用者人工確認。 |
+| Windows IME／游戏按键 ownership | 🟡 **【程式完成－人工 IME 待複驗】** | 已移除进入游戏时 `LoadKeyboardLayout／ActivateKeyboardLayout` 强制切英文的副作用，保留使用者当前语言。窗口 IME context 只在真实 ImGui 文字输入框 active 时关联；普通菜单与鼠标捕获游玩状态会解除关联，因此 Shift／WASD 不交给 Windows IME。composition／候选窗定位保留。自动 ownership 测试通过；微软注音实际组字选字仍需人工确认。 |
 | 三語 UI | 🟡 **【核心導航完成】** | 已加入繁體中文、簡體中文、英文及持久化設定；暫停、成就、語言、按鍵與 Android 核心頁面已接入。舊有 Mod／世界管理／全部 Renderer 細項尚未逐字遷移，不能標成全 UI 100%。 |
 | 成就列表 V1 | ✅ **【版面完成／功能預留】** | 桌面與 Android 均有可滾動、近全螢幕的四列範例；每列左 1/3 名稱、右 2/3 最多三行介紹。實際成就追蹤與解鎖尚未要求，因此未假裝完成。 |
 | Physics Grid 精密放置 | ✅ **【已完成－本輪】** | 原路徑確實把微方塊呼叫成 full cell；現在依 divisor 建立精確 local bounds，支援在 Grid 上單獨選取／移除最小命中 element，不會連帶刪除鄰接整格。自測驗證 1/16 尺寸與獨立移除。 |
@@ -360,7 +448,7 @@
 | 長期方向 | 狀態 | 目前證據與邊界 |
 |---|---|---|
 | Managed 輸出、Target Framework、依賴 | ✅ **【目前雙模式】** | VS／預設 CLI 使用 `net9.0`，具獨立 SDK 時可明確 opt-in `net10.0`；兩者 App 均位於各自 `bin/<Configuration>/<HostTFM>` 根目錄，Managed DLL 集中於 `Managed`。Mod API 保持 `netstandard2.1`，Example Mod 保持 `net6.0`。 |
-| Mod SDK 基礎 | 🟡 **【部分完成】** | 已有獨立 ModAPI、Example Mod、MODDING 文件、遊戲內編譯與依賴引用；尚無 `dotnet new rtxmod` 套件及正式 SDK 發布包。 |
+| Mod SDK 基礎 | ⚪ **【歷史狀態，已由 2026-10-11 直接 Hook 架構取代】** | 當時的獨立 ModAPI 已移除；目前不規劃以受限 SDK 取代 BepInEx／Harmony 直接 Hook。 |
 | Chunk／Region／Streaming／背景工作 | 🟡 **【可運作基礎完成】** | 已有 16×16 Chunk、32×32 Chunk Region、負座標、背景生成、取消、距離優先、工作預算、精確 dirty 與固定 Benchmark；遠距 LOD、Floating Origin 與 Generator Mod API 尚未完成。 |
 | Renderer Capability 與管線專屬設定 | ✅ **【已存在／已驗證】** | 六條 Renderer 具有能力描述，UI 依目前管線顯示設定；各設定已連接 Renderer。尚未建立通用 Render Graph 或完整 Profile override system。 |
 | Raster／Compute PT／Hardware DXR | 🟡 **【主要基礎可運作】** | Classic、Forward、Deferred、Hybrid、Compute PT、DXR 均為正式後端；Forward 已有簡化 temporal reprojection，完整 jitter／motion-vector TAA、統一 Temporal Context、正式 Denoiser、升頻 SDK 與完整多重反彈 GI 仍屬後續。 |
@@ -388,11 +476,11 @@
 | 項目 | 狀態 | 證據／下一步 |
 |---|---|---|
 | Host TFM | ✅ **【已更新】** | 2026-08-06 曾完成純 net10 Host 實驗；因 VS 2022 17.14 無法載入，2026-08-07 改為 VS 預設 `net9.0`、獨立 SDK 可選 `net10.0`。不再要求使用者升級到尚未安裝的 VS 18。 |
-| Mod API | ✅ **【維持現況】** | `RTXSandbox.ModAPI` 不依賴遊戲實作，繼續使用 `netstandard2.1`，可供新舊 Runtime 共用。 |
+| Mod API | ⚪ **【歷史狀態，已移除】** | 2026-10-11 起不再發佈獨立 ModAPI；見 Roadmap 頂部直接 Hook 架構。 |
 | NuGet／Renderer 相容性 | ✅ **【實機驗證完成】** | 所有既有 NuGet 依賴已在 net10 restore；RTX 5050 Release 實跑 Classic、Forward、Deferred、Hybrid、Compute PT、Hardware DXR 六管線皆通過，DXR Tier 1.1 真正建立 pipeline／shader table／BLAS／TLAS 並 Trace Rays。 |
 | BepInEx 6 on net10 | ✅ **【相容修正完成】** | 原 `6.0.0-be.785` 內含 HarmonyX 2.10.2／MonoMod 22.7，在 .NET 10 的 `PrepareMethod` 會造成 CLR fatal error。現顯式使用 HarmonyX 2.16.1／MonoMod.RuntimeDetour 25.3.4，並避開 build 785 對已移除 `PlatformHelper` 的 Paths／Console 舊入口；Debug／Release `--mod-diagnostics` 均完成 Chainloader startup。 |
 | net6／7／8／9／10 測試插件 | ✅ **【逐版本實載完成】** | 同一 Example Mod 依序以 `net6.0`、`net7.0`、`net8.0`、`net9.0`、`net10.0` 編譯並複製至 net10 Host；五次皆由 BepInEx 找到 1 個插件、建立 `BasePlugin` 並完成 startup。這證明最小插件 Runtime 相容；含衝突第三方依賴的實際 Mod 仍需個別驗證。 |
-| 遊戲內 Mod 編譯目標 | ✅ **【刻意維持 net6.0】** | ModWorkspace 繼續產生 `net6.0` DLL，以便單一插件可被較廣 Runtime 使用；其引用掃描本來就會略過高於 net6 的主程式實作 DLL並使用 `netstandard2.1` ModAPI。本輪 79/79 self-tests 包含實際 ModWorkspace 編譯通過。 |
+| 遊戲內 Mod 編譯目標 | ⚪ **【歷史狀態，已取代】** | 現在跟隨執行中 Host major TFM（預設 net9），才能直接引用遊戲程序集。 |
 
 ## Hardware DXR：彩色透光與 Infinite Mirror Extension V1（2026-08-06）
 
@@ -547,13 +635,13 @@
 | 項目 | 狀態 | Repository 現況與驗證 |
 |---|---|---|
 | 無限水平世界 | ✅ **【已完成－本輪可運作版】** | X／Z 不再由 `64×64` 限制；`ChunkCoordinate` 使用負數安全的 floor division，玩家周圍以半徑 3 Chunk、Seed 決定性背景惰性生成。自動測試已比較 `(-41, 73)` 遠距 Chunk 的兩個同 Seed 世界，內容完全一致。 |
-| 世界垂直範圍 | ✅ **【已完成－本輪】** | 世界座標正式為 Y `-64..511`（上界 512 exclusive）；一般地形／Flat surface 最高按需求限制在 256，但資料、編輯、碰撞與保存可使用完整高度。ModAPI 新增 `MinimumY`、`MaximumYExclusive` 與 `IsInside`。 |
+| 世界垂直範圍 | ✅ **【已完成－本輪】** | 世界座標正式為 Y `-64..511`（上界 512 exclusive）；一般地形／Flat surface 最高按需求限制在 256，但資料、編輯、碰撞與保存可使用完整高度。遊戲內部 world contract 提供 `MinimumY`、`MaximumYExclusive` 與 `IsInside`。 |
 | 32×32 Chunk Region 存檔 | ✅ **【已完成－本輪】** | Directory save 升級為 format v4；每個 `.region` 最多包含 32×32 個 16×16 Chunk，普通 voxel、micro voxel、負座標與空白但已生成 Chunk 都在同一容器。三個不同 Chunk 的測試只產生一個 Region；正負 Region 邊界、材質 ID remap、損壞 active Region 後整代 backup recovery 均通過。舊 v3 每-Chunk目錄與 v1–v7 單檔仍可載入並於下次保存遷移。 |
 | Renderer／Physics 接入 | ✅ **【已完成－本輪可運作版】** | Raster 使用實際 Chunk 高度 bounds 與 sparse snapshot 建 mesh；Compute PT 改為跟隨玩家的 64×576×64 GPU window；DXR 從當前可見／ray-neighborhood Chunk 建立世界幾何，動態 Grid 仍走獨立 BLAS refit；BEPU 靜態碰撞由 sparse column 合併建立。RTX 5050 實測 Classic 74 visible／22 culled、Compute PT 3 幀通過；DXR Tier 1.1 跑 16 幀、419,300 triangles、518,400 hit pixels、dynamic refit 1 次與 framebuffer readback 通過。 |
 | 程式／檔案結構整理 | ✅ **【已完成－本輪相關範圍】** | 新增獨立 `RegionCoordinate`；Chunk 儲存集中處理世界 Y→local Y 轉換與 sparse snapshot；Build Tool／Voxel Physics 改用 `VoxelPoint` key，移除無限座標下會碰撞的舊固定 64×64 linear key；刪除已停用的逐 Chunk 寫檔器。沒有重構無關子系統。 |
 | 遠距卸載／背景生成 | 🟡 **【部分完成－背景生成已完成】** | ♻️ **【舊問題已不存在】**：玩家跨 Chunk 不再同步生成整圈；單一背景 worker 會連續生成，主執行緒每幀最多提交一個完成結果，普通 `Get()` 也不再暗中生成。❌ 已走過的 Chunk 暫不卸載，GPU upload budget、LOD 與遠距 unload 仍未完成。 |
 
-驗證：Release build 0 warning／0 error；Debug 主程式與 ModAPI 使用獨立輸出（因使用者正在執行的 Debug 遊戲鎖住原輸出）0 warning／0 error；目前完整套件 79/79 self-tests 通過；RTX 5050 上六條 Renderer GPU smoke 均通過。
+當輪驗證：Release build 0 warning／0 error；Debug 主程式使用獨立輸出（因使用者正在執行的 Debug 遊戲鎖住原輸出）0 warning／0 error；當時 79/79 self-tests 通過；RTX 5050 上六條 Renderer GPU smoke 均通過。此為歷史證據，ModAPI 後來已移除。
 
 ## 本輪：Chunk／放置／水面／DXR 卡頓修正（2026-08-05）
 
@@ -584,7 +672,7 @@
 | 8. 世界管理 | ✅ **【已完成－本輪】** | 世界選單新增開啟、同 Seed／名稱／可調生成設定的覆蓋重新生成、只修改 display name 的重新命名，以及二次確認刪除；目前世界不可刪除。資料層測試驗證重建清除玩家修改但保留 Seed／Preset、rename 不改 storage／Seed、刪除拒絕路徑逃逸並移除目錄。 |
 | 9. 所有 Renderer 基本優化 | 🟡 **【部分完成－本輪 Physics／Shadow 快取】** | 原有 1.6× 保守視錐維持不變。Raster Physics Grid 改為局部座標靜態 VBO＋每幀 model matrix，只有 `TopologyVersion` 改變才重傳網格；Deferred／Hybrid 把完整靜態世界陰影與動態 Grid 陰影拆成兩張 2048² depth map，Grid 移動不再重畫 16 個靜態 Chunk。DXR 拆出靜／動 BLAS 並對同拓撲 Grid 做 refit。❌ 每 Chunk BLAS、occlusion culling、LOD、indirect/multi-draw 與大型世界 benchmark 留後續。 |
 | 10. 新 Renderer | ✅ **【已完成－本輪】** | 在 Deferred 與 Compute PT 之間新增真正可選的 **Hybrid PBR Raster（混合式 PBR 光柵）**：Deferred PBR opaque／G-Buffer lighting＋forward water/glass，固定至少品質 2，包含 shadow、SSR、HDR、Bloom、水與透明。RTX 5050 strict smoke feature mask 1023、12 direct-visible＋4 offscreen shadow-caster Chunk、非黑 framebuffer 通過。 |
-| 11. 中文輸入法 | 🟡 **【部分完成－等待人工組字確認】** | 取得焦點時以 `ImmAssociateContextEx(IACE_DEFAULT)` 恢復 Windows IME context；composition／candidate 座標完整轉成視窗 client space，排除區也不再混用 screen Y；文字輸入期間遊戲鍵盤控制保持停用。自動 IME callback、多語 Unicode 與鍵盤 ownership smoke 通過。🟡 自動測試無法替代使用者實際切換微軟注音並選字，仍需在本版執行檔做最後人工確認。 |
+| 11. 中文輸入法 | 🟡 **【部分完成－等待人工組字確認】** | 不再切换使用者键盘语言；只有实际文字框要求输入时才以 `ImmAssociateContextEx(IACE_DEFAULT)` 关联 IME，离开文字框或回到游戏立即解除，composition／candidate 坐标继续使用视窗 client space。自动 Unicode、候选位置与 ownership 测试通过。🟡 自动测试无法替代使用者实际切换微软注音并选字，仍需在本版执行档做最后人工确认。 |
 
 | 需求 | 狀態 | 目前可比對結果／下一個缺口 |
 |---|---|---|
@@ -595,12 +683,12 @@
 | Chunk Mesh 與基本效能 | 🟡 **【部分完成－本輪背景 meshing】** | Raster camera pass 已按 Chunk 建 mesh、剔除遮蔽面、分離透明幾何；Chunk CPU meshing 已迁移到单一背景 job，主线程每帧最多上传一个版本匹配结果；box-face allocation 与每 voxel Registry lock 已移除。Physics Grid 只上傳外露面與拓撲變更，BEPU 每幀只重建一個靜態 Chunk。DXR 静态方块已使用 greedy face。❌ byte/time GPU upload budget、Raster Greedy Mesh、远距 unload 與長時間大型世界壓力驗證尚未完成。 |
 | Renderer 架構與切換 | ✅ **【已完成－本輪】** | Compute Path Tracing、PBR Forward、Classic、Deferred、Hardware DXR 保持可用；Renderer 選單依序加入正式的 Hybrid PBR Raster，位於 Deferred 與 Compute PT 之間並通過 GPU smoke。 |
 | Renderer Capability／圖形設定 | 🟡 **【部分完成－本輪有進度】** | ✅ Deferred 已有 Renderer／G-Buffer／Lighting／Shadow／Reflection／AO／Water／Transparency／Fog／Post 品質，以及 HDR、Bloom、Tone Mapping、Exposure、10 種 Debug View。✅ Hardware RT 的打蠟開關已整理成 Render Style：Default／Wax／Reference／Debug。❌ Deferred Cascade Shadow／SSGI／OIT／Clustered 與 DXR 折射／GI／降噪仍是後續。 |
-| 水 | ✅ **【已完成－本輪更新】** | 游泳／上岸輸入規則維持已完成狀態。本輪修正所有 Raster 的方塊水接縫：只畫最高層 top surface、剔除 fluid 內部面、使用連續 world-space 水色／波紋；DXR 靜態水也只保留最高表面。水下 framebuffer average 181.10、range 13–238。 |
+| 水 | ✅ **【已完成－本輪更新】** | 游泳／上岸与有限体积流水维持已完成。Raster 水仍走独立透明 pass；本轮为大水面补上可改变轮廓的低频 world-space 几何波与细节法线波，按世界坐标跨方块／Chunk 连续，不会每格重新起波。DXR 用相同连续相位扰动命中法线，不每帧重建 BLAS；Android Classic／PBR／透明 pass 也加入连续几何与法线波，Android Compute PT 加入命中法线波。PBR underwater smoke 919 frames（average 221.77、range 100–245）与 RTX 5050 DXR 72 frames／376,960 hit pixels 均通过；Android x64 为 0-warning build，当前没有运行中的 VM，不能写成移动端画面实测。 |
 | 玩家碰撞與移動 | ✅ **【已完成－本輪】** | 固定碰撞體、連續 Grid 推出與固定物理步保持不變；本輪將水中岸邊抬升改為明確受跳躍輸入控制，避免前進鍵把高牆當成自動階梯。 |
 | Physics Grid | ✅ **【已完成－本輪渲染效能修正】** | 獨立剛體、平移／旋轉、BEPU compound collision、質量／重心、固定時間步、睡眠、raycast／選取及 Grid 放置保持可用。Raster／DXR 現在只建立 Grid 外露面；使用者存檔診斷 Grid triangles 由 465,408 降到 31,176，strict 場景 96 triangles／145,898 hits。DXR 動態 refit 不再誤清放置方塊造成的 static AS 更新。撞擊二次斷裂仍列後續。 |
 | 細分／Micro Build | 🟡 **【部分完成】** | 普通整格破壞、精密編輯、raycast、碰撞、渲染、Undo 與保存已完成。❌ Micro-volume 位於旋轉動態 Grid 的完整局部座標編輯／保存尚未完成。 |
 | 存檔與世界管理 | ✅ **【已完成－本輪 Region V4】** | 多世界管理與原子 generation／backup recovery 保持可用；每個 Region 現合併 32×32 Chunk，支援負座標與 Y -64..511，並保留舊 v3 目錄與舊單檔遷移。 |
-| Mod 與 ModAPI | ✅ **【已完成－本輪診斷補強】** | 原有獨立 `RTXSandbox.ModAPI` 與 BepInEx loader 已可用；未載入 DLL 現在會檢查 target framework 與 BepInPlugin／BasePlugin 入口，終端和模組頁會顯示明確原因。現有 `SoftBlockPhysicsMod.dll` 已確認為 .NET 9 且不含插件入口，因此不是可載入模組；Example Mod 仍可正常載入。 |
+| Mod 與 ModAPI | ⚪ **【歷史狀態，ModAPI 已移除】** | BepInEx 診斷保留；模組改為直接 Hook `RTXSandbox.dll`。 |
 | UI 與操作入口 | 🟡 **【部分完成－本輪修正】** | ✅ 獨立 8 鍵暫停選單、ESC 存檔關閉、背景自動暫停、Minecraft 風格背包與世界管理入口均已接線。✅ 模組從設定移到暫停選單的獨立畫面；設定／模組使用「完成」返回原選單。✅ 全域關閉鍵與 ImGui keyboard capture 已拆開：設定可用 ESC，物品欄可用 ESC／E／I／Tab；只有文字欄輸入與實際 IME composition 會保留輸入鍵。🟡 真正 Windows 中文 IME 的人工組字選字仍需使用者確認。 |
 | Shader 與錯誤回退 | 🟡 **【部分完成】** | Shader 編譯錯誤、Renderer 建立失敗保留舊 Renderer、缺少能力不顯示假後端及 GPU 資源釋放已有基礎。❌ 運行中 Shader Reload／保留上一版成功 program 的完整操作入口尚未完成。 |
 | Debug、測試與效能資料 | 🟡 **【部分完成－本輪更新】** | 79 項自動測試全部通過；新增 generation cancellation、occupied bounds、urgent collision 與大型 Grid bounds。RTX 5050 上 Classic、Forward、Deferred、Hybrid、Compute PT、Hardware DXR 與水下 framebuffer smoke 全通過。❌ 尚缺長時間無限探索壓力測試與完整 GPU timing／benchmark。 |
@@ -608,7 +696,7 @@
 
 ### 本輪驗證基準
 
-- Debug：使用者目前執行中的 `RTXSandbox (PID 1460)` 鎖住標準 Debug DLL／plugin deployment，因此沒有關閉使用者遊戲；主程式與 ModAPI 改用獨立輸出完整 Build，Example Mod 以獨立輸出 `Compile` target 驗證，三者 0 警告／0 編譯錯誤。標準 solution post-build copy 仍須關閉該執行中遊戲後才能覆寫 plugin。
+- 當輪 Debug：使用者執行中的遊戲曾鎖住標準 Debug DLL／plugin deployment，因此主程式與當時的 API project 改用獨立輸出驗證。該 API project 已於 2026-10-11 移除。
 - `dotnet build RTXSandbox.sln -c Release --no-restore`：成功，3 個專案，0 警告／0 錯誤。
 - `--self-test`：79/79 通過；包含 queued Chunk 非同步提交／取消、occupied bounds、urgent collision rebuild 與大型 Grid bounds。
 - Direct3D 12 DXR V1、Compute、Deferred、Hybrid PBR Raster、PBR Forward、Classic GPU smoke：最終版全部通過且都等待 49 個測試 Chunk 串流完成。Classic／Forward 為 43 visible／6 culled。
@@ -706,7 +794,7 @@
 - [ ] 背景 save／mesh job 與 streaming
 - [ ] Generator pass／biome／climate／river 分層
 - [x] **【部分完成】** 16 單位有限水量、守恆流動、方塊排水、小型連通管平衡、分級水面與 Region v2；流速／黏度／大型海洋壓力仍待後續
-- [x] 外部 Example Mod 獨立專案、BepInEx DLL 部署及 ModAPI 註冊驗證
+- [x] 外部 Example Mod 獨立專案、BepInEx DLL 部署；註冊驗證已改為直接 BepInEx／Harmony game hook
 - [ ] 將目前位於主程式的 `BepInExBootstrap` 拆成獨立 loader adapter 專案
 
 ## 0.12 — Precision Building（已完成）

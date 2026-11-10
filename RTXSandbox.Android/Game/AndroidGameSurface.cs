@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Text.Json;
 using System.Numerics;
 using Android.Content;
 using Android.Opengl;
@@ -8,7 +9,7 @@ using ImGuiNET;
 using Java.Nio;
 using Javax.Microedition.Khronos.Egl;
 using Javax.Microedition.Khronos.Opengles;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.Android.TouchControls;
 using RTXSandbox.Configuration;
 using RTXSandbox.Gameplay;
@@ -103,7 +104,6 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private readonly ItemRegistry _items;
     private readonly RecipeRegistry _recipes;
     private readonly BuildToolRegistry _tools;
-    private readonly ModHost _modHost;
     private readonly ISharedPreferences _uiPreferences;
     private readonly WorldClock _worldClock;
     private readonly PlayerInventory _inventory;
@@ -187,7 +187,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private float _selectionDistance;
     private int _streamingRadius;
     private int _settingsTab = -1;
-    private string _paletteSearch = string.Empty;
+    private readonly CreativeInventoryModel _creativeInventory = new();
     private readonly HashSet<string> _favoriteBlocks = new(StringComparer.OrdinalIgnoreCase);
     private IReadOnlyList<WorldSaveSummary> _knownWorlds = Array.Empty<WorldSaveSummary>();
     private string _selectedWorldStorage = "world1";
@@ -244,10 +244,16 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         _items = new ItemRegistry(_blocks);
         _recipes = new RecipeRegistry();
         _tools = new BuildToolRegistry();
-        _modHost = new ModHost(this, _blocks, _items, _recipes, _tools, _world);
-        _modHost.AttachApi();
-        _modHost.PublishWorldReady();
         _hotbar = new CreativeHotbar(_blocks);
+        try
+        {
+            var saved = JsonSerializer.Deserialize<CreativeStack[]>(_uiPreferences.GetString("creative-hotbar-stacks", "[]") ?? "[]");
+            if (saved is not null)
+                for (int i = 0; i < Math.Min(saved.Length, CreativeHotbar.SlotCount); i++) _hotbar.SetStack(i, saved[i]);
+            _creativeInventory.RestoreBackpack(JsonSerializer.Deserialize<CreativeStack[]>(
+                _uiPreferences.GetString("creative-backpack", "[]") ?? "[]"));
+        }
+        catch (JsonException ex) { System.Diagnostics.Debug.WriteLine($"Creative inventory settings invalid: {ex.Message}"); }
         _inventory = new PlayerInventory(_items);
         if (loaded && state.Inventory.Count > 0)
         {
@@ -479,7 +485,6 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                 _waterFlow.Update(deltaTime);
                 _physics.SetSimulationFocus(_player.Position);
                 _physics.Update(deltaTime);
-                _modHost.Update(deltaTime);
                 _worldClock.Update(deltaTime);
                 float targetFov = sprint ? 7f : 0f;
                 float blend = 1f - MathF.Exp(-10f * deltaTime);
@@ -566,6 +571,8 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES31.GlUniform1f(GLES31.GlGetUniformLocation(_computeProgram, "uTanHalfFov"),
             MathF.Tan(_camera.FieldOfViewDegrees * MathF.PI / 360f));
         GLES31.GlUniform1f(GLES31.GlGetUniformLocation(_computeProgram, "uDaylight"), DaylightStrength());
+        GLES31.GlUniform1f(GLES31.GlGetUniformLocation(_computeProgram, "uTime"),
+            (float)_clock.Elapsed.TotalSeconds);
         GLES31.GlUniform3i(GLES31.GlGetUniformLocation(_computeProgram, "uVoxelOrigin"),
             _computeOriginX, _computeOriginY, _computeOriginZ);
         GLES31.GlActiveTexture(GLES31.GlTexture0);
@@ -763,6 +770,12 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         GLES30.GlUniform2f(GLES30.GlGetUniformLocation(_lightingProgram, "uResolution"), _width, _height);
         GLES30.GlUniform1i(GLES30.GlGetUniformLocation(_lightingProgram, "uHybrid"), hybrid ? 1 : 0);
         GLES30.GlUniform1f(GLES30.GlGetUniformLocation(_lightingProgram, "uDaylight"), daylight);
+        Vector3 cameraForward = Vector3.Normalize(_camera.Forward);
+        Vector3 cameraRight = Vector3.Normalize(Vector3.Cross(cameraForward, Vector3.UnitY));
+        Vector3 cameraUp = Vector3.Normalize(Vector3.Cross(cameraRight, cameraForward));
+        SetVector3Uniform(_lightingProgram, "uCameraForward", cameraForward);
+        SetVector3Uniform(_lightingProgram, "uCameraRight", cameraRight);
+        SetVector3Uniform(_lightingProgram, "uCameraUp", cameraUp);
         GLES30.GlDrawArrays(GLES30.GlTriangles, 0, 3);
 
         GLES30.GlBindFramebuffer(GLES30.GlReadFramebuffer, _gbufferFramebuffer);
@@ -890,6 +903,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                 label: (slot + 1).ToString(),
                 interactive: false,
                 compact: true);
+            CreativeInventoryPanel.Count(ImGui.GetWindowDrawList(), ImGui.GetItemRectMin(), 58f, _hotbar.GetStack(slot).Count);
         }
         ImGui.End();
 
@@ -1220,6 +1234,15 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     private void DrawBlockLibraryImGui()
     {
+        if (_uiMode == AndroidGameUiMode.Inventory)
+        {
+            CreativeInventoryAction action = CreativeInventoryPanel.Draw(new Vector2(_width, _height),
+                _creativeInventory, _blocks.PlaceableDefinitions(), _hotbar, _favoriteBlocks, T,
+                block => block.DisplayName, DrawMaterialCube, PublishUiState);
+            if (action == CreativeInventoryAction.Close) SetUiMode(AndroidGameUiMode.Gameplay);
+            if (action == CreativeInventoryAction.BuildTools) SetUiMode(AndroidGameUiMode.BuildTools);
+            return;
+        }
         ImGui.SetNextWindowPos(new Vector2(_width * 0.5f, _height * 0.5f),
             ImGuiCond.FirstUseEver, new Vector2(0.5f));
         ImGui.SetNextWindowSize(new Vector2(
@@ -1228,85 +1251,21 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         if (ImGui.Begin("RTX Sandbox Editor", ref open,
                 ImGuiWindowFlags.NoCollapse))
         {
-            ImGui.TextDisabled($"{BlockChoices.Count} materials | E closes editor");
-            if (ImGui.BeginTabBar("EditorTabs"))
+            if (ImGui.Button(T("palette_title"))) SetUiMode(AndroidGameUiMode.Inventory);
+            ImGui.SeparatorText(T("build_tools"));
+            ImGui.TextWrapped("Left click removes. Right click places the selected material.");
+            bool precision = _precisionMode;
+            if (ImGui.Checkbox("Precision micro-voxel mode (V)", ref precision))
             {
-                bool blocksTabOpen = true;
-                if (ImGui.BeginTabItem("Blocks", ref blocksTabOpen, _uiMode == AndroidGameUiMode.Inventory
-                        ? ImGuiTabItemFlags.SetSelected
-                        : ImGuiTabItemFlags.None))
-                {
-                    ImGui.TextWrapped("Creative Library: every material is unlimited. Tap a material to put it in the active quickbar slot.");
-                    ImGui.Text("Quickbar");
-                    for (int slot = 0; slot < CreativeHotbar.SlotCount; slot++)
-                    {
-                        if (slot > 0) ImGui.SameLine();
-                        BlockDefinition quickBlock = _hotbar.GetBlock(slot);
-                        if (DrawBlockCard(
-                                quickBlock,
-                                new Vector2(76f, 76f),
-                                $"library-quickbar-{slot}",
-                                selected: slot == _hotbar.SelectedSlot,
-                                label: (slot + 1).ToString(),
-                                compact: true))
-                            _hotbar.SelectedSlot = slot;
-                    }
-                    ImGui.Separator();
-                    ImGui.SetNextItemWidth(330f);
-                    ImGui.InputText("Search", ref _paletteSearch, 128);
-                    BlockDefinition[] visible = CreativePaletteOrdering.Order(
-                        _blocks.PlaceableDefinitions().Where(block =>
-                            string.IsNullOrWhiteSpace(_paletteSearch) ||
-                            block.DisplayName.Contains(_paletteSearch, StringComparison.OrdinalIgnoreCase) ||
-                            block.Key.Contains(_paletteSearch, StringComparison.OrdinalIgnoreCase)),
-                        useSimpleGroups: true);
-                    ImGui.TextDisabled($"Showing {visible.Length} of {BlockChoices.Count} materials");
-                    if (ImGui.BeginChild("BlockPaletteScroll", Vector2.Zero, ImGuiChildFlags.Borders))
-                    {
-                        int columns = Math.Max(1, (int)(ImGui.GetContentRegionAvail().X / 112f));
-                        for (int index = 0; index < visible.Length; index++)
-                        {
-                            BlockDefinition block = visible[index];
-                            ImGui.PushID($"block:{block.Key}");
-                            if (DrawBlockCard(
-                                    block,
-                                    new Vector2(104f, 102f),
-                                    $"material-{block.Key}",
-                                    selected: block.Id == _hotbar.SelectedBlock.Id,
-                                    label: ShortName(block.DisplayName, 14)))
-                            {
-                                _hotbar.SelectAndAssign(block.Id);
-                                PublishUiState();
-                            }
-                            ImGui.PopID();
-                            if ((index + 1) % columns != 0) ImGui.SameLine();
-                        }
-                    }
-                    ImGui.EndChild();
-                    ImGui.EndTabItem();
-                }
-                bool toolsTabOpen = true;
-                if (ImGui.BeginTabItem("Tools", ref toolsTabOpen, _uiMode == AndroidGameUiMode.BuildTools
-                        ? ImGuiTabItemFlags.SetSelected
-                        : ImGuiTabItemFlags.None))
-                {
-                    ImGui.TextWrapped("Left click removes. Right click places the selected material.");
-                    bool precision = _precisionMode;
-                    if (ImGui.Checkbox("Precision micro-voxel mode (V)", ref precision))
-                    {
-                        _precisionMode = precision;
-                        _microBuild.Enabled = precision;
-                        PublishUiState();
-                    }
-                    int gridIndex = _microBuild.SupportedDivisors.ToList().IndexOf(_microBuild.GridDivisor);
-                    string[] grids = _microBuild.SupportedDivisors.Select(value => $"1/{value}").ToArray();
-                    if (ImGui.Combo("Precision grid", ref gridIndex, grids, grids.Length) && gridIndex >= 0)
-                        _microBuild.SetGridDivisor(_microBuild.SupportedDivisors[gridIndex]);
-                    ImGui.TextDisabled("Android touch bindings are edited from Pause > Touch Editor.");
-                    ImGui.EndTabItem();
-                }
-                ImGui.EndTabBar();
+                _precisionMode = precision;
+                _microBuild.Enabled = precision;
+                PublishUiState();
             }
+            int gridIndex = _microBuild.SupportedDivisors.ToList().IndexOf(_microBuild.GridDivisor);
+            string[] grids = _microBuild.SupportedDivisors.Select(value => $"1/{value}").ToArray();
+            if (ImGui.Combo("Precision grid", ref gridIndex, grids, grids.Length) && gridIndex >= 0)
+                _microBuild.SetGridDivisor(_microBuild.SupportedDivisors[gridIndex]);
+            ImGui.TextDisabled("Android touch bindings are edited from Pause > Touch Editor.");
         }
         ImGui.End();
         if (!open) SetUiMode(AndroidGameUiMode.Gameplay);
@@ -1348,7 +1307,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         drawList.AddRect(position, position + size, borderColor, 1f, ImDrawFlags.None, selected ? 3f : 2f);
 
         float labelHeight = compact ? 13f : 23f;
-        DrawMaterialCube(
+        if (block.Id != 0) DrawMaterialCube(
             drawList,
             position + new Vector2(4f, 3f),
             new Vector2(size.X - 8f, size.Y - labelHeight - 4f),
@@ -1383,6 +1342,17 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     private void DrawMaterialCube(ImDrawListPtr drawList, Vector2 position, Vector2 size, BlockDefinition block)
     {
+        if (block.Tags.Any(tag => tag.Equals("energy-projector", StringComparison.OrdinalIgnoreCase)))
+        {
+            DrawEnergyProjectorIcon(drawList, position, size);
+            return;
+        }
+        if (MechanicalPartGeometry.IsMechanical(block))
+        {
+            MechanicalItemIcon.Draw(drawList, position, size, block);
+            return;
+        }
+
         float halfWidth = MathF.Min(size.X * 0.42f, size.Y * 0.46f);
         float topHeight = halfWidth * 0.56f;
         float sideHeight = MathF.Min(size.Y - topHeight - 1f, halfWidth * 0.98f);
@@ -1428,6 +1398,39 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         drawList.AddLine(left, middle, outline, 1f);
         drawList.AddLine(middle, right, outline, 1f);
         drawList.AddLine(middle, middleBottom, outline, 1f);
+    }
+
+    private static void DrawEnergyProjectorIcon(ImDrawListPtr drawList, Vector2 position, Vector2 size)
+    {
+        Vector2 center = position + size * 0.5f;
+        float scale = MathF.Min(size.X, size.Y) / 48f;
+        Vector2 direction = Vector2.Normalize(new Vector2(1f, -0.30f));
+        Vector2 normal = new(-direction.Y, direction.X);
+        Vector2 rear = center - direction * (15f * scale);
+        Vector2 muzzle = center + direction * (15f * scale);
+        Vector2 bodyA = rear - normal * (6f * scale);
+        Vector2 bodyB = muzzle - normal * (5f * scale);
+        Vector2 bodyC = muzzle + normal * (5f * scale);
+        Vector2 bodyD = rear + normal * (7f * scale);
+        uint dark = ImGui.ColorConvertFloat4ToU32(new Vector4(0.025f, 0.09f, 0.14f, 1f));
+        uint steel = ImGui.ColorConvertFloat4ToU32(new Vector4(0.18f, 0.34f, 0.42f, 1f));
+        uint cyan = ImGui.ColorConvertFloat4ToU32(new Vector4(0.08f, 0.86f, 1f, 1f));
+        uint cyanGlow = ImGui.ColorConvertFloat4ToU32(new Vector4(0.08f, 0.78f, 1f, 0.22f));
+        drawList.AddCircleFilled(muzzle, 11f * scale, cyanGlow, 24);
+        drawList.AddQuadFilled(bodyA, bodyB, bodyC, bodyD, steel);
+        drawList.AddLine(bodyA, bodyB, dark, 1.6f * scale);
+        drawList.AddLine(bodyB, bodyC, dark, 1.6f * scale);
+        drawList.AddLine(bodyC, bodyD, dark, 1.6f * scale);
+        drawList.AddLine(bodyD, bodyA, dark, 1.6f * scale);
+        Vector2 gripTop = center - direction * (5f * scale) + normal * (5f * scale);
+        drawList.AddQuadFilled(
+            gripTop - direction * (3f * scale),
+            gripTop + direction * (4f * scale),
+            gripTop + direction * scale + normal * (13f * scale),
+            gripTop - direction * (6f * scale) + normal * (12f * scale), dark);
+        drawList.AddLine(rear + direction * (4f * scale), muzzle - direction * (4f * scale), cyan, 3f * scale);
+        drawList.AddCircleFilled(muzzle, 5.2f * scale, dark, 20);
+        drawList.AddCircle(muzzle, 6.4f * scale, cyan, 20, 2f * scale);
     }
 
     private MaterialTileUv MaterialTileUvFor(ushort materialId, MaterialFace face)
@@ -1755,6 +1758,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             _nextHeldDestroyAt = 0;
         }
         bool place = _input.ConsumePressed(VirtualBindingKind.Mouse, "Right");
+        place &= _hotbar.SelectedBlock.Id != 0;
         if (!destroy && !place) return;
 
         PhysicsGridRayHit? gridHit = _world.PhysicsGrids.Raycast(
@@ -1892,6 +1896,14 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
 
     private void SetUiMode(AndroidGameUiMode mode)
     {
+        if (_uiMode == AndroidGameUiMode.Inventory && mode != AndroidGameUiMode.Inventory)
+        {
+            _creativeInventory.CancelCarry(_hotbar);
+            _uiPreferences.Edit()!
+                .PutString("creative-hotbar-stacks", JsonSerializer.Serialize(_creativeInventory.SnapshotHotbar(_hotbar)))!
+                .PutString("creative-backpack", JsonSerializer.Serialize(_creativeInventory.SnapshotBackpack()))!
+                .Apply();
+        }
         _uiMode = mode;
         _input.ReleaseAll();
         PublishUiState();
@@ -2891,6 +2903,8 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
     private const string VertexShader = """
         uniform mat4 uMvp;
         uniform mat4 uLightMvp;
+        uniform float uTime;
+        uniform float uWaterMaterial;
         attribute vec3 aPosition;
         attribute vec3 aNormal;
         attribute vec3 aColor;
@@ -2911,7 +2925,15 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         varying vec3 vEmission;
         varying vec4 vShadowPosition;
         void main() {
-            vPosition = aPosition;
+            vec3 position = aPosition;
+            bool waterSurfaceVertex = abs(aTexMaterial.z - uWaterMaterial) < 0.5 &&
+                (aNormal.y > 0.65 || (abs(aNormal.y) < 0.65 && aTexMaterial.y > 0.99));
+            if (waterSurfaceVertex) {
+                position.y += sin(dot(position.xz, vec2(0.42, 0.18)) + uTime * 0.55) * 0.014
+                    + sin(dot(position.xz, vec2(-0.16, 0.37)) - uTime * 0.37) * 0.009
+                    + sin(dot(position.xz, vec2(0.11, 0.09)) + uTime * 0.23) * 0.005;
+            }
+            vPosition = position;
             vNormal = aNormal;
             vAlbedo = aColor;
             vMetallic = aMetallic;
@@ -2921,18 +2943,21 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             vMaterialId = aTexMaterial.z;
             vMaterialFace = aTexMaterial.w;
             vEmission = aEmission;
-            vShadowPosition = uLightMvp * vec4(aPosition, 1.0);
-            gl_Position = uMvp * vec4(aPosition, 1.0);
+            vShadowPosition = uLightMvp * vec4(position, 1.0);
+            gl_Position = uMvp * vec4(position, 1.0);
         }
         """;
 
     private const string ClassicFragmentShader = """
         precision mediump float;
+        uniform float uTime;
+        uniform float uWaterMaterial;
         uniform sampler2D uShadowMap;
         uniform sampler2D uMaterialAtlas;
         uniform vec2 uMaterialAtlasSize;
         uniform vec2 uShadowTexel;
         uniform float uDaylight;
+        varying vec3 vPosition;
         varying vec3 vNormal;
         varying vec3 vAlbedo;
         varying float vAlpha;
@@ -2963,6 +2988,13 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         void main() {
             vec3 lightDirection = normalize(vec3(0.45, 0.82, 0.32));
             vec3 normal = normalize(vNormal);
+            if (abs(vMaterialId - uWaterMaterial) < 0.5 && abs(normal.y) > 0.65) {
+                vec2 wave =
+                    cos(dot(vPosition.xz, vec2(0.42, 0.18)) + uTime * 0.55) * vec2(0.42, 0.18) * 0.014 +
+                    cos(dot(vPosition.xz, vec2(-0.16, 0.37)) - uTime * 0.37) * vec2(-0.16, 0.37) * 0.009 +
+                    cos(dot(vPosition.xz, vec2(0.11, 0.09)) + uTime * 0.23) * vec2(0.11, 0.09) * 0.005;
+                normal = normalize(normal + vec3(wave.x, 0.0, wave.y));
+            }
             vec3 albedo = mix(vAlbedo, texture2D(uMaterialAtlas, materialUv(vTexCoord)).rgb, 0.96);
             float dayLight = 0.27 + max(dot(normal, lightDirection), 0.0) * 0.73 * shadowVisibility(normal, lightDirection);
             float light = mix(0.035, dayLight, uDaylight);
@@ -3053,10 +3085,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             vec2 detail = texture2D(uMaterialDetailAtlas, atlasUv).rg;
             vec3 n = detailNormal(vNormal, vTexCoord);
             if (abs(vMaterialId - uWaterMaterial) < 0.5) {
-                vec2 wave = vec2(
-                    sin(vPosition.x * 2.3 + uTime * 1.35) + sin(vPosition.z * 3.1 - uTime * 0.92),
-                    cos(vPosition.z * 2.0 + uTime * 1.08) + cos(vPosition.x * 2.7 - uTime * 0.74));
-                n = normalize(n + vec3(wave.x * 0.055, 0.0, wave.y * 0.055));
+                vec2 wave =
+                    cos(dot(vPosition.xz, vec2(0.42, 0.18)) + uTime * 0.55) * vec2(0.42, 0.18) * 0.014 +
+                    cos(dot(vPosition.xz, vec2(-0.16, 0.37)) - uTime * 0.37) * vec2(-0.16, 0.37) * 0.009 +
+                    cos(dot(vPosition.xz, vec2(0.11, 0.09)) + uTime * 0.23) * vec2(0.11, 0.09) * 0.005;
+                n = normalize(n + vec3(wave.x, 0.0, wave.y));
             }
             vec3 v = normalize(uCamera - vPosition);
             vec3 l = normalize(vec3(0.45, 0.82, 0.32));
@@ -3221,6 +3254,9 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         uniform vec2 uResolution;
         uniform int uHybrid;
         uniform float uDaylight;
+        uniform vec3 uCameraForward;
+        uniform vec3 uCameraRight;
+        uniform vec3 uCameraUp;
         in vec2 vUv;
         out vec4 outColor;
         const float PI = 3.14159265359;
@@ -3249,6 +3285,37 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             blocked += smoothstep(0.00008, 0.007, center - texture(uDepth, uv + vec2(0.0,  2.0) * texel).r);
             blocked += smoothstep(0.00008, 0.007, center - texture(uDepth, uv + vec2(0.0, -2.0) * texel).r);
             return clamp(1.0 - blocked * 0.105, 0.58, 1.0);
+        }
+        vec4 screenSpaceReflection(vec2 originUv, float originDepth, vec3 reflectedWorld) {
+            vec3 reflectedView = vec3(
+                dot(reflectedWorld, uCameraRight),
+                dot(reflectedWorld, uCameraUp),
+                dot(reflectedWorld, uCameraForward));
+            if (reflectedView.z <= 0.015) return vec4(0.0);
+            vec2 texel = 1.0 / uResolution;
+            vec2 direction = vec2(reflectedView.x, -reflectedView.y) /
+                max(reflectedView.z, 0.12);
+            float directionLength = length(direction);
+            if (directionLength < 0.0001) return vec4(0.0);
+            direction /= directionLength;
+            float depthSlope = 0.0011 + (1.0 - reflectedView.z) * 0.0016;
+            for (int stepIndex = 1; stepIndex <= 20; stepIndex++) {
+                float stepDistance = float(stepIndex) * 3.0;
+                vec2 sampleUv = originUv + direction * texel * stepDistance;
+                if (any(lessThanEqual(sampleUv, vec2(0.002))) || any(greaterThanEqual(sampleUv, vec2(0.998))))
+                    break;
+                float sampleDepth = texture(uDepth, sampleUv).r;
+                if (sampleDepth >= 0.9998) continue;
+                float expectedDepth = originDepth + depthSlope * float(stepIndex);
+                float thickness = 0.004 + float(stepIndex) * 0.0008;
+                if (abs(sampleDepth - expectedDepth) <= thickness) {
+                    vec3 reflectedAlbedo = texture(uAlbedoMetal, sampleUv).rgb;
+                    float edgeFade = smoothstep(0.0, 0.12,
+                        min(min(sampleUv.x, sampleUv.y), min(1.0 - sampleUv.x, 1.0 - sampleUv.y)));
+                    return vec4(reflectedAlbedo, edgeFade);
+                }
+            }
+            return vec4(0.0);
         }
         void main() {
             vec4 albedoMetal = texture(uAlbedoMetal, vUv);
@@ -3282,8 +3349,11 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
             vec3 reflectedSky = mix(vec3(0.08, 0.13, 0.21), vec3(0.40, 0.66, 0.94),
                 clamp(reflected.y * 0.5 + 0.5, 0.0, 1.0)) * mix(0.035, 1.0, uDaylight);
             float environmentWeight = clamp(max(max(f.r, f.g), f.b) * (1.0 - roughness * 0.80), 0.0, 0.94);
-            if (uHybrid != 0)
-                color = mix(color, reflectedSky * mix(vec3(1.0), albedo, metallic), environmentWeight);
+            if (uHybrid != 0) {
+                vec4 ssr = screenSpaceReflection(vUv, texture(uDepth, vUv).r, reflected);
+                vec3 reflectedScene = mix(reflectedSky, ssr.rgb, ssr.a);
+                color = mix(color, reflectedScene * mix(vec3(1.0), albedo, metallic), environmentWeight);
+            }
             else
                 color += reflectedSky * f * (1.0 - roughness) * 0.16;
             color = color / (color + vec3(1.0));
@@ -3325,6 +3395,7 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
         uniform vec3 uUp;
         uniform float uTanHalfFov;
         uniform float uDaylight;
+        uniform float uTime;
         uniform ivec3 uVoxelOrigin;
         uniform int uWaterMaterial;
         const ivec3 WindowSize = ivec3(64, 256, 64);
@@ -3431,6 +3502,13 @@ internal sealed class AndroidGameRenderer : Java.Lang.Object, GLSurfaceView.IRen
                 color = skyColor(ray);
             } else {
                 vec4 material = materialData(materialId);
+                if (materialId == uint(uWaterMaterial) && abs(normal.y) > 0.65) {
+                    vec2 wave =
+                        cos(dot(hitPosition.xz, vec2(0.42, 0.18)) + uTime * 0.55) * vec2(0.42, 0.18) * 0.014 +
+                        cos(dot(hitPosition.xz, vec2(-0.16, 0.37)) - uTime * 0.37) * vec2(-0.16, 0.37) * 0.009 +
+                        cos(dot(hitPosition.xz, vec2(0.11, 0.09)) + uTime * 0.23) * vec2(0.11, 0.09) * 0.005;
+                    normal = normalize(normal + vec3(wave.x, 0.0, wave.y));
+                }
                 vec3 sunDirection = normalize(vec3(0.45, 0.82, 0.32));
                 vec3 shadowNormal;
                 vec3 shadowHit;

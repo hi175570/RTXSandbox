@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>RTXSandbox.ManifoldGarden.Plugin</AssemblyName>
+    <ManifoldGardenRoot Condition="'$(ManifoldGardenRoot)' == ''">C:\D\games\Manifold Garden</ManifoldGardenRoot>
+    <BepInExRoot>$(ManifoldGardenRoot)\BepInEx</BepInExRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\BridgeMemory.cs" Link="BridgeMemory.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Core" HintPath="$(BepInExRoot)\core\BepInEx.Core.dll" Private="false" />
+    <Reference Include="BepInEx.IL2CPP" HintPath="$(BepInExRoot)\core\BepInEx.IL2CPP.dll" Private="false" />
+    <Reference Include="0Harmony" HintPath="$(BepInExRoot)\core\0Harmony.dll" Private="false" />
+    <Reference Include="UnhollowerBaseLib" HintPath="$(BepInExRoot)\core\UnhollowerBaseLib.dll" Private="false" />
+    <Reference Include="UnhollowerRuntimeLib" HintPath="$(BepInExRoot)\core\UnhollowerRuntimeLib.dll" Private="false" />
+    <Reference Include="Il2Cppmscorlib" HintPath="$(BepInExRoot)\unhollowed\Il2Cppmscorlib.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(BepInExRoot)\unhollowed\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(BepInExRoot)\unhollowed\UnityEngine.InputLegacyModule.dll" Private="false" />
+    <Reference Include="UnityEngine.PhysicsModule" HintPath="$(BepInExRoot)\unhollowed\UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="UnityEngine.TextRenderingModule" HintPath="$(BepInExRoot)\unhollowed\UnityEngine.TextRenderingModule.dll" Private="false" />
+    <Reference Include="UnityEngine.UI" HintPath="$(BepInExRoot)\unhollowed\UnityEngine.UI.dll" Private="false" />
+    <Reference Include="UnityEngine.UIModule" HintPath="$(BepInExRoot)\unhollowed\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="Assembly-CSharp" HintPath="$(BepInExRoot)\unhollowed\Assembly-CSharp.dll" Private="false" />
+  </ItemGroup>
+</Project>

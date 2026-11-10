@@ -1,22 +1,21 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <ExampleModTargetFramework Condition="'$(ExampleModTargetFramework)' == ''">net6.0</ExampleModTargetFramework>
     <RTXSandboxHostTargetFramework Condition="'$(RTXSandboxHostTargetFramework)' == ''">net9.0</RTXSandboxHostTargetFramework>
-    <TargetFramework>$(ExampleModTargetFramework)</TargetFramework>
+    <TargetFramework>$(RTXSandboxHostTargetFramework)</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>RTXSandbox.ExampleMod</AssemblyName>
-    <Description>External example plugin for the RTX Sandbox ModAPI</Description>
+    <Description>External BepInEx/Harmony plugin using direct game hooks</Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj" />
+    <ProjectReference Include="..\..\RTXSandbox.csproj" Private="false" />
+    <PackageReference Include="HarmonyX" Version="2.16.1" PrivateAssets="all" />
     <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" PrivateAssets="all" />
   </ItemGroup>
 
   <Target Name="CopyPluginToGame" AfterTargets="Build">
     <PropertyGroup>
-      <!-- The sample remains net6.0 while following the selected game host output. -->
       <PluginDirectory>$(MSBuildProjectDirectory)\..\..\bin\$(Configuration)\$(RTXSandboxHostTargetFramework)\BepInEx\plugins</PluginDirectory>
     </PropertyGroup>
     <MakeDir Directories="$(PluginDirectory)" />

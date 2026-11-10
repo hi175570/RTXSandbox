@@ -3,7 +3,7 @@ using System.Text.Json;
 using RTXSandbox.Infrastructure;
 using System.Text.Json.Serialization;
 using System.Text.Json.Nodes;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 
 namespace RTXSandbox.World;
 
@@ -211,7 +211,8 @@ public static class BlockContentLoader
                 block.AnimationSpeed,
                 block.TextureGenerator,
                 block.TextureVariation,
-                block.TextureSeed),
+                block.TextureSeed,
+                block.Density),
                 force: forceAll || block.Force);
         }
         return document.Blocks.Count;
@@ -299,6 +300,7 @@ public static class BlockContentLoader
         public string TextureGenerator { get; set; } = "auto";
         public float TextureVariation { get; set; } = -1f;
         public int TextureSeed { get; set; }
+        public float Density { get; set; } = 1f;
         public bool Force { get; set; }
     }
 

@@ -26,6 +26,7 @@ public sealed record ModCompilationResult(
 /// </summary>
 public sealed class ModWorkspace
 {
+    private static readonly string HostTargetFramework = $"net{Environment.Version.Major}.0";
     private const long MaximumEditableBytes = 4L * 1024L * 1024L;
     private readonly string _pluginRoot;
     private readonly string _pluginRootPrefix;
@@ -172,12 +173,12 @@ public sealed class ModWorkspace
                 string log = process.Output.Trim();
                 if (success)
                 {
-                    log = $"net6.0 編譯成功；引用 {references.Count} 個遊戲／插件組件。" +
+                    log = $"{HostTargetFramework} 直接遊戲組件編譯成功；引用 {references.Count} 個遊戲／插件組件。" +
                           (string.IsNullOrWhiteSpace(log) ? string.Empty : Environment.NewLine + log);
                 }
                 else if (string.IsNullOrWhiteSpace(log))
                 {
-                    log = "dotnet build 沒有產生 DLL。請確認已安裝可建置 net6.0 的 .NET SDK。";
+                    log = $"dotnet build 沒有產生 DLL。請確認已安裝可建置 {HostTargetFramework} 的 .NET SDK。";
                 }
 
                 return new ModCompilationResult(
@@ -291,7 +292,7 @@ public sealed class ModWorkspace
                 string? name = assembly.Name;
                 if (string.IsNullOrWhiteSpace(name) ||
                     name.Equals(targetAssemblyName, StringComparison.OrdinalIgnoreCase) ||
-                    IsNewerThanNet6(fullPath))
+                    IsNewerThanHost(fullPath))
                 {
                     continue;
                 }
@@ -319,7 +320,7 @@ public sealed class ModWorkspace
         return Path.Combine(outputRoot, "BepInEx", "core");
     }
 
-    private static bool IsNewerThanNet6(string path)
+    private static bool IsNewerThanHost(string path)
     {
         byte[] bytes = File.ReadAllBytes(path);
         string metadata = Encoding.UTF8.GetString(bytes);
@@ -329,7 +330,8 @@ public sealed class ModWorkspace
         index += marker.Length;
         int end = index;
         while (end < metadata.Length && (char.IsDigit(metadata[end]) || metadata[end] == '.')) end++;
-        return Version.TryParse(metadata[index..end], out Version? version) && version.Major > 6;
+        return Version.TryParse(metadata[index..end], out Version? version) &&
+               version.Major > Environment.Version.Major;
     }
 
     private static string CreateProject(
@@ -341,7 +343,7 @@ public sealed class ModWorkspace
         var project = new StringBuilder();
         project.AppendLine("<Project Sdk=\"Microsoft.NET.Sdk\">");
         project.AppendLine("  <PropertyGroup>");
-        project.AppendLine("    <TargetFramework>net6.0</TargetFramework>");
+        project.AppendLine($"    <TargetFramework>{HostTargetFramework}</TargetFramework>");
         project.AppendLine("    <OutputType>Library</OutputType>");
         project.AppendLine($"    <AssemblyName>{Escape(assemblyName)}</AssemblyName>");
         project.AppendLine("    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>");

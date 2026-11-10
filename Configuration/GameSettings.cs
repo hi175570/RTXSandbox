@@ -122,6 +122,8 @@ public sealed class GameSettings
     public int BrushRadius { get; set; } = 2;
     public int ExplosionRadius { get; set; } = 4;
     public string[] CreativeHotbar { get; set; } = Array.Empty<string>();
+    public int[] CreativeHotbarCounts { get; set; } = Array.Empty<int>();
+    public RTXSandbox.Gameplay.CreativeStack[] CreativeBackpack { get; set; } = Array.Empty<RTXSandbox.Gameplay.CreativeStack>();
     public int CreativeHotbarSlot { get; set; }
     public string[] FavoriteBlocks { get; set; } = Array.Empty<string>();
     public string[] RecentBlocks { get; set; } = Array.Empty<string>();
@@ -441,6 +443,8 @@ public sealed class GameSettings
         ExplosionRadius = Math.Clamp(ExplosionRadius, 1, 12);
         CreativeHotbar ??= Array.Empty<string>();
         CreativeHotbar = CreativeHotbar.Take(9).ToArray();
+        CreativeHotbarCounts = (CreativeHotbarCounts ?? Array.Empty<int>()).Take(9).Select(c => c > 0 ? 1 : 0).ToArray();
+        CreativeBackpack = (CreativeBackpack ?? Array.Empty<RTXSandbox.Gameplay.CreativeStack>()).Select(s => s.Normalized).ToArray();
         CreativeHotbarSlot = Math.Clamp(CreativeHotbarSlot, 0, 8);
         FavoriteBlocks ??= Array.Empty<string>();
         FavoriteBlocks = FavoriteBlocks.Where(key => !string.IsNullOrWhiteSpace(key)).Distinct(StringComparer.OrdinalIgnoreCase).Take(256).ToArray();

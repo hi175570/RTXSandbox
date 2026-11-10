@@ -1,4 +1,4 @@
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.World;
 
 namespace RTXSandbox.Gameplay;
@@ -11,8 +11,6 @@ public enum EditorToolMode
     Pick,
     SelectA,
     SelectB,
-    BrushAdd,
-    BrushErase,
     Flatten,
     Explode,
     GridAssign,
@@ -94,8 +92,6 @@ public sealed class BuildToolSystem
             EditorToolMode.Pick => Pick(hit),
             EditorToolMode.SelectA => SetSelectionA(hit.X, hit.Y, hit.Z),
             EditorToolMode.SelectB => SetSelectionB(hit.X, hit.Y, hit.Z),
-            EditorToolMode.BrushAdd => Sphere(hit.Adjacent, BrushRadius, SelectedBlockId, "Add sphere"),
-            EditorToolMode.BrushErase => Sphere((hit.X, hit.Y, hit.Z), BrushRadius, 0, "Erase sphere"),
             EditorToolMode.Flatten => FlattenAt(hit.X, hit.Y, hit.Z),
             EditorToolMode.Explode => Explode(hit.X, hit.Y, hit.Z, ExplosionRadius),
             EditorToolMode.Custom => UseCustom(hit, alternate),
@@ -103,7 +99,7 @@ public sealed class BuildToolSystem
         };
     }
 
-    public bool QuickPlace(VoxelHit hit) => Place(hit);
+    public bool QuickPlace(VoxelHit hit) => SelectedBlockId != 0 && Place(hit);
 
     public bool QueueEdit(int x, int y, int z, ushort newBlockId, string? name = null)
     {

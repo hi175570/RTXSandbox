@@ -22,13 +22,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj" />
     <ProjectReference Include="RTXSandbox.Launcher\RTXSandbox.Launcher.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Remove="RTXSandbox.ModAPI\**\*.cs" />
     <Compile Remove="Examples\**\*.cs" />
+    <Compile Remove="Integrations\**\*.cs" />
+    <Compile Include="Integrations\ManifoldGardenBridge\Shared\BridgeMemory.cs"
+             Link="Infrastructure\ManifoldGardenBridge\BridgeMemory.cs" />
     <Compile Remove="RTXSandbox.Android\**\*.cs" />
     <Compile Remove="RTXSandbox.Launcher\**\*.cs" />
     <!-- Local screenshots, APK inspection and validation harnesses live here;
@@ -62,6 +63,10 @@
       <TargetPath>..\settings.json</TargetPath>
     </None>
     <None Update="Content\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>..\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </None>
+    <None Update="Content\**\*.rgb;Content\**\*.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <TargetPath>..\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
     </None>
@@ -148,6 +153,7 @@
     <ItemGroup>
       <PublishedShader Include="$(MSBuildProjectDirectory)\Shaders\*.glsl;$(MSBuildProjectDirectory)\Shaders\*.hlsl" />
       <PublishedBaseContent Include="$(MSBuildProjectDirectory)\Content\**\*.json" />
+      <PublishedBaseTexture Include="$(MSBuildProjectDirectory)\Content\**\*.rgb;$(MSBuildProjectDirectory)\Content\**\*.png" />
       <PublishedContentPack Include="$(MSBuildProjectDirectory)\ContentPacks\**\*.json" />
     </ItemGroup>
     <!-- CreateAppHost may leave an existing destination untouched. A stale root
@@ -171,6 +177,8 @@
           DestinationFiles="@(PublishedShader->'$(PublishDir)..\Shaders\%(Filename)%(Extension)')" />
     <Copy SourceFiles="@(PublishedBaseContent)"
           DestinationFiles="@(PublishedBaseContent->'$(PublishDir)..\Content\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(PublishedBaseTexture)"
+          DestinationFiles="@(PublishedBaseTexture->'$(PublishDir)..\Content\%(RecursiveDir)%(Filename)%(Extension)')" />
     <Copy SourceFiles="@(PublishedContentPack)"
           DestinationFiles="@(PublishedContentPack->'$(PublishDir)..\ContentPacks\%(RecursiveDir)%(Filename)%(Extension)')" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\settings.json" DestinationFolder="$(PublishDir).." />

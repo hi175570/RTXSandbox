@@ -2,14 +2,22 @@ using RTXSandbox;
 using RTXSandbox.Gameplay;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.Modding;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.World;
+using RTXSandbox.Persistence;
 using System.Reflection;
 
 // BepInEx is self-hosted by the game rather than injected through winhttp.dll.
 // Install its conventional BepInEx/core resolver before the first reference to
 // a framework type is JIT-compiled.
 FrameworkAssemblyResolver.Install();
+
+if (args.Any(argument =>
+        argument.StartsWith("--install-showcase-world=", StringComparison.OrdinalIgnoreCase) ||
+        argument.StartsWith("--verify-showcase-world=", StringComparison.OrdinalIgnoreCase)))
+{
+    return ShowcaseWorldInstaller.Run(args);
+}
 
 if (AppContext.GetData("RTXSandbox.Preloader.Status") is null &&
     Environment.GetEnvironmentVariable("RTX_SANDBOX_DISABLE_BEPINEX") != "1")
@@ -46,8 +54,13 @@ if (streamingBenchmark)
 bool infiniteMirrorSmoke = args.Contains("--gpu-smoke-hardware-infinite", StringComparer.OrdinalIgnoreCase);
 bool glassOcclusionSmoke = args.Contains("--gpu-smoke-hardware-glass-occlusion", StringComparer.OrdinalIgnoreCase);
 bool darkRoomSmoke = args.Contains("--gpu-smoke-hardware-dark-room", StringComparer.OrdinalIgnoreCase);
+bool debrisSmoke = args.Contains("--gpu-smoke-hardware-debris", StringComparer.OrdinalIgnoreCase);
+bool debrisStressSmoke = args.Contains("--gpu-smoke-hardware-debris-20k", StringComparer.OrdinalIgnoreCase);
+bool softBodySmoke = args.Contains("--gpu-smoke-hardware-soft-body", StringComparer.OrdinalIgnoreCase);
+bool blackHoleTransportSmoke = args.Contains("--gpu-smoke-hardware-black-hole-transport", StringComparer.OrdinalIgnoreCase);
 string? smokeRenderer = args.Contains("--gpu-smoke-hardware", StringComparer.OrdinalIgnoreCase) ||
-                         infiniteMirrorSmoke || glassOcclusionSmoke || darkRoomSmoke
+                         infiniteMirrorSmoke || glassOcclusionSmoke || darkRoomSmoke || debrisSmoke ||
+                         debrisStressSmoke || softBodySmoke || blackHoleTransportSmoke
     ? "HardwareRayTracing"
     : args.Contains("--gpu-smoke-hybrid", StringComparer.OrdinalIgnoreCase)
     ? "HybridPbrRaster"
@@ -80,7 +93,8 @@ if (smokeRenderer is not null)
     CopyBenchmarkArgumentToEnvironment("--gpu-smoke-forward-preset=", "RTX_SANDBOX_GPU_SMOKE_FORWARD_PRESET");
     CopyBenchmarkArgumentToEnvironment("--gpu-smoke-forward-debug=", "RTX_SANDBOX_GPU_SMOKE_FORWARD_DEBUG");
     if (args.Contains("--gpu-smoke-hardware", StringComparer.OrdinalIgnoreCase) ||
-        infiniteMirrorSmoke || glassOcclusionSmoke || darkRoomSmoke)
+        infiniteMirrorSmoke || glassOcclusionSmoke || darkRoomSmoke || debrisSmoke ||
+        debrisStressSmoke || softBodySmoke || blackHoleTransportSmoke)
         Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_REQUIRE_HARDWARE_RT", "1");
     if (infiniteMirrorSmoke)
         Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_INFINITE_MIRROR", "1");
@@ -88,6 +102,20 @@ if (smokeRenderer is not null)
         Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_GLASS_OCCLUSION", "1");
     if (darkRoomSmoke)
         Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DARK_ROOM", "1");
+    if (debrisSmoke)
+        Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEBRIS", "1");
+    if (debrisStressSmoke)
+    {
+        Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEBRIS", "1");
+        Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_DEBRIS_20K", "1");
+    }
+    if (softBodySmoke)
+        Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_SOFT_BODY", "1");
+    if (blackHoleTransportSmoke)
+    {
+        Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_BLACK_HOLE", "1");
+        Environment.SetEnvironmentVariable("RTX_SANDBOX_GPU_SMOKE_BLACK_HOLE_TRANSPORT", "1");
+    }
     if (args.Contains("--gpu-smoke-menu", StringComparer.OrdinalIgnoreCase))
         Environment.SetEnvironmentVariable("RTX_SANDBOX_OPEN_MAIN_MENU", "1");
     if (args.Contains("--gpu-smoke-pause", StringComparer.OrdinalIgnoreCase))
@@ -120,12 +148,18 @@ if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase))
     return SelfTests.Run();
 }
 
+if (args.Contains("--inventory-self-test", StringComparer.OrdinalIgnoreCase))
+{
+    return SelfTests.RunCreativeInventory();
+}
+
 if (args.Contains("--physics-probe", StringComparer.OrdinalIgnoreCase))
 {
     RunPhysicsProbe();
     return 0;
 }
 
+WindowsGpuPreference.EnsureHighPerformanceForCurrentExecutable();
 BepInExBootstrap.Start();
 if (args.Contains("--mod-diagnostics", StringComparer.OrdinalIgnoreCase))
 {

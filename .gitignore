@@ -8,3 +8,5 @@ BepInEx/config/
 BepInEx/cache/
 Saves/
 artifacts/
+build/deploy*/
+build/validation*/

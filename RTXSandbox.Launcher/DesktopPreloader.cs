@@ -64,8 +64,8 @@ internal static class DesktopPreloader
 
     private static void EnsureGameNotLoaded()
     {
-        if (AssemblyLoadContext.Default.Assemblies.Any(a => a.GetName().Name is "RTXSandbox" or "RTXSandbox.ModAPI"))
-            throw new InvalidOperationException("A patcher loaded the game/ModAPI before patching. Use Cecil metadata, not runtime game types, in startup patchers.");
+        if (AssemblyLoadContext.Default.Assemblies.Any(a => a.GetName().Name is "RTXSandbox"))
+            throw new InvalidOperationException("A patcher loaded the game before patching. Use Cecil metadata, not runtime game types, in startup patchers.");
     }
 
     private sealed class PreloaderLog : ILogListener

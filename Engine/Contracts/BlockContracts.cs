@@ -1,4 +1,4 @@
-namespace RTXSandbox.ModAPI;
+namespace RTXSandbox.Engine;
 
 public interface IBlockRegistry
 {

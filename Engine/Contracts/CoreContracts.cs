@@ -1,7 +1,6 @@
-using System.ComponentModel;
 using System.Numerics;
 
-namespace RTXSandbox.ModAPI;
+namespace RTXSandbox.Engine;
 
 public enum BlockSurfacePattern : byte
 {
@@ -27,7 +26,6 @@ public enum BlockSurfacePattern : byte
     Checker,
     Fabric,
 }
-
 public sealed class BlockDefinition
 {
     public ushort Id { get; set; }
@@ -59,6 +57,8 @@ public sealed class BlockDefinition
     public string TextureGenerator { get; set; }
     public float TextureVariation { get; set; }
     public int TextureSeed { get; set; }
+    /// <summary>Physical mass of one full voxel in metric tonnes (equivalent to density in t/m^3).</summary>
+    public float Density { get; set; }
 
     public BlockDefinition(
         string key,
@@ -89,7 +89,8 @@ public sealed class BlockDefinition
         float animationSpeed = 0f,
         string textureGenerator = "auto",
         float textureVariation = -1f,
-        int textureSeed = 0)
+        int textureSeed = 0,
+        float density = 1f)
     {
         Key = key ?? throw new ArgumentNullException(nameof(key));
         DisplayName = displayName ?? throw new ArgumentNullException(nameof(displayName));
@@ -120,10 +121,10 @@ public sealed class BlockDefinition
         TextureGenerator = string.IsNullOrWhiteSpace(textureGenerator) ? "auto" : textureGenerator.Trim();
         TextureVariation = textureVariation < 0f ? -1f : Math.Clamp(textureVariation, 0f, 1f);
         TextureSeed = textureSeed;
+        Density = Math.Clamp(density, 0.01f, 25f);
         Id = id;
     }
 }
-
 public sealed class ItemDefinition
 {
     public string Key { get; }
@@ -312,19 +313,6 @@ public interface IBuildToolRegistry
     BuildToolDefinition Register(BuildToolDefinition definition, bool force = false);
     bool Remove(string key);
     bool TryGet(string key, out BuildToolDefinition? definition);
-}
-
-public interface IGameEvents
-{
-    event Action<IVoxelWorld>? WorldReady;
-    event Action<float>? Updating;
-    event Action<VoxelChangedEvent>? VoxelChanged;
-}
-
-public interface IGameEventBus
-{
-    IDisposable Subscribe<TEvent>(Action<TEvent> handler, int priority = 0) where TEvent : class;
-    TEvent Publish<TEvent>(TEvent gameEvent) where TEvent : class;
 }
 
 public abstract class CancellableGameEvent
@@ -522,101 +510,3 @@ public readonly struct VoxelChangedEvent
     }
 }
 
-public interface IModLogger
-{
-    void Info(string message);
-    void Warning(string message);
-    void Error(string message, Exception? exception = null);
-}
-
-public interface IModContext
-{
-    IBlockRegistry Blocks { get; }
-    IItemRegistry Items { get; }
-    IRecipeRegistry Recipes { get; }
-    IBuildToolRegistry Tools { get; }
-    IGameEvents Events { get; }
-    IGameEventBus EventBus { get; }
-    IVoxelWorld World { get; }
-    IModLogger Log { get; }
-    object Game { get; }
-    IServiceProvider Services { get; }
-    string GameVersion { get; }
-
-    T? GetService<T>() where T : class;
-}
-
-public static class SandboxApi
-{
-    private static readonly object Sync = new();
-    private static readonly List<Action<IModContext>> Pending = new();
-    private static IModContext? _current;
-
-    public static IModContext? Current
-    {
-        get
-        {
-            lock (Sync)
-            {
-                return _current;
-            }
-        }
-    }
-
-    public static void WhenReady(Action<IModContext> initialize)
-    {
-        if (initialize is null)
-        {
-            throw new ArgumentNullException(nameof(initialize));
-        }
-        IModContext? context;
-        lock (Sync)
-        {
-            context = _current;
-            if (context is null)
-            {
-                Pending.Add(initialize);
-                return;
-            }
-        }
-        initialize(context);
-    }
-
-    public static T? GetService<T>() where T : class => Current?.GetService<T>();
-
-    public static T RequireService<T>() where T : class =>
-        GetService<T>() ?? throw new InvalidOperationException(
-            $"The game service '{typeof(T).FullName}' is not available yet. Request it from a WorldReady handler.");
-
-    [EditorBrowsable(EditorBrowsableState.Never)]
-    public static void AttachHost(IModContext context)
-    {
-        if (context is null)
-        {
-            throw new ArgumentNullException(nameof(context));
-        }
-        Action<IModContext>[] initializers;
-        lock (Sync)
-        {
-            if (_current is not null)
-            {
-                throw new InvalidOperationException("The RTX Sandbox mod host is already attached.");
-            }
-            _current = context;
-            initializers = Pending.ToArray();
-            Pending.Clear();
-        }
-
-        foreach (Action<IModContext> initialize in initializers)
-        {
-            try
-            {
-                initialize(context);
-            }
-            catch (Exception exception)
-            {
-                context.Log.Error("A queued mod initializer failed.", exception);
-            }
-        }
-    }
-}

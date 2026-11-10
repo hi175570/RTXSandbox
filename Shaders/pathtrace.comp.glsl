@@ -225,6 +225,16 @@ bool materialIsFluid(uint id)
     return (texelFetch(uMaterialFlags, int(id), 0).r & 1u) != 0u;
 }
 
+bool materialIsLightAbsorber(uint id)
+{
+    return (texelFetch(uMaterialFlags, int(id), 0).r & 2u) != 0u;
+}
+
+bool materialIsBlackHole(uint id)
+{
+    return (texelFetch(uMaterialFlags, int(id), 0).r & 4u) != 0u;
+}
+
 float fluidSurfaceHeight(ivec3 cell)
 {
     uint level = texelFetch(uFluidLevels, voxelTextureCell(cell), 0).r;
@@ -429,6 +439,346 @@ Hit traceVoxelWorld(vec3 rayOrigin, vec3 rayDirection, float maxDistance, bool i
     return hit;
 }
 
+// A black hole is the one place where a light path is not a single straight
+// segment. Outside the bounded influence volume we retain the ordinary DDA
+// fast path. Inside it, the Schwarzschild optical metric advances the ray in
+// short chords and asks the real voxel/dynamic scene about every chord.
+// Consequently distant walls, lamps, glass and the sky are lensed by transport,
+// rather than by resampling the completed screen image.
+bool findBlackHoleInfluence(
+    vec3 rayOrigin,
+    vec3 rayDirection,
+    out vec3 center,
+    out float radius,
+    out float entryDistance)
+{
+    bool found = false;
+    entryDistance = 1e30;
+    center = vec3(0.0);
+    radius = 0.0;
+    for (int index = 0; index < uDynamicBoxCount; ++index)
+    {
+        DynamicBox sphere = dynamicBoxes[index];
+        if (sphere.halfExtentsAndGrid.w >= -1.5 ||
+            !materialIsBlackHole(uint(sphere.centerAndMaterial.w + 0.5)))
+            continue;
+
+        float candidateRadius = max(sphere.halfExtentsAndGrid.x, 0.0001);
+        float influenceRadius = candidateRadius * 9.0;
+        vec3 offset = rayOrigin - sphere.centerAndMaterial.xyz;
+        float projected = dot(offset, rayDirection);
+        float discriminant = projected * projected -
+            (dot(offset, offset) - influenceRadius * influenceRadius);
+        if (discriminant < 0.0) continue;
+        float root = sqrt(discriminant);
+        float enter = max(-projected - root, 0.0);
+        float leave = -projected + root;
+        if (leave <= 0.0 || enter >= entryDistance) continue;
+        found = true;
+        entryDistance = enter;
+        center = sphere.centerAndMaterial.xyz;
+        radius = candidateRadius;
+    }
+    return found;
+}
+
+void accumulateAccretionDiskSegment(
+    vec3 rayOrigin,
+    vec3 rayDirection,
+    float segmentLength,
+    vec3 center,
+    float radius,
+    inout vec3 radiance,
+    inout float transmittance)
+{
+    const vec3 diskNormal = vec3(0.081760, 0.980581, 0.178385);
+    if (segmentLength <= 0.00001 || transmittance <= 0.002) return;
+
+    // Integrate a finite-height plasma volume.  This is not an opaque plane hit:
+    // background radiance continues through the disk while every curved chord
+    // contributes emission and extinction along its actual world-space path.
+    float denominator = dot(rayDirection, diskNormal);
+    float startHeight = dot(rayOrigin - center, diskNormal);
+    float closestDistance = abs(denominator) > 0.00001
+        ? clamp(-startHeight / denominator, 0.0, segmentLength)
+        : segmentLength * 0.5;
+    vec3 point = rayOrigin + rayDirection * closestDistance;
+    vec3 radialVector = point - center - diskNormal * dot(point - center, diskNormal);
+    float radialDistance = length(radialVector);
+    float ratio = radialDistance / max(radius, 0.0001);
+    if (ratio < 2.55 || ratio > 5.15) return;
+
+    vec3 radialDirection = radialVector / max(radialDistance, 0.0001);
+    vec3 tangent = normalize(cross(diskNormal, radialDirection));
+    float innerHeat = 1.0 - smoothstep(2.55, 5.15, ratio);
+    float radialEnvelope = smoothstep(2.55, 2.78, ratio) *
+        (1.0 - smoothstep(4.70, 5.15, ratio));
+    float scaleHeight = mix(0.075, 0.16, smoothstep(2.55, 5.15, ratio));
+    float heightRatio = abs(dot(point - center, diskNormal)) /
+        max(radius * scaleHeight, 0.0001);
+
+    vec3 diskAxis = normalize(cross(diskNormal, vec3(0.0, 0.0, 1.0)));
+    vec3 diskBitangent = cross(diskNormal, diskAxis);
+    float azimuth = atan(dot(radialDirection, diskBitangent), dot(radialDirection, diskAxis));
+    // A low-amplitude coherent density wave avoids both a sterile solid ring and
+    // random-noise texturing. The wave lives in the plasma volume and therefore
+    // receives the same geodesic lensing as every other world-space light source.
+    float densityWave = 0.82 + 0.18 *
+        (0.5 + 0.5 * sin(azimuth * 3.0 - ratio * 7.5));
+    float density = radialEnvelope * exp(-0.5 * heightRatio * heightRatio) * densityWave;
+    if (density <= 0.00001) return;
+
+    float pathLength = abs(denominator) > 0.00001
+        ? min(segmentLength, 2.506628 * radius * scaleHeight / abs(denominator))
+        : segmentLength;
+    float opticalDepth = density * pathLength / max(radius * 0.24, 0.0001);
+    float emittedFraction = 1.0 - exp(-opticalDepth * 0.82);
+    float attenuation = exp(-opticalDepth * 0.42);
+
+    float orbitalSpeed = sqrt(0.46 / max(ratio, 2.55));
+    float lineOfSight = dot(tangent, -rayDirection);
+    float doppler = pow(clamp(
+        1.0 / max(1.0 - orbitalSpeed * lineOfSight, 0.30),
+        0.46, 1.95), 2.35);
+    float gravitationalShift = sqrt(clamp(
+        1.0 - 1.0 / max(ratio, 1.001), 0.04, 1.0));
+    vec3 gas = mix(vec3(0.11, 0.0015, 0.0002),
+        vec3(2.8, 0.72, 0.055), pow(innerHeat, 0.70));
+    gas = mix(gas, vec3(4.8, 3.0, 1.05), pow(innerHeat, 2.55));
+    radiance += transmittance * gas * gravitationalShift * doppler * emittedFraction;
+    transmittance *= attenuation;
+}
+
+// Schwarzschild optical metric in isotropic coordinates. blackHoleRadius is
+// the isotropic event-horizon radius (r_s / 4), so a = Rh / r approaches one
+// at the horizon. Fermat transport in this metric is
+//   dT/ds = grad(log(n)) - T dot(grad(log(n))) T,
+// with n = (1+a)^3 / (1-a). The returned vector is grad(log(n)); projecting it
+// perpendicular to the ray below yields the null-geodesic curvature.
+vec3 schwarzschildOpticalGradient(vec3 position, vec3 center, float horizonRadius)
+{
+    vec3 offset = position - center;
+    float radius = max(length(offset), horizonRadius * 1.001);
+    float a = clamp(horizonRadius / radius, 0.0, 0.999);
+    float radialDerivative = -a / radius *
+        (3.0 / (1.0 + a) + 1.0 / (1.0 - a));
+    return offset / radius * radialDerivative;
+}
+
+vec3 schwarzschildDirectionStep(
+    vec3 position,
+    vec3 direction,
+    vec3 center,
+    float horizonRadius,
+    float distance)
+{
+    vec3 gradient = schwarzschildOpticalGradient(position, center, horizonRadius);
+    vec3 curvature = gradient - direction * dot(direction, gradient);
+    return normalize(direction + curvature * distance);
+}
+
+void integrateSchwarzschildPath(
+    vec3 rayOrigin,
+    vec3 initialDirection,
+    float maximumDistance,
+    out vec3 endpoint,
+    out vec3 exitDirection,
+    out bool captured)
+{
+    endpoint = rayOrigin;
+    exitDirection = normalize(initialDirection);
+    captured = false;
+    if (maximumDistance <= 0.0001) return;
+
+    vec3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!findBlackHoleInfluence(rayOrigin, exitDirection,
+            blackHoleCenter, blackHoleRadius, entryDistance) ||
+        entryDistance >= maximumDistance)
+    {
+        endpoint += exitDirection * maximumDistance;
+        return;
+    }
+
+    float travelled = max(entryDistance, 0.0);
+    endpoint += exitDirection * travelled;
+    float previousRadius = length(endpoint - blackHoleCenter);
+    bool passedPeriapsis = false;
+    for (int stepIndex = 0; stepIndex < 144 && travelled < maximumDistance; ++stepIndex)
+    {
+        float distanceToHole = length(endpoint - blackHoleCenter);
+        if (distanceToHole <= blackHoleRadius * 1.002)
+        {
+            captured = true;
+            return;
+        }
+        passedPeriapsis = passedPeriapsis ||
+            distanceToHole > previousRadius + blackHoleRadius * 0.002;
+        previousRadius = distanceToHole;
+        float segmentLength = min(maximumDistance - travelled, clamp(
+            (distanceToHole - blackHoleRadius) * 0.10,
+            blackHoleRadius * 0.004,
+            blackHoleRadius * 0.30));
+        vec3 midpointDirection = schwarzschildDirectionStep(
+            endpoint, exitDirection, blackHoleCenter, blackHoleRadius,
+            segmentLength * 0.50);
+        endpoint += midpointDirection * segmentLength;
+        travelled += segmentLength;
+        exitDirection = schwarzschildDirectionStep(
+            endpoint, midpointDirection, blackHoleCenter, blackHoleRadius,
+            segmentLength * 0.50);
+        if (passedPeriapsis &&
+            length(endpoint - blackHoleCenter) > blackHoleRadius * 9.05)
+            break;
+    }
+    endpoint += exitDirection * max(maximumDistance - travelled, 0.0);
+}
+
+bool solveDirectionalLightGeodesic(
+    vec3 rayOrigin,
+    vec3 directionAtInfinity,
+    out vec3 localDirection)
+{
+    vec3 targetDirection = normalize(directionAtInfinity);
+    localDirection = targetDirection;
+    vec3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!findBlackHoleInfluence(rayOrigin, localDirection,
+            blackHoleCenter, blackHoleRadius, entryDistance) ||
+        entryDistance >= uRayDistance)
+        return true;
+
+    bool captured = false;
+    for (int iteration = 0; iteration < 6; ++iteration)
+    {
+        vec3 endpoint;
+        vec3 finalDirection;
+        integrateSchwarzschildPath(rayOrigin, localDirection, uRayDistance,
+            endpoint, finalDirection, captured);
+        if (!captured && dot(finalDirection, targetDirection) > 0.99996)
+            return true;
+        vec3 angularError = targetDirection - finalDirection *
+            dot(targetDirection, finalDirection);
+        if (captured)
+        {
+            vec3 radial = normalize(blackHoleCenter - rayOrigin);
+            vec3 away = localDirection - radial * dot(localDirection, radial);
+            if (dot(away, away) < 0.000001)
+                away = cross(localDirection, abs(localDirection.y) < 0.9
+                    ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
+            angularError += normalize(away) * 0.055;
+        }
+        localDirection = normalize(localDirection + angularError * 0.82);
+    }
+
+    vec3 solvedEndpoint;
+    vec3 solvedDirection;
+    integrateSchwarzschildPath(rayOrigin, localDirection, uRayDistance,
+        solvedEndpoint, solvedDirection, captured);
+    return !captured && dot(solvedDirection, targetDirection) > 0.9985;
+}
+
+Hit traceCurvedRay(
+    inout vec3 rayOrigin,
+    inout vec3 rayDirection,
+    float maxDistance,
+    bool ignoreTransmissive,
+    out bool captured,
+    out vec3 diskEmission,
+    out float diskTransmittance)
+{
+    captured = false;
+    diskEmission = vec3(0.0);
+    diskTransmittance = 1.0;
+    vec3 blackHoleCenter;
+    float blackHoleRadius;
+    float entryDistance;
+    if (!findBlackHoleInfluence(rayOrigin, rayDirection,
+            blackHoleCenter, blackHoleRadius, entryDistance))
+        return traceVoxelWorld(rayOrigin, rayDirection, maxDistance, ignoreTransmissive);
+
+    float travelled = 0.0;
+    if (entryDistance > 0.0005)
+    {
+        float straightDistance = min(entryDistance, maxDistance);
+        Hit straightHit = traceVoxelWorld(
+            rayOrigin, rayDirection, straightDistance, ignoreTransmissive);
+        if (straightHit.found) return straightHit;
+        rayOrigin += rayDirection * straightDistance;
+        travelled += straightDistance;
+        if (travelled >= maxDistance) return straightHit;
+    }
+
+    float previousRadius = length(rayOrigin - blackHoleCenter);
+    bool passedPeriapsis = false;
+    for (int stepIndex = 0; stepIndex < 144 && travelled < maxDistance; ++stepIndex)
+    {
+        vec3 fromHole = rayOrigin - blackHoleCenter;
+        float distanceToHole = length(fromHole);
+        if (distanceToHole <= blackHoleRadius * 1.002)
+        {
+            captured = true;
+            Hit capturedHit;
+            capturedHit.found = false;
+            capturedHit.distance = travelled;
+            return capturedHit;
+        }
+
+        passedPeriapsis = passedPeriapsis || distanceToHole > previousRadius + blackHoleRadius * 0.002;
+        previousRadius = distanceToHole;
+        float remaining = maxDistance - travelled;
+        float segmentLength = min(remaining, clamp(
+            (distanceToHole - blackHoleRadius) * 0.10,
+            blackHoleRadius * 0.004,
+            blackHoleRadius * 0.30));
+
+        // Integrate the null ray at the segment midpoint.  The previous Euler
+        // scheme walked a straight chord and applied one late kick at its end;
+        // at a turn that looked like a screen-space jump and accumulated a
+        // visible kink.  Midpoint transport bends both the scene query and the
+        // accretion-disk query along the same continuously evolving direction.
+        vec3 midpointDirection = schwarzschildDirectionStep(
+            rayOrigin, rayDirection, blackHoleCenter, blackHoleRadius,
+            segmentLength * 0.50);
+
+        Hit segmentHit = traceVoxelWorld(
+            rayOrigin, midpointDirection, segmentLength, ignoreTransmissive);
+        float transportedDistance = segmentHit.found
+            ? min(segmentHit.distance, segmentLength)
+            : segmentLength;
+        accumulateAccretionDiskSegment(
+            rayOrigin, midpointDirection, transportedDistance,
+            blackHoleCenter, blackHoleRadius, diskEmission, diskTransmittance);
+        if (segmentHit.found)
+        {
+            segmentHit.distance += travelled;
+            return segmentHit;
+        }
+
+        rayOrigin += midpointDirection * segmentLength;
+        travelled += segmentLength;
+
+        // In geometrized units r_s is the scale of 2GM/c^2. This kick is the
+        // weak-field null-geodesic term, strengthened continuously near the
+        // horizon where straight-line lens formulae cease to be valid.
+        distanceToHole = max(length(blackHoleCenter - rayOrigin), blackHoleRadius * 1.001);
+        rayDirection = schwarzschildDirectionStep(
+            rayOrigin, midpointDirection, blackHoleCenter, blackHoleRadius,
+            segmentLength * 0.50);
+
+        if (passedPeriapsis && distanceToHole > blackHoleRadius * 9.05)
+            break;
+    }
+
+    float remaining = maxDistance - travelled;
+    Hit escapedHit = traceVoxelWorld(
+        rayOrigin, rayDirection, remaining, ignoreTransmissive);
+    if (escapedHit.found) escapedHit.distance += travelled;
+    return escapedHit;
+}
+
 void celestialLight(out vec3 direction, out vec3 color, out float intensity, out float daylight)
 {
     float angle = (uTimeOfDay - 6.0) * (2.0 * PI / 24.0);
@@ -455,10 +805,26 @@ vec3 skyColor(vec3 direction)
 
     float discSharpness = daylight > 0.08 ? 900.0 : 2800.0;
     float disc = pow(max(dot(direction, lightDirection), 0.0), discSharpness);
-    vec3 directionCell = floor(direction * 650.0);
-    float starNoise = fract(sin(dot(directionCell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
-    float stars = step(0.9965, starNoise) * smoothstep(0.0, 0.45, direction.y) * (1.0 - daylight);
-    return sky * mix(0.55, 0.82, daylight) + lightColor * disc * mix(1.5, 10.0, daylight) + vec3(stars * 1.8);
+    // The night sky is infinitely distant radiance, not a shell of emissive
+    // geometry.  Curved primary transport mutates rayDirection before this
+    // lookup, so every star and the broad galactic band are gravitationally
+    // reprojected by the same null ray that traversed the scene.
+    vec3 galacticNormal = normalize(vec3(0.23, 0.91, -0.34));
+    float latitude = abs(dot(direction, galacticNormal));
+    float milkyWay = exp(-latitude * latitude * 95.0);
+    vec3 fineCell = floor(direction * 920.0);
+    vec3 brightCell = floor(direction * 410.0 + 17.0);
+    float fineHash = fract(sin(dot(fineCell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    float brightHash = fract(sin(dot(brightCell, vec3(39.346, 11.135, 83.155))) * 24634.6345);
+    float fineStar = smoothstep(0.9968 - milkyWay * 0.0020, 0.99995, fineHash);
+    float brightStar = smoothstep(0.9985, 0.99998, brightHash);
+    float temperature = fract(brightHash * 7.13 + fineHash * 3.71);
+    vec3 starColor = mix(vec3(0.48, 0.68, 1.0), vec3(1.0, 0.58, 0.28), temperature);
+    vec3 starField = starColor * (fineStar * (0.75 + milkyWay * 1.1) + brightStar * 2.8);
+    vec3 galacticGlow = vec3(0.075, 0.095, 0.16) * milkyWay;
+    return sky * mix(0.55, 0.82, daylight) +
+        lightColor * disc * mix(1.5, 10.0, daylight) +
+        (starField + galacticGlow) * (1.0 - daylight);
 }
 
 void materialProperties(uint id, out vec3 albedo, out float roughness, out float metallic, out vec3 emission)
@@ -498,7 +864,13 @@ vec2 materialFaceUv(Hit hit)
     {
         uv.x = 1.0 - uv.x;
     }
-    return fract(uv);
+    // Keep the material attached to the voxel, but decorrelate neighbouring uses
+    // of the same 16x16 source tile. Pixel-aligned offsets avoid filtering blur and
+    // provide many more stable variants than flip/transpose alone.
+    vec2 offset = vec2(float((orientation >> 8) & 15u),
+                       float((orientation >> 16) & 15u)) /
+                  float(MATERIAL_TILE_SIZE);
+    return fract(uv + offset);
 }
 
 ivec2 materialAtlasTexel(uint id, int face, vec2 uv)
@@ -583,8 +955,9 @@ vec3 cosineHemisphere(vec3 normal, inout uint state)
                      normal * sqrt(max(0.0, 1.0 - u1)));
 }
 
-vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
+vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state, out float primaryCoverage)
 {
+    primaryCoverage = 0.0;
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     ivec3 originCell = ivec3(floor(rayOrigin));
@@ -614,7 +987,21 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
     {
         if (bounce >= uMaxBounces) break;
         bool wasTravellingThroughMedium = travellingThroughTransmissive;
-        Hit hit = traceVoxelWorld(rayOrigin, rayDirection, uRayDistance, travellingThroughTransmissive);
+        bool captured = false;
+        vec3 diskEmission = vec3(0.0);
+        float diskTransmittance = 1.0;
+        // Gravity acts on photons, not on the camera image. Every segment of the
+        // Monte-Carlo path therefore uses the same geodesic integrator: primary,
+        // diffuse, reflected and refracted bounces can all be captured or lensed.
+        Hit hit = traceCurvedRay(
+            rayOrigin, rayDirection, uRayDistance, travellingThroughTransmissive,
+            captured, diskEmission, diskTransmittance);
+        if (bounce == 0)
+            primaryCoverage = (hit.found || captured || max(diskEmission.r,
+                max(diskEmission.g, diskEmission.b)) > 0.0001) ? 1.0 : 0.0;
+        radiance += throughput * diskEmission * uEmissionIntensity;
+        throughput *= diskTransmittance;
+        if (captured) break;
         if (!hit.found)
         {
             radiance += throughput * skyColor(rayDirection) * uEnvironmentIntensity;
@@ -643,6 +1030,11 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
                 radiance += throughput * vec3(0.8, 0.583, 0.06);
             }
         }
+
+        // An absorber is a transport boundary, not merely a very rough black
+        // dielectric. It terminates the path before Fresnel/specular sampling, so
+        // even an arbitrarily large global reflection multiplier cannot revive it.
+        if (materialIsLightAbsorber(hit.material) || materialIsBlackHole(hit.material)) break;
 
         float transmission = materialTransmission(hit.material);
         if (materialIsTransmissive(hit.material) &&
@@ -704,9 +1096,21 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
         applySurfaceDetail(hit.material, hit, albedo, roughness, shadingNormal);
         radiance += throughput * emission * uEmissionIntensity;
 
-        Hit blocker = traceVoxelWorld(hit.position + hit.normal * 0.0025,
-            primaryLightDirection, uRayDistance, true);
-        float direct = blocker.found ? 0.0 : max(dot(shadingNormal, primaryLightDirection), 0.0);
+        vec3 lightRayOrigin = hit.position + hit.normal * 0.0025;
+        vec3 lightRayDirection;
+        bool lightPathSolved = solveDirectionalLightGeodesic(
+            lightRayOrigin, primaryLightDirection, lightRayDirection);
+        vec3 localLightDirection = lightRayDirection;
+        bool lightCaptured = false;
+        vec3 ignoredDiskEmission;
+        float ignoredDiskTransmittance;
+        Hit blocker = traceCurvedRay(lightRayOrigin, lightRayDirection,
+            uRayDistance, true, lightCaptured, ignoredDiskEmission, ignoredDiskTransmittance);
+        // A directional source lives at infinity.  Its local arrival direction is
+        // gravity-shifted; the finite solar disc tolerance retains the physically
+        // valid path while rejecting rays that escaped toward a different sky cell.
+        float direct = blocker.found || lightCaptured || !lightPathSolved ? 0.0 :
+            max(dot(shadingNormal, localLightDirection), 0.0);
         radiance += throughput * albedo * primaryLightColor * direct * primaryLightIntensity *
             uDirectLightingStrength * (1.0 - metallic);
 
@@ -717,7 +1121,7 @@ vec3 samplePath(vec3 rayOrigin, vec3 rayDirection, inout uint state)
         if (direct > 0.0 && metallic > 0.001)
         {
             vec3 viewDirection = normalize(-rayDirection);
-            vec3 halfDirection = normalize(primaryLightDirection + viewDirection);
+            vec3 halfDirection = normalize(localLightDirection + viewDirection);
             float normalHalf = max(dot(shadingNormal, halfDirection), 0.0);
             float glossExponent = mix(12.0, 768.0, 1.0 - roughness);
             float normalizedLobe = (glossExponent + 2.0) / (2.0 * PI);
@@ -778,11 +1182,20 @@ void main()
         uCameraRight * ndc.x * uTanHalfFov +
         uCameraUp * ndc.y * uTanHalfFov);
 
-    vec3 sampleColor = samplePath(uCameraPosition, rayDirection, state);
-    vec3 previous = imageLoad(uAccumulation, pixel).rgb;
+    float primaryCoverage;
+    vec3 sampleColor = samplePath(uCameraPosition, rayDirection, state, primaryCoverage);
+    // Bound rare specular/emissive paths before they enter the running average.
+    // This is an energy-preserving chroma clamp, not temporal blur or guessed pixels.
+    float sampleLuminance = dot(max(sampleColor, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    sampleColor *= min(1.0, 18.0 / max(sampleLuminance, 1e-4));
+    vec4 previousSample = imageLoad(uAccumulation, pixel);
+    vec3 previous = previousSample.rgb;
     float sampleCount = float(uFrameIndex + 1);
     vec3 accumulated = (uFrameIndex == 0)
         ? sampleColor
         : previous + (sampleColor - previous) / sampleCount;
-    imageStore(uAccumulation, pixel, vec4(accumulated, 1.0));
+    float accumulatedCoverage = (uFrameIndex == 0)
+        ? primaryCoverage
+        : previousSample.a + (primaryCoverage - previousSample.a) / sampleCount;
+    imageStore(uAccumulation, pixel, vec4(accumulated, accumulatedCoverage));
 }

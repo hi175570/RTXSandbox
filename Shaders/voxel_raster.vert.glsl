@@ -13,6 +13,7 @@ uniform mat4 uPreviousView;
 uniform mat4 uPreviousProjection;
 uniform mat4 uModel;
 uniform mat4 uPreviousModel;
+uniform float uWaterTime;
 
 out vec3 vWorldPosition;
 out vec3 vNormal;
@@ -29,9 +30,23 @@ flat out int vGrid;
 out vec4 vCurrentClip;
 out vec4 vPreviousClip;
 
+float continuousWaterHeight(vec2 worldXZ, float time)
+{
+    // Low-frequency Gerstner-like components move continuously in world space.
+    // Their deliberately different directions and slow phase speeds avoid the
+    // frame-to-frame shimmer of the previous high-frequency two-wave pattern.
+    return sin(dot(worldXZ, vec2(0.42, 0.18)) + time * 0.55) * 0.014 +
+           sin(dot(worldXZ, vec2(-0.16, 0.37)) - time * 0.37) * 0.009 +
+           sin(dot(worldXZ, vec2(0.11, 0.09)) + time * 0.23) * 0.005;
+}
+
 void main()
 {
     vec4 worldPosition = uModel * vec4(aPosition, 1.0);
+    bool animatedWaterTop = aOptics.x < 0.0 &&
+        (aNormal.y > 0.65 || (abs(aNormal.y) < 0.65 && aUv.y > 0.99));
+    if (animatedWaterTop)
+        worldPosition.y += continuousWaterHeight(worldPosition.xz, uWaterTime);
     vWorldPosition = worldPosition.xyz;
     vNormal = normalize(mat3(uModel) * aNormal);
     vUv = aUv;
@@ -45,6 +60,9 @@ void main()
     vCell = ivec3(aCellAndGrid.xyz + vec3(0.5));
     vGrid = int(aCellAndGrid.w + 0.5);
     vCurrentClip = uProjection * uView * worldPosition;
-    vPreviousClip = uPreviousProjection * uPreviousView * uPreviousModel * vec4(aPosition, 1.0);
+    vec4 previousWorldPosition = uPreviousModel * vec4(aPosition, 1.0);
+    if (animatedWaterTop)
+        previousWorldPosition.y += continuousWaterHeight(previousWorldPosition.xz, uWaterTime);
+    vPreviousClip = uPreviousProjection * uPreviousView * previousWorldPosition;
     gl_Position = vCurrentClip;
 }

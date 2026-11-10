@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>RTXSandbox.SoftBodyPhysicsMod</AssemblyName>
+    <Description>Event-driven material-aware impact deformation for RTX Sandbox</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- V1.3's continuous spring solver moved into the game core. Keep the old
+         source as migration history, but the plugin now performs impact-only dents. -->
+    <Compile Remove="SoftBodyPlugin.cs" />
+    <!-- Mods intentionally target and patch game internals directly. -->
+    <ProjectReference Include="..\..\RTXSandbox.csproj" Private="false" />
+    <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" PrivateAssets="all" />
+  </ItemGroup>
+
+  <Target Name="CopyPluginToGame" AfterTargets="Build">
+    <PropertyGroup>
+      <RTXSandboxHostTargetFramework Condition="'$(RTXSandboxHostTargetFramework)' == ''">net9.0</RTXSandboxHostTargetFramework>
+      <PluginDirectory>$(MSBuildProjectDirectory)\..\..\bin\$(Configuration)\$(RTXSandboxHostTargetFramework)\BepInEx\plugins\SoftBodyPhysics</PluginDirectory>
+    </PropertyGroup>
+    <MakeDir Directories="$(PluginDirectory)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PluginDirectory)" />
+  </Target>
+</Project>

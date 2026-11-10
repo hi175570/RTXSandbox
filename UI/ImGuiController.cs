@@ -18,8 +18,8 @@ internal sealed unsafe class ImGuiController : IDisposable
     private readonly int _fontTexture;
     private bool _disposed;
     private static IntPtr s_imeWindowHandle;
-    private static IntPtr s_englishKeyboardLayout;
     private static int s_imePositionUpdateCount;
+    private bool _imeTextEntryEnabled = true;
 
     internal bool ImePositionUpdated =>
         !OperatingSystem.IsWindows() || Volatile.Read(ref s_imePositionUpdateCount) > 0;
@@ -51,6 +51,13 @@ internal sealed unsafe class ImGuiController : IDisposable
         ImGui.StyleColorsDark();
         ImGuiIOPtr io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
+        // ImGui uses 16-bit indices in this build, but it can split a large window
+        // into commands whose vertices live beyond index 65535 when the renderer
+        // advertises base-vertex support.  RenderDrawData already uses
+        // DrawElementsBaseVertex and command.VtxOffset; failing to advertise that
+        // capability made the native library assert as soon as the detailed 3D item
+        // previews filled a sufficiently large inventory draw list.
+        io.BackendFlags |= ImGuiBackendFlags.RendererHasVtxOffset;
 
         LoadInternationalFonts(io.Fonts);
         ConfigureIme(nativeWindowHandle);
@@ -181,7 +188,11 @@ internal sealed unsafe class ImGuiController : IDisposable
         GL.Viewport(0, 0, framebufferWidth, framebufferHeight);
         GL.Enable(EnableCap.Blend);
         GL.BlendEquation(BlendEquationMode.FuncAdd);
-        GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+        GL.BlendFuncSeparate(
+            BlendingFactorSrc.SrcAlpha,
+            BlendingFactorDest.OneMinusSrcAlpha,
+            BlendingFactorSrc.One,
+            BlendingFactorDest.OneMinusSrcAlpha);
         GL.Disable(EnableCap.CullFace);
         GL.Disable(EnableCap.DepthTest);
         GL.Enable(EnableCap.ScissorTest);
@@ -329,38 +340,33 @@ internal sealed unsafe class ImGuiController : IDisposable
     public void HandleWindowFocusChanged(bool focused, IntPtr nativeWindowHandle)
     {
         if (!focused || !OperatingSystem.IsWindows() || nativeWindowHandle == IntPtr.Zero) return;
-        ImmAssociateContextEx(nativeWindowHandle, IntPtr.Zero, IaceDefault);
         ConfigureIme(nativeWindowHandle);
+        ApplyImeAssociation();
     }
 
     /// <summary>
-    /// Gameplay owns Shift as an action key. Close the active IME and activate an
-    /// English keyboard layout while the mouse is captured so a Chinese IME cannot
-    /// consume Shift as its Chinese/English toggle. Text fields keep the existing
-    /// full IME composition path; players can switch languages normally after a UI
-    /// releases the mouse.
+    /// Associates the window IME only while an actual ImGui text field wants text.
+    /// Gameplay and ordinary menu navigation keep the user's selected keyboard
+    /// layout unchanged, but have no IME context that can consume Shift/WASD.
     /// </summary>
-    public void EnforceGameplayEnglishInput(bool gameplayActive)
+    public void SetImeTextEntryEnabled(bool enabled)
     {
-        if (!gameplayActive || !OperatingSystem.IsWindows() || s_imeWindowHandle == IntPtr.Zero) return;
-        IntPtr english = s_englishKeyboardLayout;
-        if (english == IntPtr.Zero)
-        {
-            english = LoadKeyboardLayoutW("00000409", KeyboardLayoutActivate);
-            if (english != IntPtr.Zero) s_englishKeyboardLayout = english;
-        }
-        if (english != IntPtr.Zero) ActivateKeyboardLayout(english, 0);
-        IntPtr inputContext = ImmGetContext(s_imeWindowHandle);
-        if (inputContext == IntPtr.Zero) return;
-        try
-        {
-            ImmSetOpenStatus(inputContext, false);
-        }
-        finally
-        {
-            ImmReleaseContext(s_imeWindowHandle, inputContext);
-        }
+        if (_imeTextEntryEnabled == enabled) return;
+        _imeTextEntryEnabled = enabled;
+        ApplyImeAssociation();
     }
+
+    private void ApplyImeAssociation()
+    {
+        if (!OperatingSystem.IsWindows() || s_imeWindowHandle == IntPtr.Zero) return;
+        ImmAssociateContextEx(
+            s_imeWindowHandle,
+            IntPtr.Zero,
+            _imeTextEntryEnabled ? IaceDefault : 0u);
+    }
+
+    internal static bool ShouldEnableIme(bool interfaceVisible, bool wantsTextEntry) =>
+        interfaceVisible && wantsTextEntry;
 
     private static bool IsImeComposing()
     {
@@ -419,7 +425,6 @@ internal sealed unsafe class ImGuiController : IDisposable
     private const int CandidateFormExclude = 0x0080;
     private const uint CompositionString = 0x0008;
     private const uint IaceDefault = 0x0010;
-    private const uint KeyboardLayoutActivate = 0x00000001;
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly record struct NativePoint(int X, int Y);
@@ -465,15 +470,6 @@ internal sealed unsafe class ImGuiController : IDisposable
 
     [DllImport("imm32.dll")]
     private static extern bool ImmAssociateContextEx(IntPtr windowHandle, IntPtr inputContext, uint flags);
-
-    [DllImport("imm32.dll")]
-    private static extern bool ImmSetOpenStatus(IntPtr inputContext, bool open);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr LoadKeyboardLayoutW(string keyboardLayoutId, uint flags);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr ActivateKeyboardLayout(IntPtr keyboardLayout, uint flags);
 
     private const string VertexShaderSource = """
         #version 430 core

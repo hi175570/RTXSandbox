@@ -179,6 +179,13 @@ public sealed class MainActivity : Activity
         root.AddView(_editorToolbar, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MatchParent, Dp(62), GravityFlags.Bottom));
         SetContentView(root);
+        string? rendererDiagnostic = Intent?.GetStringExtra("rtxsandbox.renderer");
+        if (!string.IsNullOrWhiteSpace(rendererDiagnostic) &&
+            Enum.TryParse(rendererDiagnostic, ignoreCase: true, out AndroidRendererMode rendererMode))
+        {
+            _gameSurface?.SelectRenderer(rendererMode);
+            Log.Info("RTXSandbox.RendererTest", $"Requested renderer {rendererMode} from diagnostic intent.");
+        }
         bool debuggable = (ApplicationInfo?.Flags & ApplicationInfoFlags.Debuggable) != 0;
         _diagnosticSession = debuggable &&
                              Intent?.GetBooleanExtra("rtxsandbox.physics_smoke", false) == true;

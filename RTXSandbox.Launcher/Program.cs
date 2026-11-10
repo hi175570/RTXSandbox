@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.Launcher;
 
-// This assembly must never reference RTXSandbox or its ModAPI. The game can
+// This assembly must never reference RTXSandbox. The game can
 // only be loaded after Cecil has applied the preloader patches.
 FrameworkAssemblyResolver.Install();
 string gamePath = Path.Combine(AppContext.BaseDirectory, "RTXSandbox.dll");
@@ -31,6 +31,7 @@ try
 {
     bool skip = Environment.GetEnvironmentVariable("RTX_SANDBOX_DISABLE_BEPINEX") == "1" ||
                 args.Any(arg => arg.Equals("--self-test", StringComparison.OrdinalIgnoreCase) ||
+                                arg.Equals("--inventory-self-test", StringComparison.OrdinalIgnoreCase) ||
                                 arg.Equals("--physics-probe", StringComparison.OrdinalIgnoreCase) ||
                                 arg.Equals("--world-stream-benchmark", StringComparison.OrdinalIgnoreCase) ||
                                 arg.Equals("--adversarial-performance-suite", StringComparison.OrdinalIgnoreCase) ||

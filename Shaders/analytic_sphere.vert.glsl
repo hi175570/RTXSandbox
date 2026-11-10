@@ -7,6 +7,7 @@ uniform float uSphereRadius;
 uniform vec3 uCameraPosition;
 uniform vec3 uCameraRight;
 uniform vec3 uCameraUp;
+uniform int uBlackHole;
 
 out vec3 vProxyPosition;
 
@@ -23,6 +24,8 @@ void main()
     float proxyRadius = min(
         uSphereRadius * distanceToCenter / tangentDenominator,
         uSphereRadius * 5.0);
+    if (uBlackHole != 0)
+        proxyRadius *= 4.75;
     vProxyPosition = uSphereCenter +
         (uCameraRight * corner.x + uCameraUp * corner.y) * proxyRadius;
     gl_Position = uProjection * uView * vec4(vProxyPosition, 1.0);

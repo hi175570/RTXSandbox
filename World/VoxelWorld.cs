@@ -1,13 +1,13 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Numerics;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 
 namespace RTXSandbox.World;
 
 internal readonly record struct FluidDisplacementEvent(int X, int Y, int Z, byte Amount);
 
-public sealed class VoxelWorld : IVoxelWorld
+public sealed partial class VoxelWorld : IVoxelWorld
 {
     // Width/Depth are the legacy GPU clip-window dimensions, not horizontal world bounds.
     public const int Width = 64;
@@ -608,15 +608,15 @@ public sealed class VoxelWorld : IVoxelWorld
         for (int x = minX; x <= maxX; x++)
         {
             boxes.Clear();
-            if (includeDynamicGrids) GetCollisionBoxes(x, y, z, boxes);
-            else GetStaticCollisionBoxes(x, y, z, boxes);
+            GetStaticCollisionBoxes(x, y, z, boxes);
             if (boxes.Any(box => box.Intersects(minimum, maximum)))
             {
                 return true;
             }
         }
 
-        return false;
+        return includeDynamicGrids &&
+               PhysicsGrids.TryCalculatePlayerPenetration(minimum, maximum, out _, out _);
     }
 
     private void GenerateWorld()
@@ -637,6 +637,7 @@ public sealed class VoxelWorld : IVoxelWorld
 
     public int EnsureChunksAround(Vector3 worldPosition, int radius = DefaultGenerationRadiusChunks)
     {
+        if (GenerationSettings.Preset == WorldPreset.ExternalBridge) return 0;
         ChunkCoordinate center = ChunkCoordinate.FromVoxel(
             (int)MathF.Floor(worldPosition.X), (int)MathF.Floor(worldPosition.Z));
         int generated = 0;
@@ -656,6 +657,7 @@ public sealed class VoxelWorld : IVoxelWorld
     /// </summary>
     public int QueueChunksAround(Vector3 worldPosition, int radius = DefaultGenerationRadiusChunks)
     {
+        if (GenerationSettings.Preset == WorldPreset.ExternalBridge) return 0;
         ChunkCoordinate center = ChunkCoordinate.FromVoxel(
             (int)MathF.Floor(worldPosition.X), (int)MathF.Floor(worldPosition.Z));
         ChunkCoordinate[] wanted = ChunkCoordinate.Around(center, radius)
@@ -710,7 +712,8 @@ public sealed class VoxelWorld : IVoxelWorld
     /// </summary>
     public void WarmUpChunkGeneration()
     {
-        if (!_proceduralGenerationEnabled || GenerationSettings.Preset == WorldPreset.Void) return;
+        if (!_proceduralGenerationEnabled ||
+            GenerationSettings.Preset is WorldPreset.Void or WorldPreset.ExternalBridge) return;
         var probe = new VoxelWorld(
             generate: false,
             _blocks,
@@ -790,6 +793,7 @@ public sealed class VoxelWorld : IVoxelWorld
                 GenerateNaturalChunk(chunk, pureNature: true);
                 break;
             case WorldPreset.Void:
+            case WorldPreset.ExternalBridge:
                 break;
         }
         if (publishEvent) ChunkGenerated?.Invoke(chunk);
@@ -1058,22 +1062,6 @@ public sealed class VoxelWorld : IVoxelWorld
                     SetSilently(x + ox, crownY + oy, z + oz, VoxelMaterial.Leaves);
             }
         }
-    }
-
-    private void BuildShowcaseFeatures()
-    {
-        for (int z = 5; z <= 17; z++)
-        for (int x = 5; x <= 17; x++)
-        {
-            SetSilently(x, 4, z, VoxelMaterial.Water);
-            if (x is 5 or 17 || z is 5 or 17) SetSilently(x, 5, z, VoxelMaterial.Marble);
-        }
-        for (int z = 7; z <= 15; z += 4)
-        for (int x = 25; x <= 41; x += 4)
-        for (int y = 5; y <= 12; y++)
-            SetSilently(x, y, z, (x + z) % 8 == 0 ? VoxelMaterial.Crystal : VoxelMaterial.Glass);
-        BuildMaterialGallery();
-        BuildLightingLab();
     }
 
     private void GenerateFlat()

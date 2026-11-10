@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace RTXSandbox.ModAPI;
+namespace RTXSandbox.Engine;
 
 public interface IVoxelWorld
 {
@@ -33,7 +33,7 @@ public readonly struct MicroVoxelData
     }
 }
 
-/// <summary>Optional precision-building service available through IModContext.GetService.</summary>
+/// <summary>Precision-building contract used by the game engine.</summary>
 public interface IMicroVoxelService
 {
     bool Enabled { get; set; }

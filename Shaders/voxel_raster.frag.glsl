@@ -16,11 +16,15 @@ uniform float uClassicSunlightStrength;
 uniform float uClassicAmbientStrength;
 uniform float uClassicColorSaturation;
 uniform float uClassicWaterWaveStrength;
+uniform float uWaterTime;
 uniform float uClassicFogDensity;
 uniform int uTransparentOnly;
 uniform int uDeferredTransparent;
 uniform int uWaterQuality;
 uniform int uTransparencyQuality;
+// Raster pipelines need different approximations for an effect that DXR obtains
+// from real secondary rays: 1 Classic, 2 simple PBR, 3 Forward HDR, 4 Deferred/Hybrid.
+uniform int uTransparencyProfile;
 uniform vec2 uScreenSize;
 uniform int uHasSelection;
 uniform ivec3 uSelectedCell;
@@ -68,6 +72,55 @@ const float PI = 3.14159265359;
 const int TILE_SIZE = 16;
 const int TILES_PER_ROW = 128;
 
+uint materialVariantHash()
+{
+    ivec2 uvTile = ivec2(floor(vUv));
+    uint value = uint(vCell.x + uvTile.x) * 0x8da6b343u;
+    value ^= uint(vCell.y + vCell.z + uvTile.y) * 0xd8163841u;
+    value ^= uint(vMaterial) * 0xcb1ab31fu;
+    value ^= uint(vFace) * 0x165667b1u;
+    value ^= value >> 15;
+    value *= 0x2c1b3c6du;
+    return value ^ (value >> 12);
+}
+
+vec2 rotateMaterialUv(vec2 value, uint rotation)
+{
+    if (rotation == 1u) return vec2(value.y, 1.0 - value.x);
+    if (rotation == 2u) return vec2(1.0) - value;
+    if (rotation == 3u) return vec2(1.0 - value.y, value.x);
+    return value;
+}
+
+ivec2 rotateMaterialOffset(ivec2 value, uint rotation)
+{
+    if (rotation == 1u) return ivec2(value.y, -value.x);
+    if (rotation == 2u) return -value;
+    if (rotation == 3u) return ivec2(-value.y, value.x);
+    return value;
+}
+
+ivec2 materialPixel(ivec2 offset)
+{
+    // Authored iron and hazard stripes are deliberately tile-periodic. Randomly
+    // rotating or shifting each block creates the exact cross seams these patterns
+    // are designed to avoid.
+    if (vMaterial == 136 || vMaterial == 157 || vMaterial == 158)
+    {
+        ivec2 pixel = ivec2(floor(fract(vUv) * float(TILE_SIZE))) + offset;
+        return ivec2((pixel.x % TILE_SIZE + TILE_SIZE) % TILE_SIZE,
+                     (pixel.y % TILE_SIZE + TILE_SIZE) % TILE_SIZE);
+    }
+    uint variant = materialVariantHash();
+    uint rotation = variant & 3u;
+    vec2 localUv = rotateMaterialUv(fract(vUv), rotation);
+    ivec2 shift = ivec2(int((variant >> 8) & 15u), int((variant >> 16) & 15u));
+    ivec2 pixel = ivec2(floor(localUv * float(TILE_SIZE))) + shift +
+        rotateMaterialOffset(offset, rotation);
+    return ivec2((pixel.x % TILE_SIZE + TILE_SIZE) % TILE_SIZE,
+                 (pixel.y % TILE_SIZE + TILE_SIZE) % TILE_SIZE);
+}
+
 vec3 safeNormalize(vec3 value, vec3 fallback)
 {
     float lengthSquared = dot(value, value);
@@ -87,17 +140,14 @@ vec3 atlasColor()
 {
     int tile = vMaterial * 3 + vFace;
     ivec2 tileOrigin = ivec2((tile % TILES_PER_ROW) * TILE_SIZE, (tile / TILES_PER_ROW) * TILE_SIZE);
-    ivec2 pixel = clamp(ivec2(floor(fract(vUv) * float(TILE_SIZE))), ivec2(0), ivec2(TILE_SIZE - 1));
-    return texelFetch(uMaterialAtlas, tileOrigin + pixel, 0).rgb;
+    return texelFetch(uMaterialAtlas, tileOrigin + materialPixel(ivec2(0)), 0).rgb;
 }
 
 vec2 atlasDetail(ivec2 offset)
 {
     int tile = vMaterial * 3 + vFace;
     ivec2 tileOrigin = ivec2((tile % TILES_PER_ROW) * TILE_SIZE, (tile / TILES_PER_ROW) * TILE_SIZE);
-    ivec2 pixel = clamp(ivec2(floor(fract(vUv) * float(TILE_SIZE))) + offset,
-        ivec2(0), ivec2(TILE_SIZE - 1));
-    return texelFetch(uMaterialDetailAtlas, tileOrigin + pixel, 0).rg;
+    return texelFetch(uMaterialDetailAtlas, tileOrigin + materialPixel(offset), 0).rg;
 }
 
 float sampleShadowLayer(sampler2D shadowMap, vec3 projected, float receiverBias, int radius)
@@ -189,27 +239,40 @@ void main()
     float roughness = clamp(mix(vRoughness, materialDetail.r, 0.72), 0.045, 1.0);
     float metallic = clamp(vMetallic, 0.0, 1.0);
     vec2 heightGradient = vec2(0.0);
+    float materialHeight = materialDetail.g;
     if (vFluid == 0)
         heightGradient = vec2(
-            atlasDetail(ivec2(1, 0)).g - materialDetail.g,
-            atlasDetail(ivec2(0, 1)).g - materialDetail.g);
-    vec3 surfaceTangent = safeNormalize(abs(normal.y) < 0.95
-        ? cross(vec3(0.0, 1.0, 0.0), normal)
-        : cross(vec3(0.0, 0.0, 1.0), normal), vec3(1.0, 0.0, 0.0));
+            (atlasDetail(ivec2(1, 0)).g - atlasDetail(ivec2(-1, 0)).g) * 0.5,
+            (atlasDetail(ivec2(0, 1)).g - atlasDetail(ivec2(0, -1)).g) * 0.5);
+    // Derivative TBN follows the actual UV orientation of every face (including
+    // deformed soft-body faces). A world-axis tangent repainted square highlights
+    // and made normal detail look like reflection instead of relief.
+    vec3 dpdx = dFdx(vWorldPosition);
+    vec3 dpdy = dFdy(vWorldPosition);
+    vec2 duvdx = dFdx(vUv);
+    vec2 duvdy = dFdy(vUv);
+    float uvDeterminant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
+    vec3 surfaceTangent = abs(uvDeterminant) > 1e-7
+        ? safeNormalize((dpdx * duvdy.y - dpdy * duvdx.y) / uvDeterminant, vec3(1.0, 0.0, 0.0))
+        : safeNormalize(abs(normal.y) < 0.95 ? cross(vec3(0.0, 1.0, 0.0), normal)
+                                             : cross(vec3(0.0, 0.0, 1.0), normal), vec3(1.0, 0.0, 0.0));
+    surfaceTangent = safeNormalize(surfaceTangent - normal * dot(surfaceTangent, normal), surfaceTangent);
     vec3 surfaceBitangent = safeNormalize(cross(normal, surfaceTangent), vec3(0.0, 0.0, 1.0));
+    if (uvDeterminant < 0.0) surfaceBitangent = -surfaceBitangent;
     if (vFluid == 0 && uClassic == 0)
-        normal = safeNormalize(normal - surfaceTangent * heightGradient.x * 1.15 -
-            surfaceBitangent * heightGradient.y * 1.15, geometricNormal);
+        normal = safeNormalize(normal - surfaceTangent * heightGradient.x * 3.2 -
+            surfaceBitangent * heightGradient.y * 3.2, geometricNormal);
     if (vFluid != 0)
     {
-        float time = uTimeOfDay * 3.2;
-        vec2 waveGradient = vec2(
-            cos(vWorldPosition.x * 5.7 + vWorldPosition.z * 2.1 + time) * 0.045,
-            sin(vWorldPosition.z * 6.3 - vWorldPosition.x * 1.7 - time * 0.83) * 0.045);
+        float time = uWaterTime;
+        vec2 waveGradient =
+            cos(dot(vWorldPosition.xz, vec2(0.42, 0.18)) + time * 0.55) * vec2(0.42, 0.18) * 0.014 +
+            cos(dot(vWorldPosition.xz, vec2(-0.16, 0.37)) - time * 0.37) * vec2(-0.16, 0.37) * 0.009 +
+            cos(dot(vWorldPosition.xz, vec2(0.11, 0.09)) + time * 0.23) * vec2(0.11, 0.09) * 0.005;
         if (uClassic == 0 || uWaterQuality > 1)
             waveGradient += vec2(
-                cos(vWorldPosition.x * 1.9 - vWorldPosition.z * 4.3 - time * 0.7) * 0.025,
-                sin(vWorldPosition.z * 2.2 + vWorldPosition.x * 3.7 + time * 0.54) * 0.025);
+                cos(vWorldPosition.x * 1.45 - vWorldPosition.z * 1.18 - time * 0.44) * 0.012,
+                sin(vWorldPosition.z * 1.32 + vWorldPosition.x * 1.57 + time * 0.39) * 0.012);
         if (uClassic != 0)
             waveGradient *= uClassicWaterWaveStrength;
         normal = safeNormalize(normal + surfaceTangent * waveGradient.x +
@@ -224,6 +287,7 @@ void main()
         ? safeNormalize(uPrimaryLightDirection, vec3(0.0, 1.0, 0.0))
         : (daylight > 0.08 ? sunDirection : -sunDirection);
     vec3 color = albedo;
+    bool lightAbsorber = vMaterial == 189;
     float shadowVisibility = 1.0;
     vec3 directLighting = vec3(0.0);
     vec3 ambientLighting = vec3(0.0);
@@ -270,6 +334,18 @@ void main()
             float tintStrength = mix(0.08, 0.50, chroma) * clamp(vTransmission, 0.0, 1.0);
             color = mix(refracted * mix(vec3(1.0), albedo, tintStrength), reflected,
                 clamp(fresnel, 0.04, 0.68));
+            float grazing = pow(1.0 - clamp(abs(dot(normal, viewDirection)), 0.0, 1.0), 3.0);
+            // Classic has no physically traced thickness or secondary reflection.
+            // Give it a restrained panel/edge response so clear glass remains legible
+            // without pretending that it emits light. Higher raster modes retain a
+            // subtler version because their lighting and HDR already supply contrast.
+            float panelResponse = uTransparencyProfile == 1
+                ? 0.10 + grazing * 0.34 + materialDetail.r * 0.05
+                : (uTransparencyProfile == 2
+                    ? 0.055 + grazing * 0.22
+                    : 0.035 + grazing * 0.16);
+            vec3 panelColor = mix(albedo, reflected, 0.32 + grazing * 0.42);
+            color = mix(color, panelColor, clamp(panelResponse, 0.0, 0.52));
         }
         color += vEmission;
     }
@@ -288,7 +364,12 @@ void main()
 
         vec3 skyAmbient = sky(normal, daylight);
         float skyWeight = mix(0.34, 0.88, clamp(geometricNormal.y * 0.5 + 0.5, 0.0, 1.0));
+        // Height provides cavity occlusion only. It does not alter metallic,
+        // roughness or emission, so relief can exist without becoming shiny.
+        float microOcclusion = vFluid != 0 ? 1.0 : mix(0.58, 1.0,
+            smoothstep(0.20, 0.66, materialHeight));
         ambientLighting = albedo * skyAmbient * skyWeight * mix(0.18, 0.42, daylight) *
+            microOcclusion *
             (1.0 - metallic * 0.72);
         if (uForwardApproximateGi != 0)
         {
@@ -308,7 +389,7 @@ void main()
             float falloff = max(1.0 - distanceToLight / radius, 0.0);
             falloff = falloff * falloff / (1.0 + distanceSquared * 0.08);
             vec3 radiance = uPointColorIntensity[index].rgb *
-                uPointColorIntensity[index].a * falloff * 8.0;
+                uPointColorIntensity[index].a * falloff * 2.0;
             directLighting += uForwardPbr != 0
                 ? evaluatePbr(albedo, normal, viewDirection, localDirection, radiance, roughness, metallic)
                 : albedo * radiance * max(dot(normal, localDirection), 0.0);
@@ -318,7 +399,7 @@ void main()
         vec3 f0 = mix(vec3(0.04), albedo, metallic);
         float facing = clamp(dot(normal, viewDirection), 0.0, 1.0);
         vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - facing, 5.0);
-        vec3 environment = reflectedSky * fresnel * (1.0 - roughness * 0.88) *
+        vec3 environment = reflectedSky * fresnel * pow(1.0 - roughness, 2.0) *
             (float(uReflectionQuality) / 3.0);
         color = directLighting + ambientLighting + approximateGi + environment + vEmission;
 
@@ -344,7 +425,12 @@ void main()
         color *= faceLight;
     }
 
-    if (uClassic != 0 && uClassicFogDensity > 0.0001)
+    // ID 189 is the built-in tagged Light Absorber. It is an ideal sink rather
+    // than ordinary black paint, so all forward/classic light and reflection lobes
+    // are suppressed. Selection is applied below and remains visible to the player.
+    if (lightAbsorber) color = vec3(0.0);
+
+    if (!lightAbsorber && uClassic != 0 && uClassicFogDensity > 0.0001)
     {
         float viewDistance = length(uCameraPosition - vWorldPosition);
         float fogAmount = 1.0 - exp(-viewDistance * uClassicFogDensity * 0.012);
@@ -362,7 +448,7 @@ void main()
 
     bool invalid = any(isnan(color)) || any(isinf(color)) || any(isnan(normal)) || any(isinf(normal));
     if (invalid) color = uForwardDebugView == 13 ? vec3(1.0, 0.0, 1.0) : vec3(0.0);
-    outForwardSurface = vec4(geometricNormal * 0.5 + 0.5, roughness);
+    outForwardSurface = vec4(normal * 0.5 + 0.5, roughness);
     if (uForwardHdr == 0)
     {
         color = vec3(1.0) - exp(-max(color, vec3(0.0)) * uExposure);
@@ -373,5 +459,18 @@ void main()
         : (vTransmission > 0.0
             ? clamp(0.035 + (1.0 - vTransmission) * 0.42 + materialDetail.r * 0.10, 0.05, 0.42)
             : 1.0);
+    if (vFluid == 0 && vTransmission > 0.0)
+    {
+        float grazing = pow(1.0 - clamp(abs(dot(normal, viewDirection)), 0.0, 1.0), 3.0);
+        float chroma = max(albedo.r, max(albedo.g, albedo.b)) - min(albedo.r, min(albedo.g, albedo.b));
+        float profileAlpha = uTransparencyProfile == 1
+            ? 0.13 + grazing * 0.30 + materialDetail.r * 0.08 + chroma * 0.05
+            : (uTransparencyProfile == 2
+                ? 0.085 + grazing * 0.23 + materialDetail.r * 0.05
+                : (uTransparencyProfile == 4
+                    ? 0.075 + grazing * 0.20 + materialDetail.r * 0.04
+                    : 0.065 + grazing * 0.18 + materialDetail.r * 0.035));
+        alpha = max(alpha, clamp(profileAlpha, 0.0, 0.52));
+    }
     outColor = vec4(max(color, vec3(0.0)), alpha);
 }

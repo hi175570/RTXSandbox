@@ -23,6 +23,8 @@ public sealed class AnalyticSphere
     public Vector3 LinearVelocity { get; internal set; }
     public Vector3 AngularVelocity { get; internal set; }
     public bool IsSleeping { get; internal set; }
+    /// <summary>Renderer-only moving proxy controlled by gameplay rather than BEPU.</summary>
+    public bool IsKinematic { get; internal set; }
 }
 
 public readonly record struct AnalyticSphereHit(

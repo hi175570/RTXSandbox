@@ -1,4 +1,4 @@
-namespace RTXSandbox.ModAPI;
+namespace RTXSandbox.Engine;
 
 /// <summary>
 /// Structural-grid physics service. Structural fracture is a world rule rather than a

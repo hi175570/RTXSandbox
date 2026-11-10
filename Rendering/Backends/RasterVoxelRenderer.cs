@@ -4,7 +4,8 @@ using System.Buffers;
 using OpenTK.Graphics.OpenGL4;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.Gameplay;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
+using RTXSandbox.Rendering;
 using RTXSandbox.World;
 using Matrix4 = OpenTK.Mathematics.Matrix4;
 using OpenTkVector3 = OpenTK.Mathematics.Vector3;
@@ -126,6 +127,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private Vector3 _lastDirectionalShadowDirection;
     private Vector3 _lastDirectionalShadowCenter;
     private float _lastDirectionalShadowDistance = -1f;
+    private float _activeShadowDistance = 100f;
     private Matrix4 _cachedLightView = Matrix4.Identity;
     private Matrix4 _cachedLightProjection = Matrix4.Identity;
     private bool _deferredLightsDirty = true;
@@ -459,6 +461,23 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         RenderQualitySettings quality,
         float exposure)
     {
+        bool externalBridge = _world.GenerationSettings.Preset == WorldPreset.ExternalBridge;
+        if (externalBridge)
+        {
+            quality = quality with
+            {
+                DeferredFogQuality = 0,
+                HybridFogQuality = 0,
+                ForwardVolumetricQuality = 0,
+                ForwardVolumetric = false,
+                ClassicFogDensity = 0f,
+            };
+        }
+        _activeShadowDistance = _hybrid
+            ? 64f + quality.HybridShadowQuality * 30f
+            : _deferred
+                ? quality.DeferredShadowDistance
+                : EnhancedForward ? quality.ForwardShadowDistance : 64f;
         UpdateChunkMeshResidency(cameraPosition);
         UpdateVisibleGeometry(cameraPosition, camera, timeOfDay);
         RebuildDirtyMeshes();
@@ -511,10 +530,10 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
 
         float daylight = Math.Clamp(MathF.Sin((timeOfDay - 6f) * MathF.PI / 12f) * 0.72f + 0.28f, 0.04f, 1f);
         GL.ClearColor(
-            0.018f + daylight * 0.10f,
-            0.028f + daylight * 0.24f,
-            0.06f + daylight * 0.48f,
-            1f);
+            externalBridge ? 0f : 0.018f + daylight * 0.10f,
+            externalBridge ? 0f : 0.028f + daylight * 0.24f,
+            externalBridge ? 0f : 0.06f + daylight * 0.48f,
+            externalBridge ? 0f : 1f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
         GL.Enable(EnableCap.DepthTest);
         GL.DepthFunc(DepthFunction.Lequal);
@@ -526,7 +545,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         var eye = new OpenTkVector3(cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
         Vector3 forward = camera.Forward;
         var target = eye + new OpenTkVector3(forward.X, forward.Y, forward.Z);
-        Matrix4 view = Matrix4.LookAt(eye, target, OpenTkVector3.UnitY);
+        Matrix4 view = Matrix4.LookAt(eye, target, new OpenTkVector3(camera.Up.X, camera.Up.Y, camera.Up.Z));
         Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(
             camera.FieldOfViewDegrees * MathF.PI / 180f,
             _width / (float)Math.Max(_height, 1),
@@ -534,6 +553,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             220f);
 
         _shader.Use();
+        GL.Uniform1(_shader.Uniform("uWaterTime"), WaterAnimationSeconds());
         GL.UniformMatrix4(_shader.Uniform("uView"), false, ref view);
         GL.UniformMatrix4(_shader.Uniform("uProjection"), false, ref projection);
         GL.Uniform3(_shader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
@@ -552,6 +572,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 0);
         GL.Uniform1(_shader.Uniform("uWaterQuality"), 0);
         GL.Uniform1(_shader.Uniform("uTransparencyQuality"), 0);
+        GL.Uniform1(_shader.Uniform("uTransparencyProfile"), _classic ? 1 : 2);
         GL.Uniform1(_shader.Uniform("uForwardHdr"), 0);
         GL.Uniform1(_shader.Uniform("uForwardPbr"), 0);
         GL.Uniform1(_shader.Uniform("uForwardDebugView"), 0);
@@ -597,6 +618,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
         GL.CopyTexSubImage2D(TextureTarget.Texture2D, 0, 0, 0, 0, 0, _width, _height);
         _shader.Use();
+        GL.Uniform1(_shader.Uniform("uWaterTime"), WaterAnimationSeconds());
         GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 2);
         GL.Uniform1(_shader.Uniform("uWaterQuality"), _classic ? quality.ClassicWaterQuality : 2);
         GL.Uniform1(_shader.Uniform("uTransparencyQuality"),
@@ -622,7 +644,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         var eye = new OpenTkVector3(cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
         Vector3 forward = camera.Forward;
         var target = eye + new OpenTkVector3(forward.X, forward.Y, forward.Z);
-        Matrix4 view = Matrix4.LookAt(eye, target, OpenTkVector3.UnitY);
+        Matrix4 view = Matrix4.LookAt(eye, target, new OpenTkVector3(camera.Up.X, camera.Up.Y, camera.Up.Z));
         Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(
             camera.FieldOfViewDegrees * MathF.PI / 180f,
             _width / (float)Math.Max(_height, 1), 0.03f, 220f);
@@ -649,7 +671,12 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
         GL.Viewport(0, 0, _width, _height);
         float daylight = Math.Clamp(MathF.Sin((timeOfDay - 6f) * MathF.PI / 12f) * 0.72f + 0.28f, 0.02f, 1f);
-        GL.ClearColor(0.008f + daylight * 0.06f, 0.014f + daylight * 0.15f, 0.035f + daylight * 0.34f, 1f);
+        bool externalBridge = _world.GenerationSettings.Preset == WorldPreset.ExternalBridge;
+        GL.ClearColor(
+            externalBridge ? 0f : 0.008f + daylight * 0.06f,
+            externalBridge ? 0f : 0.014f + daylight * 0.15f,
+            externalBridge ? 0f : 0.035f + daylight * 0.34f,
+            externalBridge ? 0f : 1f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
         GL.Enable(EnableCap.DepthTest);
         GL.DepthFunc(DepthFunction.Lequal);
@@ -658,6 +685,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Disable(EnableCap.Blend);
 
         _shader.Use();
+        GL.Uniform1(_shader.Uniform("uWaterTime"), WaterAnimationSeconds());
         GL.UniformMatrix4(_shader.Uniform("uView"), false, ref view);
         GL.UniformMatrix4(_shader.Uniform("uProjection"), false, ref projection);
         GL.Uniform3(_shader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
@@ -671,6 +699,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 0);
         GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.ForwardWaterQuality);
         GL.Uniform1(_shader.Uniform("uTransparencyQuality"), quality.ForwardWaterQuality);
+        GL.Uniform1(_shader.Uniform("uTransparencyProfile"), 3);
         GL.Uniform2(_shader.Uniform("uScreenSize"), (float)_width, (float)_height);
         GL.Uniform1(_shader.Uniform("uForwardHdr"), 1);
         GL.Uniform1(_shader.Uniform("uForwardPbr"), quality.ForwardPbr ? 1 : 0);
@@ -731,6 +760,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         if (quality.ForwardDebugView == ForwardDebugView.FinalImage)
         {
             _shader.Use();
+            GL.Uniform1(_shader.Uniform("uWaterTime"), WaterAnimationSeconds());
             GL.Uniform1(_shader.Uniform("uTransparentOnly"), 1);
             GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 1);
             GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.ForwardWaterEffects ? quality.ForwardWaterQuality : 0);
@@ -778,20 +808,24 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             quality.ForwardVolumetric ? quality.ForwardVolumetricQuality : 0);
         GL.Uniform1(post.Uniform("uPostQuality"), quality.ForwardPostProcessingQuality);
         GL.Uniform1(post.Uniform("uBloomEnabled"), quality.ForwardBloom ? 1 : 0);
+        GL.Uniform1(post.Uniform("uBloomStrength"), 0.075f);
         GL.Uniform1(post.Uniform("uToneMapping"), quality.ForwardToneMapping);
         GL.Uniform1(post.Uniform("uUpscalingMode"), (int)quality.UpscalingMode);
         GL.Uniform1(post.Uniform("uTaaEnabled"), useTemporalReprojection ? 1 : 0);
         GL.Uniform1(post.Uniform("uHasHistory"),
             _forwardHistoryValid && (quality.ForwardTemporalAntiAliasing || useFrameGeneration) ? 1 : 0);
         GL.Uniform1(post.Uniform("uDebugView"), (int)quality.ForwardDebugView);
+        GL.Uniform1(post.Uniform("uEnvironmentVisible"), externalBridge ? 0 : 1);
         GL.BindVertexArray(_fullscreenVertexArray);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
 
         GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _forwardHistoryBuffers[historyWriteIndex]);
-        GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
         GL.BlitFramebuffer(0, 0, _width, _height, 0, 0, _width, _height,
             ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Nearest);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
         _forwardPostGpuTimer.End();
         ForwardPostCpuMilliseconds = ElapsedMilliseconds(postStarted);
         _forwardHistoryIndex = historyReadIndex;
@@ -827,7 +861,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         var eye = new OpenTkVector3(cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
         Vector3 forward = camera.Forward;
         var target = eye + new OpenTkVector3(forward.X, forward.Y, forward.Z);
-        Matrix4 view = Matrix4.LookAt(eye, target, OpenTkVector3.UnitY);
+        Matrix4 view = Matrix4.LookAt(eye, target, new OpenTkVector3(camera.Up.X, camera.Up.Y, camera.Up.Z));
         Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(
             camera.FieldOfViewDegrees * MathF.PI / 180f,
             _width / (float)Math.Max(_height, 1), 0.03f, 220f);
@@ -923,6 +957,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(lighting.Uniform("uShadowSoftness"), quality.DeferredShadowSoftness);
         GL.Uniform1(lighting.Uniform("uAoQuality"), quality.DeferredAmbientOcclusionQuality);
         GL.Uniform1(lighting.Uniform("uDebugView"), (int)quality.DeferredDebugView);
+        GL.Uniform1(lighting.Uniform("uEnvironmentVisible"),
+            _world.GenerationSettings.Preset == WorldPreset.ExternalBridge ? 0 : 1);
         int pointCount = quality.DeferredLightingQuality > 0 ? _deferredPointLights.Count : 0;
         GL.Uniform1(lighting.Uniform("uPointLightCount"), pointCount);
         for (int index = 0; index < pointCount; index++)
@@ -945,7 +981,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         // HDR post pass: optional fog, bloom, color grading, sharpening and selected
         // tone mapper. Debug views bypass artistic post processing.
         long postStarted = Stopwatch.GetTimestamp();
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
         ShaderProgram post = _deferredPost!;
         post.Use();
         BindGBufferTexture(post, "uHdrColor", _hdrColor, TextureUnit.Texture0, 0);
@@ -956,6 +993,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.Uniform1(post.Uniform("uTimeOfDay"), timeOfDay);
         GL.Uniform1(post.Uniform("uHdrEnabled"), quality.DeferredHdr ? 1 : 0);
         GL.Uniform1(post.Uniform("uBloomEnabled"), quality.DeferredBloom ? 1 : 0);
+        GL.Uniform1(post.Uniform("uBloomStrength"), _hybrid ? 0.065f : 0.075f);
         GL.Uniform1(post.Uniform("uPostQuality"), quality.DeferredPostProcessingQuality);
         GL.Uniform1(post.Uniform("uFogQuality"), quality.DeferredFogQuality);
         GL.Uniform1(post.Uniform("uToneMapping"), quality.DeferredToneMapping);
@@ -967,10 +1005,12 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         {
             long transparencyStarted = Stopwatch.GetTimestamp();
             GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _gBuffer);
-            GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer, 0);
+            GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer,
+                ManifoldGardenFramePublisher.CurrentFramebuffer);
             GL.BlitFramebuffer(0, 0, _width, _height, 0, 0, _width, _height,
                 ClearBufferMask.DepthBufferBit, BlitFramebufferFilter.Nearest);
-            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+                ManifoldGardenFramePublisher.CurrentFramebuffer);
 
             GL.ActiveTexture(TextureUnit.Texture2);
             GL.BindTexture(TextureTarget.Texture2D, _sceneColorCopy);
@@ -985,6 +1025,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
             GL.DepthMask(false);
             _shader.Use();
+            GL.Uniform1(_shader.Uniform("uWaterTime"), WaterAnimationSeconds());
             GL.UniformMatrix4(_shader.Uniform("uView"), false, ref view);
             GL.UniformMatrix4(_shader.Uniform("uProjection"), false, ref projection);
             GL.Uniform3(_shader.Uniform("uCameraPosition"), cameraPosition.X, cameraPosition.Y, cameraPosition.Z);
@@ -998,6 +1039,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             GL.Uniform1(_shader.Uniform("uDeferredTransparent"), 1);
             GL.Uniform1(_shader.Uniform("uWaterQuality"), quality.DeferredWaterQuality);
             GL.Uniform1(_shader.Uniform("uTransparencyQuality"), quality.DeferredTransparencyQuality);
+            GL.Uniform1(_shader.Uniform("uTransparencyProfile"), 4);
             GL.Uniform2(_shader.Uniform("uScreenSize"), (float)_width, (float)_height);
             SetSelectionUniforms(_shader, selection);
             GL.ActiveTexture(TextureUnit.Texture0);
@@ -1045,7 +1087,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     {
         if (_world.AnalyticSpheres.Count == 0) return;
         Vector3 forward = Vector3.Normalize(camera.Forward);
-        Vector3 right = Vector3.Cross(forward, Vector3.UnitY);
+        Vector3 right = Vector3.Cross(forward, camera.Up);
         if (right.LengthSquared() < 0.000001f) right = Vector3.UnitX;
         else right = Vector3.Normalize(right);
         Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
@@ -1080,6 +1122,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             GL.Uniform3(_analyticSphereShader.Uniform("uAlbedo"), material.Albedo.X, material.Albedo.Y, material.Albedo.Z);
             GL.Uniform1(_analyticSphereShader.Uniform("uRoughness"), material.Roughness);
             GL.Uniform1(_analyticSphereShader.Uniform("uMetallic"), material.Metallic);
+            GL.Uniform1(_analyticSphereShader.Uniform("uBlackHole"),
+                AnalyticSpherePlacement.IsBlackHole(material) ? 1 : 0);
             GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
         }
         GL.BindVertexArray(0);
@@ -1136,7 +1180,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.ReadBuffer(ReadBufferMode.None);
         if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
             throw new InvalidOperationException("Directional shadow framebuffer is incomplete.");
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
     }
 
     private (Matrix4 View, Matrix4 Projection) RenderDirectionalShadowMap(
@@ -1152,7 +1197,10 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             DirectionalShadowDrawCount = 0;
             return (_cachedLightView, _cachedLightProjection);
         }
-        Vector3 requestedCenter = new(cameraPosition.X, 80f, cameraPosition.Z);
+        // The configured distance is a radius around the receiver. The old map
+        // treated it as a full width (halving coverage) and always centered Y at
+        // 80, so otherwise visible shadows vanished surprisingly close by.
+        Vector3 requestedCenter = cameraPosition;
         bool lightChanged = !_hasDirectionalShadowMap ||
             Vector3.DistanceSquared(lightDirection, _lastDirectionalShadowDirection) >=
             ShadowDirectionUpdateThresholdSquared ||
@@ -1162,12 +1210,14 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         {
             var direction = new OpenTkVector3(lightDirection.X, lightDirection.Y, lightDirection.Z);
             var center = new OpenTkVector3(requestedCenter.X, requestedCenter.Y, requestedCenter.Z);
-            var eye = center + direction * 112f;
+            float lightDepth = shadowDistance + 192f;
+            var eye = center + direction * lightDepth;
             OpenTkVector3 up = MathF.Abs(OpenTkVector3.Dot(direction, OpenTkVector3.UnitY)) > 0.96f
                 ? OpenTkVector3.UnitZ
                 : OpenTkVector3.UnitY;
             _cachedLightView = Matrix4.LookAt(eye, center, up);
-            _cachedLightProjection = Matrix4.CreateOrthographic(shadowDistance, shadowDistance, 1f, 224f);
+            _cachedLightProjection = Matrix4.CreateOrthographic(
+                shadowDistance * 2f, shadowDistance * 2f, 1f, lightDepth * 2f);
             _lastDirectionalShadowDirection = lightDirection;
             _lastDirectionalShadowCenter = requestedCenter;
             _lastDirectionalShadowDistance = shadowDistance;
@@ -1226,7 +1276,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         if (drawDynamic) DrawDynamicShadowGeometry(depth);
         else DrawStaticShadowGeometry(depth);
         GL.Disable(EnableCap.PolygonOffsetFill);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
     }
 
     private static void SetSelectionUniforms(ShaderProgram shader, VoxelHit? selection)
@@ -1262,7 +1313,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         });
         if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
             throw new InvalidOperationException("Deferred GBuffer is incomplete.");
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
 
         _hdrBuffer = GL.GenFramebuffer();
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, _hdrBuffer);
@@ -1279,7 +1331,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
         if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
             throw new InvalidOperationException("Deferred HDR framebuffer is incomplete.");
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
     }
 
     private void ResizeForwardBuffers()
@@ -1323,7 +1376,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
                 throw new InvalidOperationException("Enhanced Forward temporal framebuffer is incomplete.");
         }
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer,
+            ManifoldGardenFramePublisher.CurrentFramebuffer);
         _forwardHistoryIndex = 0;
         _forwardHistoryValid = false;
     }
@@ -1426,7 +1480,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                 camera.FieldOfViewDegrees, aspect, 12f);
             bool shadowCaster = (_deferred || EnhancedForward) && !directlyVisible && IsShadowCasterNeeded(
                 center, radius, lightDirection, cameraPosition, camera.Forward,
-                camera.FieldOfViewDegrees, aspect);
+                camera.FieldOfViewDegrees, aspect, ActiveShadowDistance());
             if (!directlyVisible && !shadowCaster)
                 continue;
             if (shadowCaster) ShadowCasterChunkCount++;
@@ -1442,7 +1496,7 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             if (IsSphereInView(grid.Position, gridRadius, cameraPosition, camera.Forward,
                     camera.FieldOfViewDegrees, aspect, 12f) ||
                 ((_deferred || EnhancedForward) && IsShadowCasterNeeded(grid.Position, gridRadius, lightDirection, cameraPosition,
-                    camera.Forward, camera.FieldOfViewDegrees, aspect)))
+                    camera.Forward, camera.FieldOfViewDegrees, aspect, ActiveShadowDistance())))
                 visibleGridIds.Add(grid.Id);
         }
         if (!_visiblePhysicsGridIds.SetEquals(visibleGridIds))
@@ -1536,12 +1590,17 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         Vector3 cameraPosition,
         Vector3 cameraForward,
         float fieldOfViewDegrees,
-        float aspect)
+        float aspect,
+        float shadowDistance)
     {
         // A caster outside the camera frustum can still shadow a visible receiver.
         // Project its bounds away from the sun/moon and retain it when that projected
         // shadow volume crosses the guarded camera frustum.
-        ReadOnlySpan<float> distances = stackalloc float[] { 12f, 24f, 40f, 64f };
+        shadowDistance = Math.Clamp(shadowDistance, 48f, 160f);
+        ReadOnlySpan<float> distances = stackalloc float[]
+        {
+            12f, shadowDistance * 0.33f, shadowDistance * 0.66f, shadowDistance,
+        };
         foreach (float distance in distances)
         {
             Vector3 projectedReceiver = casterCenter - lightDirection * distance;
@@ -1551,6 +1610,9 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
         return false;
     }
+
+    private float ActiveShadowDistance()
+        => _activeShadowDistance;
 
     private static Vector3 PrimaryLightDirection(float timeOfDay)
     {
@@ -1741,11 +1803,34 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
 
     private PhysicsGridMesh BuildPhysicsGridMesh(PhysicsGrid grid, int signature)
     {
-        int estimatedFloats = Math.Clamp(grid.Elements.Count * 6 * FloatsPerVertex, 120, 2_000_000);
+        SoftBodySurfaceVertex[] smoothSurface = SoftBodySurfaceBuilder.Build(grid.SmoothSpheres);
+        int estimatedFloats = Math.Clamp(
+            (grid.Elements.Count * 36 + smoothSurface.Length) * FloatsPerVertex,
+            120,
+            4_000_000);
         using var vertices = new PooledFloatBuffer(estimatedFloats);
         BlockDefinition[] definitions = _blockDefinitions;
+        var smoothCells = grid.SmoothSpheres
+            .Select(sphere => (sphere.CellX, sphere.CellY, sphere.CellZ, sphere.MaterialId))
+            .ToHashSet();
         foreach (PhysicsGridElement element in grid.Elements)
         {
+            if (smoothCells.Contains((element.CellX, element.CellY, element.CellZ, element.MaterialId))) continue;
+            BlockDefinition definition = definitions[element.MaterialId];
+            Vector3 expectedMinimum = new(element.CellX, element.CellY, element.CellZ);
+            if (MechanicalPartGeometry.IsMechanical(definition) &&
+                Vector3.DistanceSquared(element.Minimum, expectedMinimum) <= 0.000001f &&
+                Vector3.DistanceSquared(element.Maximum, expectedMinimum + Vector3.One) <= 0.000001f)
+            {
+                MechanicalAxis axis = MechanicalPartGeometry.ResolveAxis(
+                    element.CellX, element.CellY, element.CellZ,
+                    (x, y, z) => grid.TryGetFullCellMaterial(x, y, z, out ushort id) ? id : (ushort)0,
+                    definitions);
+                AddMechanicalMesh(vertices, expectedMinimum,
+                    MechanicalPartGeometry.BuildVisualMesh(definition, axis), definition,
+                    element.CellX, element.CellY, element.CellZ, (int)grid.Id);
+                continue;
+            }
             // Geometry stays in Grid-local coordinates. Movement and rotation are
             // supplied as a model matrix, so physics no longer rebuilds/uploads every
             // vertex on every simulation step.
@@ -1755,6 +1840,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
             AddBox(vertices, element.Minimum, element.Maximum, element.MaterialId, faceMask,
                 element.CellX, element.CellY, element.CellZ, (int)grid.Id, definitions);
         }
+        foreach (SoftBodySurfaceVertex vertex in smoothSurface)
+            AddSoftBodySurfaceVertex(vertices, vertex, (int)grid.Id, definitions);
         MeshBuffer buffer = CreateMeshBuffer();
         long uploadStart = Stopwatch.GetTimestamp();
         UploadMesh(buffer, vertices, BufferUsageHint.StaticDraw);
@@ -1952,6 +2039,11 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     private static double ElapsedMilliseconds(long started) =>
         (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
 
+    private static readonly long WaterAnimationStarted = Stopwatch.GetTimestamp();
+
+    private static float WaterAnimationSeconds() =>
+        (float)((Stopwatch.GetTimestamp() - WaterAnimationStarted) / (double)Stopwatch.Frequency);
+
     private static void AddRegularVoxel(
         PooledFloatBuffer vertices,
         int x,
@@ -1961,7 +2053,18 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         ChunkMeshingSnapshot snapshot,
         IReadOnlyList<BlockDefinition> definitions)
     {
-        bool fluid = definitions[material].IsFluid;
+        BlockDefinition definition = definitions[material];
+        if (MechanicalPartGeometry.IsMechanical(definition))
+        {
+            MechanicalAxis axis = MechanicalPartGeometry.ResolveAxis(
+                x, y, z, snapshot.GetBlock, definitions);
+            Vector3 origin = new(x, y, z);
+            AddMechanicalMesh(vertices, origin,
+                MechanicalPartGeometry.BuildVisualMesh(definition, axis), definition,
+                x, y, z, 0);
+            return;
+        }
+        bool fluid = definition.IsFluid;
         ushort above = snapshot.GetBlock(x, y + 1, z);
         bool fluidAbove = above != 0 && definitions[above].IsFluid;
         float maximumY = fluid && !fluidAbove
@@ -2044,7 +2147,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
     }
 
     private static bool IsGreedyOpaque(BlockDefinition definition) =>
-        !definition.IsFluid && !definition.IsTransparent && definition.Transmission <= 0f;
+        !definition.IsFluid && !definition.IsTransparent && definition.Transmission <= 0f &&
+        !MechanicalPartGeometry.IsMechanical(definition);
 
     private static void AddGreedyChunkFaces(
         PooledFloatBuffer vertices,
@@ -2221,9 +2325,44 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                     minimumY + v + runHeight,
                     chunk.MinimumZ + slice + 1);
             }
-            AddBox(vertices, minimum, maximum, material, (byte)(1 << face),
-                (int)minimum.X, (int)minimum.Y, (int)minimum.Z, 0, definitions,
-                tileUv: true);
+            if (face == 0 && definitions[material].IsFluid)
+            {
+                AddContinuousWaterTop(vertices, minimum, maximum, material, definitions);
+            }
+            else
+            {
+                AddBox(vertices, minimum, maximum, material, (byte)(1 << face),
+                    (int)minimum.X, (int)minimum.Y, (int)minimum.Z, 0, definitions,
+                    tileUv: true);
+            }
+        }
+    }
+
+    private static void AddContinuousWaterTop(
+        PooledFloatBuffer vertices,
+        Vector3 minimum,
+        Vector3 maximum,
+        ushort material,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        // The low-frequency wave only needs a two-block lattice. Boundaries are
+        // aligned to the global even grid so independently merged water regions
+        // still share edge vertices. Compared with one quad per water voxel this
+        // removes up to 75% of large-ocean surface vertices without flattening it.
+        for (float z = minimum.Z; z < maximum.Z - 0.001f;)
+        {
+            float nextZ = MathF.Min((MathF.Floor(z * 0.5f) + 1f) * 2f, maximum.Z);
+            for (float x = minimum.X; x < maximum.X - 0.001f;)
+            {
+                float nextX = MathF.Min((MathF.Floor(x * 0.5f) + 1f) * 2f, maximum.X);
+                Vector3 tileMinimum = new(x, minimum.Y, z);
+                Vector3 tileMaximum = new(nextX, maximum.Y, nextZ);
+                AddBox(vertices, tileMinimum, tileMaximum, material, 1 << 0,
+                    (int)MathF.Floor(x), (int)MathF.Floor(minimum.Y), (int)MathF.Floor(z),
+                    0, definitions);
+                x = nextX;
+            }
+            z = nextZ;
         }
     }
 
@@ -2314,6 +2453,49 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
         }
     }
 
+    private static void AddSoftBodySurfaceVertex(
+        PooledFloatBuffer vertices,
+        SoftBodySurfaceVertex vertex,
+        int gridId,
+        IReadOnlyList<BlockDefinition> definitions)
+    {
+        BlockDefinition definition = definitions[vertex.MaterialId];
+        vertices.Add(vertex.Position.X); vertices.Add(vertex.Position.Y); vertices.Add(vertex.Position.Z);
+        vertices.Add(vertex.Normal.X); vertices.Add(vertex.Normal.Y); vertices.Add(vertex.Normal.Z);
+        vertices.Add(vertex.Uv.X); vertices.Add(vertex.Uv.Y);
+        vertices.Add(vertex.MaterialId); vertices.Add(vertex.FaceIndex); vertices.Add(definition.Roughness); vertices.Add(definition.Metallic);
+        float packedTransmission = definition.IsFluid
+            ? -MathF.Max(definition.Transmission, 0.001f)
+            : definition.Transmission;
+        vertices.Add(packedTransmission);
+        vertices.Add(definition.Emission.X); vertices.Add(definition.Emission.Y); vertices.Add(definition.Emission.Z);
+        vertices.Add(vertex.CellX); vertices.Add(vertex.CellY); vertices.Add(vertex.CellZ); vertices.Add(gridId);
+    }
+
+    private static void AddMechanicalMesh(
+        PooledFloatBuffer vertices,
+        Vector3 origin,
+        IReadOnlyList<MechanicalPartMeshVertex> mesh,
+        BlockDefinition definition,
+        int cellX,
+        int cellY,
+        int cellZ,
+        int gridId)
+    {
+        foreach (MechanicalPartMeshVertex vertex in mesh)
+        {
+            Vector3 position = origin + vertex.Position;
+            vertices.Add(position.X); vertices.Add(position.Y); vertices.Add(position.Z);
+            vertices.Add(vertex.Normal.X); vertices.Add(vertex.Normal.Y); vertices.Add(vertex.Normal.Z);
+            vertices.Add(vertex.Uv.X); vertices.Add(vertex.Uv.Y);
+            vertices.Add(definition.Id); vertices.Add(vertex.AtlasFace);
+            vertices.Add(definition.Roughness); vertices.Add(definition.Metallic);
+            vertices.Add(definition.Transmission);
+            vertices.Add(definition.Emission.X); vertices.Add(definition.Emission.Y); vertices.Add(definition.Emission.Z);
+            vertices.Add(cellX); vertices.Add(cellY); vertices.Add(cellZ); vertices.Add(gridId);
+        }
+    }
+
     private static Vector3 BoxFaceCorner(Vector3 minimum, Vector3 maximum, int face, int corner) =>
         (face, corner) switch
         {
@@ -2394,8 +2576,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                         voxel.Y + 0.5f,
                         chunk.MinimumZ + voxel.LocalZ + 0.5f),
                     Vector3.Normalize(emission + new Vector3(0.001f)),
-                    Math.Clamp(energy, 0.25f, 8f),
-                    Math.Clamp(4f + energy * 2.5f, 5f, 18f)));
+                    Math.Clamp(MathF.Sqrt(energy) * 0.55f, 0.18f, 2.2f),
+                    Math.Clamp(3.5f + MathF.Sqrt(energy) * 2.0f, 4f, 10f)));
             }
             _deferredLightsByChunk[chunk] = lights;
             _dirtyDeferredLightChunks.Remove(chunk);
@@ -2420,8 +2602,8 @@ public sealed class RasterVoxelRenderer : IRenderBackend, IMaterialPreviewSource
                         return new LocalDeferredLight(
                             (entry.Element.Minimum + entry.Element.Maximum) * 0.5f,
                             Vector3.Normalize(entry.Emission + new Vector3(0.001f)),
-                            Math.Clamp(energy, 0.25f, 8f),
-                            Math.Clamp(4f + energy * 2.5f, 5f, 18f));
+                            Math.Clamp(MathF.Sqrt(energy) * 0.55f, 0.18f, 2.2f),
+                            Math.Clamp(3.5f + MathF.Sqrt(energy) * 2.0f, 4f, 10f));
                     })
                     .ToArray();
                 cached = new CachedGridLights(grid.TopologyVersion, localLights);

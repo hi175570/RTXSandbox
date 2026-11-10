@@ -32,6 +32,7 @@ uniform int uPointLightCount;
 uniform vec4 uPointPositionRadius[16];
 uniform vec4 uPointColorIntensity[16];
 uniform int uSpotLightCount;
+uniform int uEnvironmentVisible;
 uniform vec4 uSpotPositionRadius[4];
 uniform vec4 uSpotDirectionCone[4];
 uniform vec4 uSpotColorIntensity[4];
@@ -224,16 +225,44 @@ bool screenReflection(vec3 position, vec3 direction, float roughness, int qualit
                 }
                 else lower = middle;
             }
+            vec3 hitGeometricNormal = decodeOctahedral(texture(uMotion, refinedUv).zw);
+            // Reject the back side of a screen-space surface. Without this check a
+            // ray could accept the face of an unrelated emissive voxel and produce
+            // detached square light cards in a reflection.
+            if (dot(hitGeometricNormal, direction) > -0.025)
+            {
+                previousSample = sampleWorld;
+                continue;
+            }
+            vec2 colorTexel = 1.0 / vec2(textureSize(uAlbedo, 0));
+            float blur = roughness * roughness * 2.5;
             vec3 hitAlbedo = texture(uAlbedo, refinedUv).rgb;
+            if (blur > 0.08)
+            {
+                hitAlbedo += texture(uAlbedo, refinedUv + vec2(colorTexel.x * blur, 0.0)).rgb;
+                hitAlbedo += texture(uAlbedo, refinedUv - vec2(colorTexel.x * blur, 0.0)).rgb;
+                hitAlbedo += texture(uAlbedo, refinedUv + vec2(0.0, colorTexel.y * blur)).rgb;
+                hitAlbedo += texture(uAlbedo, refinedUv - vec2(0.0, colorTexel.y * blur)).rgb;
+                hitAlbedo *= 0.2;
+            }
             vec4 hitEmissionSample = texture(uEmission, refinedUv);
-            vec3 hitEmission = hitEmissionSample.rgb;
+            vec3 hitEmission = max(hitEmissionSample.rgb, vec3(0.0));
+            float peakEmission = max(hitEmission.r, max(hitEmission.g, hitEmission.b));
+            hitEmission /= 1.0 + peakEmission * 0.52;
             if (uSelectionInReflections != 0)
                 hitEmission += hitEmissionSample.a * vec3(0.8, 0.583, 0.06);
             reflected = hitAlbedo * 0.72 + hitEmission;
             float edge = min(min(refinedUv.x, refinedUv.y), min(1.0 - refinedUv.x, 1.0 - refinedUv.y));
             float edgeFade = smoothstep(0.015, 0.12, edge);
             float distanceFade = 1.0 - smoothstep(10.0, 42.0, rayDistance);
-            confidence = edgeFade * distanceFade * (1.0 - roughness * 0.72);
+            vec4 refinedScene = texture(uPosition, refinedUv);
+            float hitError = refinedScene.a > 0.5 && finiteVector(refinedScene.xyz)
+                ? distance(refinedScene.xyz, upper) : thickness;
+            // Loose screen-space intersections were especially visible on bright
+            // voxel lights: the complete source texel appeared as a detached square.
+            // Only a geometrically tight hit may retain full reflection confidence.
+            float hitConfidence = 1.0 - smoothstep(thickness * 0.18, thickness * 0.72, hitError);
+            confidence = edgeFade * distanceFade * hitConfidence * (1.0 - roughness * 0.72);
             return confidence > 0.001;
         }
         previousSample = sampleWorld;
@@ -286,7 +315,9 @@ void main()
         else
         {
             vec3 skyDirection = safeNormalize(vec3(vUv * 2.0 - 1.0, 0.75), vec3(0.0, 1.0, 0.0));
-            outColor = vec4(skyColor(skyDirection, daylight), 1.0);
+            outColor = vec4(
+                uEnvironmentVisible != 0 ? skyColor(skyDirection, daylight) : vec3(0.0),
+                uEnvironmentVisible != 0 ? 1.0 : 0.0);
         }
         return;
     }
@@ -296,11 +327,18 @@ void main()
     vec4 emissionSample = texture(uEmission, vUv);
     vec4 motionSample = texture(uMotion, vUv);
     vec3 position = positionSample.xyz;
+    bool lightAbsorber = int(round(positionSample.a - 1.0)) == 189;
     vec3 albedo = clamp(albedoRoughness.rgb, 0.0, 1.0);
     float roughness = clamp(albedoRoughness.a, 0.045, 1.0);
     float metallic = clamp(normalMetallic.a, 0.0, 1.0);
     vec3 normal = safeNormalize(normalMetallic.xyz * 2.0 - 1.0, vec3(0.0, 1.0, 0.0));
     vec3 geometricNormal = decodeOctahedral(motionSample.zw);
+    // Specular anti-aliasing: a pixelated normal map must add apparent surface
+    // roughness instead of turning each atlas texel into a square mirror/firefly.
+    // Albedo stays crisp; only the unresolved micro-normal variance is filtered.
+    float normalVariance = max(dot(dFdx(normal), dFdx(normal)), dot(dFdy(normal), dFdy(normal)));
+    float lightingRoughness = clamp(sqrt(roughness * roughness + min(normalVariance * 0.32, 0.36)),
+        roughness, 1.0);
     vec3 viewDirection = safeNormalize(uCameraPosition - position, geometricNormal);
     vec3 emission = max(emissionSample.rgb, vec3(0.0)) + emissionSample.a * vec3(0.8, 0.583, 0.06);
     float ao = screenAo(position, geometricNormal, uAoQuality);
@@ -327,7 +365,7 @@ void main()
         (0.82 + float(uRendererQuality) * 0.06);
     vec3 sunRadiance = mix(vec3(0.16, 0.21, 0.35), vec3(4.2, 3.75, 3.15), daylight) * lightingScale;
     float sunVisibility = directionalShadow(position, geometricNormal, lightDirection, uShadowQuality);
-    vec3 directLighting = pbrLight(albedo, roughness, metallic, normal, viewDirection,
+    vec3 directLighting = pbrLight(albedo, lightingRoughness, metallic, normal, viewDirection,
         lightDirection, sunRadiance, sunVisibility);
     int activeLightCount = 1;
 
@@ -345,8 +383,8 @@ void main()
         int shadowedPointLightLimit = uShadowQuality >= 3 ? 4 : uShadowQuality >= 2 ? 2 : 0;
         float visibility = index < shadowedPointLightLimit
             ? screenShadow(position + geometricNormal * 0.04, direction, distanceToLight, uShadowQuality) : 1.0;
-        directLighting += pbrLight(albedo, roughness, metallic, normal, viewDirection, direction,
-            uPointColorIntensity[index].rgb * uPointColorIntensity[index].a * attenuation * 8.0, visibility);
+        directLighting += pbrLight(albedo, lightingRoughness, metallic, normal, viewDirection, direction,
+            uPointColorIntensity[index].rgb * uPointColorIntensity[index].a * attenuation * 2.0, visibility);
     }
 
     for (int index = 0; index < 4; index++)
@@ -365,12 +403,14 @@ void main()
         float attenuation = cone * pow(clamp(1.0 - distanceToLight / radius, 0.0, 1.0), 2.0);
         float visibility = uShadowQuality >= 2
             ? screenShadow(position + geometricNormal * 0.04, direction, distanceToLight, uShadowQuality) : 1.0;
-        directLighting += pbrLight(albedo, roughness, metallic, normal, viewDirection, direction,
+        directLighting += pbrLight(albedo, lightingRoughness, metallic, normal, viewDirection, direction,
             uSpotColorIntensity[index].rgb * uSpotColorIntensity[index].a * attenuation, visibility);
     }
 
     vec3 reflectedDirection = reflect(-viewDirection, normal);
-    vec3 environment = skyColor(safeNormalize(reflectedDirection, geometricNormal), daylight);
+    vec3 environment = uEnvironmentVisible != 0
+        ? skyColor(safeNormalize(reflectedDirection, geometricNormal), daylight)
+        : vec3(0.0);
     vec3 f0 = mix(vec3(0.04), albedo, metallic);
     float facing = clamp(dot(normal, viewDirection), 0.0, 1.0);
     vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(clamp(1.0 - facing, 0.0, 1.0), 5.0);
@@ -379,7 +419,7 @@ void main()
     float ambientShadow = mix(0.68, 1.0, sunVisibility);
     vec3 ambient = albedo * mix(vec3(0.055, 0.065, 0.09), vec3(0.18, 0.22, 0.30), daylight) *
         (1.0 - metallic) * ao * ambientShadow;
-    vec3 environmentReflection = environment * fresnel * (1.0 - roughness * 0.78) *
+    vec3 environmentReflection = environment * fresnel * pow(1.0 - lightingRoughness, 2.0) *
         (float(uReflectionQuality) / 3.0) * ao;
     vec3 indirectLighting = ambient + environmentReflection;
     vec3 ssrContribution = vec3(0.0);
@@ -387,7 +427,7 @@ void main()
     if (uReflectionQuality > 0)
     {
         vec3 ssrColor;
-        if (screenReflection(position + geometricNormal * 0.05, reflectedDirection, roughness,
+        if (screenReflection(position + geometricNormal * 0.05, reflectedDirection, lightingRoughness,
                 uReflectionQuality, ssrColor, reflectionConfidence))
         {
             ssrContribution = ssrColor * fresnel * reflectionConfidence;
@@ -395,7 +435,9 @@ void main()
         }
     }
 
-    vec3 color = directLighting + indirectLighting + emission;
+    // The built-in absorber is an ideal transport sink, not a dielectric with a
+    // dark albedo. Preserve only the explicit selection outline stored in emission.
+    vec3 color = lightAbsorber ? emission : directLighting + indirectLighting + emission;
     bool invalidOutput = invalidInput || !finiteVector(directLighting) || !finiteVector(indirectLighting) ||
         !finiteVector(ssrContribution) || !finiteVector(color);
     if (uDebugView == 8) { outColor = vec4(max(color, vec3(0.0)), 1.0); return; }

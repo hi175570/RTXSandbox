@@ -65,7 +65,7 @@ Creative voxel building
 - 九格快捷列、搜尋、分類與 3D 等角方塊預覽。
 - A／B 區域選取、填滿、清除與條件替換。
 - 複製、貼上、Y 軸旋轉、X 軸鏡像。
-- 球形新增／刪除筆刷、平整與爆炸工具。
+- 平整、爆炸、選區、複製與貼上工具；舊球形體素筆刷已移除。
 - 最多 64 筆建造操作 Undo／Redo。
 - 1/2 到 1/64 的精密 Micro Voxel 建造，以及混合網格的精確資料表示。
 - 方塊準星資訊限制為最多三行，避免遮住遊戲畫面。
@@ -174,6 +174,8 @@ Hardware Ray Tracing 是 Windows 專用的 Direct3D 12 DXR 管線。它會實際
 
 DXR 支援共用材質、基本法線明暗、直接光照、陰影、反射、折射、透明／彩色玻璃、水、發光材質、動態 Grid 和攝影機更新。Render Style 包含 Default、Wax Mode（打蠟模式）、Reference 與 Debug。
 
+平面鏡尾端歷史在一般轉頭時會沿用上一幀相機資料進行重投影，不再因每個滑鼠視角增量先清空而短暫變黑；視窗重建或真正的大幅相機跳躍仍會安全丟棄不相容歷史。
+
 真實 DXR 反射最多 29 層。Infinite Mirror Extension 的 Extreme 模式可把平面鏡的視覺尾端延伸到 1000 層，但 30 層以後是 Reprojected／Analytic Tail 近似，不會被介面或文件假稱為 1000 次真實 DXR bounce：
 
 ```text
@@ -234,6 +236,8 @@ isTransparent / isCollidable / isFluid / affectedByGravity
 surfacePattern / textureGenerator / soundSet
 ```
 
+共用程序 Atlas 不再對所有金屬套同一張純色鏡面：鑄鐵、拉絲鋁、不鏽鋼、錘紋鋼、鈦、青銅、黃銅、銀與鍍鉻分別使用 cast／brushed／hammered／polished 微表面與不同粗糙度。鍍鉻仍可接近完美鏡面，其餘金屬會保留各自的細節、反射展寬與底色；各 Renderer 讀取同一份材質資料。
+
 ### 玻璃
 
 玻璃家族包括一般玻璃、彩色玻璃、磨砂、霧面、馬賽克、壓克力與雕紋／蝕刻玻璃。物品庫會把玻璃集中排序，彩色系列採穩定顏色順序；磨砂、霧面與馬賽克使用不同尺度的表面細節。
@@ -255,6 +259,7 @@ Emission 不只改變方塊自身顏色。Raster 管線建立有限數量的發�
 - 小範圍連通管壓力／液面平衡。
 - 世界修改、存檔、載入及 Renderer 更新。
 - 游泳阻力；跳躍鍵在不同水深仍提供足以離水的跳躍，不用自動爬牆。
+- 模拟量仍以格点保存，但可见水面不是每格重复的静态贴图：Raster／Android 使用独立透明 pass、跨方块与 Chunk 连续的 world-space 几何波和细节法线波；Compute PT 使用连续光学法线，Hardware DXR 使用相同相位扰动命中法线而不每帧重建 BLAS。
 
 目前水模擬仍不是 Navier–Stokes：尚無完整速度向量、黏度、泵浦／活塞、跨未載入 Chunk 的全域連通或大型海洋壓力求解。
 
@@ -284,15 +289,31 @@ Emission 不只改變方塊自身顏色。Raster 管線建立有限數量的發�
 
 - 世界選擇與世界建立。
 - 遊戲 HUD、九格快捷列、選取框與三行方塊資訊。
-- Creative Library／物品庫。
+- Creative Library／物品庫：Java 版 Minecraft 風格的淺灰凹凸面板、分類圖示分頁、9×5 完整物品格，以及底部九格快捷欄。滑鼠滾輪逐列切換，拖動捲軸也會吸附整列，不裁切半個物品；分類過多時用左右按鈕翻分頁列。
 - 建造工具與精密模式。
 - ESC 暫停選單：繼續、六個功能入口、離開世界。
 - 設定：全域顯示設定與當前 Renderer 專屬光影設定。
 - Mod 管理、檔案右鍵選單與簡易文字編輯器。
 
-設定畫面的完成按鈕會回到上一層暫停選單；Mod 不再混在設定頁。再次按 ESC 會儲存並關閉暫停選單，視窗失去焦點時會自動開啟暫停選單。桌面中文輸入使用 IME composition，避免組字跑到左上角或中文輸入造成操作焦點卡住。
+設定畫面的完成按鈕會回到上一層暫停選單；Mod 不再混在設定頁。再次按 ESC 會儲存並關閉暫停選單，視窗失去焦點時會自動開啟暫停選單。桌面不会在进入游戏时强制切换英文键盘配置；Windows IME 只在实际文字输入框取得焦点时与游戏窗口关联，普通菜单和游玩状态不会让 IME 抢走 Shift／WASD。中文输入框仍使用原生 composition 与候选窗定位。
 
-Android 已有觸控虛擬按鍵、八方向 D-pad／搖桿配置、跳躍、蹲下、左右鍵、長按畫面破壞、快捷列、物品庫，以及可在遊戲內重新綁定並保存的外接鍵盤輸入；觸控按鈕可選完整標準 104 鍵名稱。桌面與 Android 直接共用 `SharedImGuiScreens` 的暫停、成就與語言畫面，語言清單以 `繁體中文／简体中文／English` 自稱顯示；Android Editor 使用與 PC 相同的 `Blocks / Tools`、九格快捷欄、搜尋與材質卡片排列。Android 設定恢復 PC 的「畫面／時間與光照／控制與介面」核心頁籤，另加「觸控」；顯示距離、FOV、日夜循環、日長、靈敏度、建造距離、飛行／穿牆、物理開關與保存均接入實際狀態。Android 也已接入世界管理與可實際執行 `BasePlugin` 的 Mod runtime V1；完整桌面 BepInEx 等價能力與所有 Renderer 進階細項仍待接入，詳見「[Android](#android)」。
+創造物品欄是**遊戲本體**的 UI，並非模組管理頁或需要安裝的外掛。頂部分頁依序為全部、自然、木材、建築、玻璃、金屬、光學、照明、科技、工具等內容分類，收藏固定在最後；背包改為獨立側邊標籤，搜尋框則始終保留，不再偽裝成內容分類。所有玻璃由既有 key／`glass` tag 集中到「玻璃」分頁；能量投射器等可用工具則集中到「工具」，不改變方塊 ID、材質或存檔。搜尋可匹配名稱、namespaced key 與標籤，物品庫右鍵切換收藏。新增內容的 Category 會自動產生分頁。`CreativeInventoryPanel` 和 `CreativeInventoryModel` 由桌面及 Android 直接共用，三種語言的分頁名稱也共用同一張表。
+
+侧边「背包」提供 **9×5＝45 格**，格子尺寸与物品库完全相同，另外保留九格快捷栏且没有装备栏。创造模式中的格子保存的是一个材质引用，不再显示虚假的 64 数量；旧版 81 格／count 设定会安全压缩并迁移为最多 45 个材质。背包与快捷栏按 namespaced key 保存，切换世界仍保留这套创造工具配置，世界建造继续无限取用。
+
+| 操作 | 效果 |
+|---|---|
+| 點物品库／Shift＋點物品库 | 游标拿起一个材质引用；Shift 不再制造 64 的假数量 |
+| 點背包／快捷栏格子 | 拿起、放回或与不同材质交换；放回同类格会清空游标 |
+| Shift＋點擊／Shift＋左鍵拖曳 | 背包與快捷欄之间快速搬运到空格 |
+| 右鍵點物品库 | 加入或移除收藏 |
+| 背包右下角垃圾桶 | 點擊銷毀游標材質；Shift＋點擊會清空游標、45 格背包及九格快捷欄 |
+
+物品庫滾輪仍是整列捲動，不顯示半個物品。拿著物品時可以切分類再放入背包；ESC／叉叉關閉會取消**尚未完成的拿取與交換**，回復到這次拿起之前，不把游標物品弄丟。完成放入後立即成為保留的配置，關閉背包時保存。任何 UI 可见时都会释放并显示鼠标，暂停菜单与背包之间切换也不会重新把鼠标藏起来。操作参考 [Mouse Tweaks](https://github.com/YaLTeR/MouseTweaks)，是原生游戏实现，不是载入 Minecraft 模组或完整移植其所有设定。
+
+針對此介面可執行 `dotnet run --project RTXSandbox.csproj -c Release -- --inventory-self-test`；测试包括真实 ImGui 点击／拖曳、分页、侧边背包、独立垃圾桶、45 格与九格快捷栏、三种视窗大小、交易回滚、持久化、鼠标捕获与 IME ownership。
+
+Android 已有觸控虛擬按鍵、八方向 D-pad／搖桿配置、跳躍、蹲下、左右鍵、長按畫面破壞、快捷列、物品庫，以及可在遊戲內重新綁定並保存的外接鍵盤輸入；觸控按鈕可選完整標準 104 鍵名稱。桌面與 Android 直接共用 `SharedImGuiScreens` 的暫停、成就與語言畫面，語言清單以 `繁體中文／简体中文／English` 自稱顯示；Android 創造物品欄直接共用桌面的 `CreativeInventoryPanel` 分頁、完整格子、整列捲動與底部快捷欄；建造工具則仍由原有工具畫面提供。Android 設定恢復 PC 的「畫面／時間與光照／控制與介面」核心頁籤，另加「觸控」；顯示距離、FOV、日夜循環、日長、靈敏度、建造距離、飛行／穿牆、物理開關與保存均接入實際狀態。Android 也已接入世界管理與可實際執行 `BasePlugin` 的 Mod runtime V1；完整桌面 BepInEx 等價能力與所有 Renderer 進階細項仍待接入，詳見「[Android](#android)」。
 
 ## 存檔與世界管理
 
@@ -331,9 +352,42 @@ BepInEx/plugins/
    └─ 其他相依 DLL
 ```
 
-公開的 `RTXSandbox.ModAPI` 目標為 `netstandard2.1`，提供 Blocks、Items、Recipes、Tools、World、Rendering、Physics、Events 與 service locator 等介面。遊戲本體預設使用 `net9.0`，可由 .NET 10 SDK選擇性建置 `net10.0` Host，以改善新舊 TFM Mod 的 Runtime 條件；這不代表所有第三方依賴一定二進位相容。
+本專案不再提供獨立 `RTXSandbox.ModAPI`。模組框架的定位是直接劫持／擴充遊戲：插件引用目前的 `Managed/RTXSandbox.dll`，透過公開成員、Reflection 或 Harmony patch 操作本體。這不提供跨版本二進位相容承諾，但也不以一層受限 API 阻擋模組能力。遊戲預設使用 Visual Studio 2022 可載入的 `net9.0`；可選擇性建立 `net10.0` Host，但 Runtime 升級不代表第三方依賴一定相容。
 
 遊戲內 Mod 頁面可對文字／C# 檔案開啟右鍵選單，進行編輯、保存、移動、重新命名、刪除與手動編譯。編譯永遠保留原始碼；刪除走回收筒／可恢復流程。第一版編譯器會引用遊戲 `Managed`、Mod 目錄及依賴 DLL，但目前沒有安全可靠的 Runtime Hot Reload，完成編譯後仍建議重新啟動遊戲。
+
+#### 本體軟體物理、能量工具與機械結構
+
+透明凝膠、彈性橡膠與柔軟泡棉，以及持續運行的質點／彈簧求解器，現在屬於遊戲本體，不必安裝 Mod。含軟材質的面相連結構會以整個 `PhysicsGrid` 為單位變形；普通硬方塊可作為同一結構的剛性負載，貼著世界的接觸面固定，最後支撐被破壞後則解除固定並受重力影響。每格仍可單獨破壞，硬方塊不會被揉成軟體。
+
+創造物品欄的物理分類包含：
+
+- **透明凝膠**：柔軟、帶透射，形變後緩慢恢復。
+- **彈性橡膠**：剛度和回彈最高。
+- **柔軟泡棉**：形變最大、阻尼最高。
+
+- **能量投射器**：左鍵發射可見的能量脈衝；右鍵打開專屬設定，可獨立選擇低／中／高力度及 0.15～4 格受力半徑。脈衝可推動動態 Physics Grid 與解析球。普通中等脈衝已足以使非夾層玻璃碎裂；世界玻璃與 Physics Grid 內的玻璃都會移除被命中的原格，從實際命中點向四邊產生固定上限八片、帶隨機邊界的三角棱柱碎片。每片都有獨立重力、線速度與角速度；視覺使用明確角點，碰撞使用片內緊縮代理，不再把一格玻璃展開成 `8×8×8` 粉末，也不再用幾個長方體假裝不規則碎片。已經是 Micro Voxel 的玻璃只會把既有元素分組，不會再次把每個元素乘上 64。Physics Save V3／單檔世界 V9 會保存碎片表皮，重開後不會退回碰撞小方塊。
+- **動力與傳動元件**：高扭力／高速／重載馬達、減速／增速齒輪箱、傳動軸、飛輪、煞車、大小直齒輪、傘齒輪、直線齒條、離合器、萬向接頭、鏈輪與皮帶輪，以及直線伺服缸、升降曲柄、旋轉主軸、曲柄搖臂、輸送驅動輪與凸輪推板。致動器必須透過面相連的機械元件連到動力源，且機架必須實際接觸可碰撞的靜態世界支撐才會運轉。馬達、齒輪箱與致動器外殼保持固定，只有輸出接觸區向獨立剛體負載施加有界力／扭矩；拆掉最後支撐後整組機械會退出固定狀態並受普通剛體重力影響，不再沿腳本錨點漂浮、擺動或旋轉。世界渲染與桌面／Android 物品欄共用機械輪廓，不再以一排換色方塊冒充不同元件。
+- **水面互動**：移動中的物理結構或解析球進入水體時，會把有限流體量重新分配成小幅局部波紋；不生成誇張水花，也不憑空增加或刪除水量。
+
+材質現在有獨立的實際物理密度。`BlockDefinition.Density` 的單位是每個完整一立方公尺方塊的公噸數（同時等價於 t/m³）；Physics Grid 的質量、質心與慣量會使用體積×密度。金屬度與粗糙度只影響渲染，不再冒充重量。鐵塊預設為 7.87 t/格，方塊資訊 HUD 會在金屬度／粗糙度同一行顯示質量。
+
+核心求解器以固定 120 Hz 小步進計算重力、阻尼、材質剛度、形狀恢復與世界碰撞；每格使用八個明確角點與面／體對角約束，最多同時接管 32 個、每個 512 格的結構。可見表皮與玩家碰撞仍維持封閉、平滑且可行走的方塊外殼，不以球串或 Capsule 冒充軟方塊。表面 UV 綁定未變形時的格點，再隨目前角點插值，因此材質會跟著彎曲、剪切與旋轉，而不是在每格重新貼一張未變形方圖。變形後的凝膠表面也使用實際角點三角面做射線命中，因此可從彎曲後的側面繼續放置或逐格破壞，不再只命中未變形的舊 AABB。
+
+硬方塊不套用軟表皮。每一組面相連的金屬／普通硬 Cell 會建立獨立 shape-matching 剛性群：它能被凝膠帶著平移、旋轉並把重量傳回軟梁，但群內距離與方塊排列保持剛性，不會被 spring solver 揉成一坨。Physics Grid 的整體方向會跟隨主要剛性群，因此末端鐵塊和與它銜接的軟梁會使用同一個旋轉基準，不再出現鐵塊保持水平、梁卻獨自彎曲的錯位。硬 Cell 的可見／碰撞盒沿用來源方塊尺寸，不再由旋轉後的 solver 質點 AABB 膨脹；標準鐵塊始終是一格方塊。自動 smoke 同時量測剛性群最大形狀誤差，超過 0.04 格或硬方塊尺寸偏離一格即判定失敗。
+
+`Examples/SoftBodyPhysicsMod` 已改為 **Impact Plasticity V2** 範例：它不再擁有或重複運行本體的連續軟體求解器，而是直接用 Harmony patch 能量命中的內部流程。土壤／凝膠保留體素材質反應；金屬不再刪除 `8×8×8` 小格來製造像素坑，而會把受擊面轉成共享角點的連續細分曲面，以超橢圓壓痕、方向性加工硬化折面及平滑法線形成永久凹陷。凹面使用簡化碰撞但仍可選取，並由 Physics Save V3 保存。玻璃碎裂仍在本體，確保沒裝 Mod 也能正確破裂。這個例子刻意不經過獨立 Mod API。
+
+目前限制：不保存每條 spring 的瞬時狀態；運行中的 Micro Voxel 結構組裝、軟體互撞、布料、繩索、撕裂及 GPU solver 尚未完成。塑性 Mod V2 只在能量命中時重算局部形狀，不把全世界變成持續軟體模擬。
+
+### RTX 展示世界
+
+Showcase 預設現在是一座共用展示園區：水與折射實驗室、特殊玻璃光譜牆、平行鏡廳、具單格針孔及倒立投影的暗箱、PBR 金屬庭院、剛體／解析球場、具實體牆面固定端的軟體梁，以及有馬達、齒輪箱、傳動軸與飛輪供電的機械場都在同一世界。凝膠／橡膠／泡棉梁在存檔中是與牆相連的世界方塊，不是預先懸空建立的 Physics Grid；遊戲啟動後才由軟體求解器在保留牆面固定點的前提下接管。機械場則把固定於基岩的機架與可動負載保存為不同 Physics Grid，避免整台馬達連同負載一起播放懸空動畫。六條 Renderer 看到相同資料。維護用命令可在無視窗模式生成及重載驗證：
+
+```powershell
+dotnet run -c Release --no-build -- --install-showcase-world=world1 --showcase-source-root=C:\D\games\RTXSandbox\Saves --showcase-output-root=<staging>
+dotnet run -c Release --no-build -- --verify-showcase-world=world1 --showcase-source-root=C:\D\games\RTXSandbox\Saves
+```
 
 > Mod 是可執行程式碼，只安裝可信來源。ARM64 上 MonoMod／RuntimeDetour 仍有上游不支援警告，依賴 Runtime patch 的 Mod 不能宣稱完整相容。完整說明見 [MODDING.md](MODDING.md)。
 
@@ -350,7 +404,7 @@ BepInEx/plugins/
 
 | 平台 | 架構 | 目前證據 | Renderer／限制 | 狀態 |
 |---|---|---|---|---|
-| Windows 10/11 | x64 | Debug／Release、91/91 self-tests、RTX 5050 DXR smoke、BepInEx 實際載入 | 六條 Renderer；DXR 完整主要驗證平台 | **主要支援** |
+| Windows 10/11 | x64 | Debug／Release、108/108 self-tests、RTX 5050 DXR smoke、BepInEx／Impact Plasticity V2 實際載入 | 六條 Renderer；DXR 完整主要驗證平台 | **主要支援** |
 | Windows | ARM64 | 可產生 self-contained／framework-dependent 發行檔 | 尚無 ARM64 Windows 實機；MonoMod hook 有限制 | **跨編譯** |
 | Linux（Ubuntu／WSL） | x64 | 87/87 self-tests；Mesa／Xvfb GL 4.3 下 Classic、PBR、Deferred、Hybrid、Compute smoke；BepInEx `Started: True` | 五條 OpenGL Renderer；無 D3D12 DXR | **實際驗證** |
 | Linux | ARM64 | self-contained 發行檔在 QEMU AArch64 通過 87/87 self-tests | 尚無 ARM64 GPU 畫面；Mod hook 有限制 | **核心驗證** |
@@ -372,7 +426,7 @@ BepInEx/plugins/
 
 ### Android
 
-Android 專案不是獨立世界 Demo：它直接 link／重用 `World`、`PlayerController`、`Camera`、`CreativeHotbar`、`ItemRegistry`、`WorldSaveService`、平台服務與 ModAPI，並使用同一份基礎內容 JSON。APK 支援 `android-x64` 與 `android-arm64`，最低 API 26，現有 Emulator 驗證使用 API 30。
+Android 專案不是獨立世界 Demo：它直接 link／重用 `World`、`PlayerController`、`Camera`、`CreativeHotbar`、`ItemRegistry`、`WorldSaveService`、平台服務與遊戲內部 Engine contracts，並使用同一份基礎內容 JSON。APK 支援 x86／x64／ARMv7／ARM64，最低 API 26。
 
 已存在：
 
@@ -436,7 +490,7 @@ dotnet build RTXSandbox.sln -c Release `
   -p:RTXSandboxHostTargetFramework=net10.0
 ```
 
-`RTXSandbox.ModAPI` 維持 `netstandard2.1`。這是選擇性 Host 目標，不要求為升級 Runtime 重寫遊戲系統。
+模組需直接引用與 Host 相同版本的 `RTXSandbox.dll`；可選 `net10.0` Host 不會產生另一份 Mod API，也不要求重寫遊戲系統。
 
 ### 一次發行桌面平台與 Android
 
@@ -494,7 +548,7 @@ dotnet run --project RTXSandbox.csproj -c Release --no-build -- --self-test
 dotnet run --project RTXSandbox.csproj -c Release --no-build -- --mod-diagnostics
 ```
 
-目前已記錄的共享測試總數為 91/91。測試涵蓋世界、Region save、流體、Micro Voxel、物理、Renderer 設定、平台服務、可編輯輸入、三語導航與 Mod 相關核心行為。
+目前 Windows 共享測試總數為 118/118。測試涵蓋世界、Region save、流體、Micro Voxel、剛體／核心軟體物理、軟體存檔拓撲復原、變形表面逐格編輯、能量玻璃碎裂、展示世界、Renderer 設定、平台服務、可編輯輸入、三語導航與 Mod 相關核心行為。其他平台表格中的較低數字是該平台最後一次實際執行的證據，不直接冒充已同步重跑。
 
 ### GPU Smoke
 
@@ -505,6 +559,8 @@ dotnet run -c Release --no-build -- --gpu-smoke-deferred
 dotnet run -c Release --no-build -- --gpu-smoke-hybrid
 dotnet run -c Release --no-build -- --gpu-smoke
 dotnet run -c Release --no-build -- --gpu-smoke-hardware
+dotnet run -c Release --no-build -- --gpu-smoke-hardware-debris
+dotnet run -c Release --no-build -- --gpu-smoke-hardware-soft-body
 ```
 
 其中 `--gpu-smoke` 是 Compute Path Tracing；Hardware DXR 必須明確使用 `--gpu-smoke-hardware`。其他針對性測試包括：
@@ -603,7 +659,6 @@ bin/Release/net9.0/
 ├─ RTXSandbox.exe            # Windows；其他平台為對應 native apphost
 ├─ Managed/
 │  ├─ RTXSandbox.dll
-│  ├─ RTXSandbox.ModAPI.dll
 │  ├─ *.deps.json
 │  ├─ *.runtimeconfig.json
 │  └─ 第三方與 Runtime DLL
@@ -647,8 +702,8 @@ RTXsandbox/
 │  └─ ProceduralMaterialAtlas.cs      共用材質 Atlas
 ├─ Shaders/                           GLSL 與 HLSL
 ├─ Persistence/WorldSaveService.cs    level／Region／generation 存檔
-├─ Modding/                           BepInEx Host、編譯與診斷
-├─ RTXSandbox.ModAPI/                 公開 netstandard2.1 Mod API
+├─ Engine/Contracts/                  編入遊戲的共用內部合約
+├─ Modding/                           BepInEx Host、直接 Hook 編譯與診斷
 ├─ RTXSandbox.Android/                Android Host、GLES、觸控與外接輸入
 ├─ Infrastructure/                    平台抽象、診斷與壓力測試
 ├─ UI/                                ImGui controller 與設定畫面

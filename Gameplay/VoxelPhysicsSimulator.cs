@@ -1,6 +1,6 @@
 using System.Numerics;
 using System.Diagnostics;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
 using RTXSandbox.World;
 
 namespace RTXSandbox.Gameplay;
@@ -35,6 +35,9 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     public int ChangesLastStep { get; private set; }
     public int SimulationSubstepsLastStep { get; private set; }
     public int ActiveGridCount => _world.PhysicsGrids.Count;
+    public int ExactRigidBodyCount => _rigidBodyBackend?.DynamicBodyCount ?? 0;
+    public int LightweightDebrisCount => _rigidBodyBackend?.LightweightDebrisCount ?? 0;
+    public int VirtualizedDebrisCount => _rigidBodyBackend?.VirtualizedDebrisCount ?? 0;
     public bool SimulationEnabled { get; set; } = true;
     public ulong SelectedGridId { get; private set; }
     public string Status { get; private set; } = "Grid physics ready";
@@ -48,10 +51,13 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     public double MaximumDynamicReconcileMilliseconds =>
         _rigidBodyBackend?.MaximumDynamicReconcileMilliseconds ?? 0;
     public double MaximumSimulationMilliseconds => _rigidBodyBackend?.MaximumSimulationMilliseconds ?? 0;
+    public double MaximumLightweightDebrisMilliseconds =>
+        _rigidBodyBackend?.MaximumLightweightDebrisMilliseconds ?? 0;
     public double MaximumSingleSimulationStepMilliseconds =>
         _rigidBodyBackend?.MaximumSingleSimulationStepMilliseconds ?? 0;
     public double MaximumStaticResidencyMilliseconds =>
         _rigidBodyBackend?.MaximumStaticResidencyMilliseconds ?? 0;
+    public int ForcedPhysicsChunkLoadsLastStep { get; private set; }
 
     public VoxelPhysicsSimulator(VoxelWorld world, BlockRegistry blocks)
     {
@@ -89,6 +95,7 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
     {
         deltaSeconds = Math.Clamp(deltaSeconds, 0f, 0.05f);
         ChangesLastStep = 0;
+        ForcedPhysicsChunkLoadsLastStep = 0;
         if (!SimulationEnabled)
         {
             SimulationSubstepsLastStep = 0;
@@ -104,11 +111,13 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
 
         if (_world.PhysicsGrids.Count > 0 || _world.AnalyticSpheres.Count > 0 || _rigidBodyBackend is not null)
         {
+            ForcedPhysicsChunkLoadsLastStep = EnsurePhysicsStructureChunkResidency(deltaSeconds);
             _rigidBodyBackend ??= new BepuPhysicsBackend(_world, _simulationFocus);
             _rigidBodyBackend.SetSimulationFocus(_simulationFocus);
             _rigidBodyBackend.Step(deltaSeconds);
             SimulationSubstepsLastStep = _rigidBodyBackend.CollisionStepsLastFrame;
-            Status = $"BEPUphysics 2: {_rigidBodyBackend.DynamicBodyCount} bodies, " +
+            Status = $"BEPUphysics 2: {_rigidBodyBackend.DynamicBodyCount} exact + " +
+                     $"{_rigidBodyBackend.LightweightDebrisCount} hashed debris, " +
                      $"{_rigidBodyBackend.StaticChunkBodyCount} static chunks, {SimulationSubstepsLastStep} collision steps";
         }
         else
@@ -118,11 +127,131 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         }
     }
 
+    /// <summary>
+    /// A complete flying structure owns physics beyond the player's streaming window.
+    /// Materialize the chunks under its current and near-future bounds before BEPU
+    /// advances it, otherwise it can cross the last loaded floor collider and fall
+    /// through terrain that merely has not streamed yet. Tiny debris is deliberately
+    /// excluded; it may leave the active window without dragging an unbounded world
+    /// residency tail behind a large shard field.
+    /// </summary>
+    private int EnsurePhysicsStructureChunkResidency(float deltaSeconds)
+    {
+        var required = new HashSet<ChunkCoordinate>();
+        float predictionSeconds = MathF.Max(0.5f, Math.Clamp(deltaSeconds, 0f, 0.05f) * 4f);
+        foreach (PhysicsGrid grid in _world.PhysicsGrids.Grids)
+        {
+            if (grid.IsDebrisFragment || grid.IsDeformable ||
+                grid.IsKinematicController || grid.Elements.Count == 0) continue;
+            (Vector3 currentMinimum, Vector3 currentMaximum) = grid.CalculateWorldBounds();
+            Vector3 predictedOffset = grid.LinearVelocity * predictionSeconds;
+            Vector3 minimum = Vector3.Min(currentMinimum, currentMinimum + predictedOffset) -
+                              new Vector3(1f, 0f, 1f);
+            Vector3 maximum = Vector3.Max(currentMaximum, currentMaximum + predictedOffset) +
+                              new Vector3(1f, 0f, 1f);
+            ChunkCoordinate first = ChunkCoordinate.FromVoxel(
+                (int)MathF.Floor(minimum.X), (int)MathF.Floor(minimum.Z));
+            ChunkCoordinate last = ChunkCoordinate.FromVoxel(
+                (int)MathF.Floor(maximum.X - 0.0001f),
+                (int)MathF.Floor(maximum.Z - 0.0001f));
+            for (int z = first.Z; z <= last.Z; z++)
+            for (int x = first.X; x <= last.X; x++)
+                required.Add(new ChunkCoordinate(x, z));
+        }
+
+        int generated = 0;
+        foreach (ChunkCoordinate chunk in required)
+            if (!_world.IsChunkLoaded(chunk) && _world.EnsureChunkGenerated(chunk)) generated++;
+        return generated;
+    }
+
     public int AnalyzeNow()
     {
         ChangesLastStep = 0;
         AnalyzeDirtyComponents(int.MaxValue, enforceTimeLimit: false);
         return ChangesLastStep;
+    }
+
+    /// <summary>
+    /// Consumes a world voxel that is being replaced in-place by permanent deformation
+    /// geometry. Every normal world/render/save notification still fires, but this
+    /// simulator must not interpret the replacement as a destroyed structural support
+    /// and detach a second copy of the neighbouring structure.
+    /// </summary>
+    public bool TryConsumeForStaticDeformation(int x, int y, int z, ushort expectedMaterialId)
+    {
+        if (expectedMaterialId == 0 || _world.GetBlockId(x, y, z) != expectedMaterialId)
+            return false;
+        bool previousSuppression = _suppressWorldEvents;
+        _suppressWorldEvents = true;
+        try
+        {
+            return _world.SetBlockId(x, y, z, 0);
+        }
+        finally
+        {
+            _suppressWorldEvents = previousSuppression;
+        }
+    }
+
+    /// <summary>
+    /// Extracts every loaded structure containing one of the supplied soft materials,
+    /// even when that structure is still supported. Soft cells become the deformable
+    /// body, finite hard branches attached to them travel with the body, and terrain or
+    /// unbreakable hard branches remain in the world as static pinning supports.
+    /// </summary>
+    public int ExtractLoadedSoftStructures(IReadOnlyCollection<ushort> softMaterialIds)
+    {
+        ArgumentNullException.ThrowIfNull(softMaterialIds);
+        var softMaterials = softMaterialIds.Where(id => id != 0).ToHashSet();
+        if (softMaterials.Count == 0) return 0;
+
+        var seeds = new List<VoxelPoint>();
+        foreach (ChunkCoordinate chunk in _world.SnapshotLoadedChunks())
+        {
+            foreach (StoredVoxel voxel in _world.SnapshotChunk(chunk).Voxels)
+            {
+                if (!softMaterials.Contains(voxel.MaterialId)) continue;
+                seeds.Add(new VoxelPoint(
+                    chunk.MinimumX + voxel.LocalX,
+                    voxel.Y,
+                    chunk.MinimumZ + voxel.LocalZ));
+            }
+        }
+
+        int extracted = 0;
+        var examinedSoftCells = new HashSet<VoxelPoint>();
+        var knownStaticHardCells = new HashSet<VoxelPoint>();
+        foreach (VoxelPoint seed in seeds)
+        {
+            if (examinedSoftCells.Contains(seed) ||
+                !softMaterials.Contains(_world.GetLoadedBlockId(seed.X, seed.Y, seed.Z))) continue;
+            if (TryExtractSoftStructure(
+                    seed, softMaterials, examinedSoftCells, knownStaticHardCells))
+                extracted++;
+        }
+        return extracted;
+    }
+
+    /// <summary>
+    /// Extracts the supported or unsupported soft structure containing <paramref name="x"/>.
+    /// This is intentionally separate from ordinary structural fracture: support pins a
+    /// soft body but never disables its deformation.
+    /// </summary>
+    public bool TryExtractSoftStructure(
+        int x,
+        int y,
+        int z,
+        IReadOnlyCollection<ushort> softMaterialIds)
+    {
+        ArgumentNullException.ThrowIfNull(softMaterialIds);
+        var softMaterials = softMaterialIds.Where(id => id != 0).ToHashSet();
+        if (softMaterials.Count == 0) return false;
+        return TryExtractSoftStructure(
+            new VoxelPoint(x, y, z),
+            softMaterials,
+            new HashSet<VoxelPoint>(),
+            new HashSet<VoxelPoint>());
     }
 
     public void SetSimulationFocus(Vector3 position)
@@ -168,12 +297,46 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Removes the object represented by a selection. Precision editing may remove one
+    /// authored sub-element from an ordinary rigid grid, but deformable and permanently
+    /// dented structures still represent source voxels. Their continuous render skin is
+    /// only an appearance layer, so primary destruction must remove the complete source
+    /// cell even while precision mode is enabled.
+    /// </summary>
+    public bool TryRemoveGridSelection(PhysicsGridRayHit hit, bool precisionEditing)
+    {
+        PhysicsGrid? grid = _world.PhysicsGrids.Get(hit.GridId);
+        if (grid is null) return false;
+        return precisionEditing && !grid.IsDeformable && !grid.IsStaticDeformation
+            ? TryRemoveGridElement(hit)
+            : TryRemoveGridCell(hit.GridId, hit.CellX, hit.CellY, hit.CellZ);
+    }
+
     public bool TryPlaceOnGrid(PhysicsGridRayHit hit, ushort materialId)
     {
         PhysicsGrid? grid = _world.PhysicsGrids.Get(hit.GridId);
         if (grid is null || !CanPlaceOnGrid(hit, materialId)) return false;
         Vector3 localNormal = Vector3.Transform(hit.Normal, Quaternion.Inverse(grid.Orientation));
         VoxelPoint face = CardinalDirection(localNormal);
+        // Anything placed against a deformable lattice belongs to that same physical
+        // structure. Soft cells extend the compliant part; hard cells are rebuilt by
+        // SoftBodyPhysicsSystem as rigid clusters, so a solid endpoint stays cuboid
+        // without becoming a detached world voxel or being stretched like gel.
+        if (grid.IsDeformable)
+        {
+            int targetX = hit.CellX + face.X;
+            int targetY = hit.CellY + face.Y;
+            int targetZ = hit.CellZ + face.Z;
+            bool joined = TryBuildContinuousExtensionCorners(grid, hit, face, out Vector3[] corners)
+                ? grid.TryAddDeformableFullCell(targetX, targetY, targetZ, materialId, corners)
+                : grid.TryAddFullCell(targetX, targetY, targetZ, materialId);
+            if (joined) _world.PhysicsGrids.NotifyChanged();
+            return joined;
+        }
+        if (grid.IsStaticDeformation &&
+            TryResolveWorldPlacement(grid, hit, out VoxelPoint worldTarget))
+            return _world.SetBlockId(worldTarget.X, worldTarget.Y, worldTarget.Z, materialId);
         bool added = grid.TryAddFullCell(
             hit.CellX + face.X,
             hit.CellY + face.Y,
@@ -190,7 +353,78 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
             materialId == 0 || !_blocks.Get(materialId).IsPlaceable) return false;
         Vector3 localNormal = Vector3.Transform(hit.Normal, Quaternion.Inverse(grid.Orientation));
         VoxelPoint face = CardinalDirection(localNormal);
-        return !grid.ContainsCell(hit.CellX + face.X, hit.CellY + face.Y, hit.CellZ + face.Z);
+        if (grid.ContainsCell(hit.CellX + face.X, hit.CellY + face.Y, hit.CellZ + face.Z)) return false;
+        if (grid.IsDeformable) return true;
+        if (!grid.IsStaticDeformation) return true;
+        return TryResolveWorldPlacement(grid, hit, out VoxelPoint target) &&
+               _world.IsInside(target.X, target.Y, target.Z) &&
+               _world.IsReplaceableMaterial(_world.GetBlockId(target.X, target.Y, target.Z));
+    }
+
+    private static bool TryBuildContinuousExtensionCorners(
+        PhysicsGrid grid,
+        PhysicsGridRayHit hit,
+        VoxelPoint face,
+        out Vector3[] corners)
+    {
+        corners = Array.Empty<Vector3>();
+        PhysicsGridSmoothSphere? source = grid.SmoothSpheres.FirstOrDefault(surface =>
+            surface.CellX == hit.CellX && surface.CellY == hit.CellY && surface.CellZ == hit.CellZ &&
+            surface.HasExplicitCorners);
+        if (source is not PhysicsGridSmoothSphere skin || !skin.HasExplicitCorners) return false;
+
+        Vector3 localNormal = Vector3.Transform(hit.Normal, Quaternion.Inverse(grid.Orientation));
+        if (localNormal.LengthSquared() < 0.000001f) return false;
+        localNormal = Vector3.Normalize(localNormal);
+        Vector3 latticeNormal = new(face.X, face.Y, face.Z);
+        if (Vector3.Dot(localNormal, latticeNormal) < 0f) localNormal = -localNormal;
+
+        corners = new Vector3[8];
+        for (int z = 0; z < 2; z++)
+        for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 2; x++)
+        {
+            int sourceX = face.X == 0 ? x : face.X > 0 ? 1 : 0;
+            int sourceY = face.Y == 0 ? y : face.Y > 0 ? 1 : 0;
+            int sourceZ = face.Z == 0 ? z : face.Z > 0 ? 1 : 0;
+            bool outer = face.X > 0 ? x == 1 : face.X < 0 ? x == 0 :
+                         face.Y > 0 ? y == 1 : face.Y < 0 ? y == 0 :
+                         face.Z > 0 ? z == 1 : z == 0;
+            corners[x + y * 2 + z * 4] = skin.GetCorner(sourceX, sourceY, sourceZ) +
+                                          (outer ? localNormal : Vector3.Zero);
+        }
+        return true;
+    }
+
+    private static bool TryResolveWorldPlacement(
+        PhysicsGrid grid,
+        PhysicsGridRayHit hit,
+        out VoxelPoint target)
+    {
+        Vector3 localNormal = Vector3.Transform(hit.Normal, Quaternion.Inverse(grid.Orientation));
+        VoxelPoint face = CardinalDirection(localNormal);
+        int localX = hit.CellX + face.X;
+        int localY = hit.CellY + face.Y;
+        int localZ = hit.CellZ + face.Z;
+        if (grid.ContainsCell(localX, localY, localZ))
+        {
+            target = default;
+            return false;
+        }
+
+        // The solver keeps source-cell lattice identity even after the visible surface
+        // bends. Resolve from that lattice, not hit.Position: a dented/elastic face can
+        // sit well inside its old voxel and floor(hit.Position) would place a duplicate
+        // inside the soft body instead of the adjacent supporting world cell.
+        Vector3 worldCenter = grid.LocalToWorld(new Vector3(
+            localX + 0.5f,
+            localY + 0.5f,
+            localZ + 0.5f));
+        target = new VoxelPoint(
+            (int)MathF.Floor(worldCenter.X),
+            (int)MathF.Floor(worldCenter.Y),
+            (int)MathF.Floor(worldCenter.Z));
+        return true;
     }
 
     public bool TryPlaceMicroOnGrid(PhysicsGridRayHit hit, ushort materialId, int divisor)
@@ -531,9 +765,12 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
             _suppressWorldEvents = false;
         }
 
-        // Until block definitions expose explicit physical density, use volume density.
-        // Rendering metallic/roughness values are not mass and previously displaced COM.
-        PhysicsGrid grid = _world.PhysicsGrids.Create(elements, new Vector3(minX, minY, minZ));
+        // Physical density is independent from rendering metallic/roughness values.
+        // Weight both the center of mass and inertia by the registered block density.
+        PhysicsGrid grid = _world.PhysicsGrids.Create(
+            elements,
+            new Vector3(minX, minY, minZ),
+            materialId => _blocks.Get(materialId).Density);
         if (_lastRemovedSupportCenter.HasValue)
         {
             Vector3 lever = grid.Position - _lastRemovedSupportCenter.Value;
@@ -546,6 +783,122 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         }
         ChangesLastStep += component.Count;
     }
+
+    private bool TryExtractSoftStructure(
+        VoxelPoint seed,
+        HashSet<ushort> softMaterials,
+        HashSet<VoxelPoint> examinedSoftCells,
+        HashSet<VoxelPoint> knownStaticHardCells)
+    {
+        if (!_world.IsInside(seed.X, seed.Y, seed.Z) ||
+            !softMaterials.Contains(_world.GetLoadedBlockId(seed.X, seed.Y, seed.Z))) return false;
+
+        var selected = new HashSet<VoxelPoint>();
+        var softQueue = new Queue<VoxelPoint>();
+        var examinedHardCells = new HashSet<VoxelPoint>();
+        softQueue.Enqueue(seed);
+        examinedSoftCells.Add(seed);
+
+        while (softQueue.TryDequeue(out VoxelPoint softCell))
+        {
+            selected.Add(softCell);
+            if (selected.Count > SoftStructureElementLimit) return false;
+
+            foreach (VoxelPoint offset in FaceNeighbors)
+            {
+                var neighbor = new VoxelPoint(
+                    softCell.X + offset.X,
+                    softCell.Y + offset.Y,
+                    softCell.Z + offset.Z);
+                ushort material = _world.GetLoadedBlockId(neighbor.X, neighbor.Y, neighbor.Z);
+                if (softMaterials.Contains(material))
+                {
+                    if (examinedSoftCells.Add(neighbor)) softQueue.Enqueue(neighbor);
+                    continue;
+                }
+                if (!IsStructural(material) || knownStaticHardCells.Contains(neighbor) ||
+                    !examinedHardCells.Add(neighbor)) continue;
+
+                List<VoxelPoint> hardBranch = FloodHardBranch(
+                    neighbor,
+                    softMaterials,
+                    examinedHardCells,
+                    out List<VoxelPoint> adjacentSoftCells,
+                    out bool staticSupport);
+                if (staticSupport || selected.Count + hardBranch.Count > SoftStructureElementLimit)
+                {
+                    foreach (VoxelPoint point in hardBranch) knownStaticHardCells.Add(point);
+                    continue;
+                }
+
+                selected.UnionWith(hardBranch);
+                foreach (VoxelPoint adjacentSoft in adjacentSoftCells)
+                {
+                    if (examinedSoftCells.Add(adjacentSoft)) softQueue.Enqueue(adjacentSoft);
+                }
+            }
+        }
+
+        if (selected.Count == 0) return false;
+        ExtractComponent(selected.ToList());
+        return true;
+    }
+
+    private List<VoxelPoint> FloodHardBranch(
+        VoxelPoint seed,
+        HashSet<ushort> softMaterials,
+        HashSet<VoxelPoint> examinedHardCells,
+        out List<VoxelPoint> adjacentSoftCells,
+        out bool staticSupport)
+    {
+        var branch = new List<VoxelPoint>();
+        adjacentSoftCells = new List<VoxelPoint>();
+        var queue = new Queue<VoxelPoint>();
+        queue.Enqueue(seed);
+        staticSupport = false;
+
+        while (queue.TryDequeue(out VoxelPoint point))
+        {
+            branch.Add(point);
+            // Ordinary terrain usually has a direct structural column to bedrock.
+            // Detect that before flooding sideways through tens of thousands of world
+            // cells; a small attached weight normally has air or soft material below.
+            if (HasVerticalStaticSupport(point, softMaterials) || branch.Count >= MaximumAnalyzedCells)
+            {
+                staticSupport = true;
+                break;
+            }
+
+            foreach (VoxelPoint offset in FaceNeighbors)
+            {
+                var neighbor = new VoxelPoint(point.X + offset.X, point.Y + offset.Y, point.Z + offset.Z);
+                if (!_world.IsInside(neighbor.X, neighbor.Y, neighbor.Z)) continue;
+                ushort material = _world.GetLoadedBlockId(neighbor.X, neighbor.Y, neighbor.Z);
+                if (softMaterials.Contains(material))
+                {
+                    adjacentSoftCells.Add(neighbor);
+                    continue;
+                }
+                if (!IsStructural(material) || !examinedHardCells.Add(neighbor)) continue;
+                queue.Enqueue(neighbor);
+            }
+        }
+        return branch;
+    }
+
+    private bool HasVerticalStaticSupport(VoxelPoint point, HashSet<ushort> softMaterials)
+    {
+        for (int y = point.Y; y >= VoxelWorld.MinimumY; y--)
+        {
+            ushort material = _world.GetLoadedBlockId(point.X, y, point.Z);
+            if (softMaterials.Contains(material) || !IsStructural(material)) return false;
+            if (IsAnchor(point.X, y, point.Z)) return true;
+        }
+        return false;
+    }
+
+    // Keep this aligned with the example soft-body solver's public V1 safety cap.
+    private const int SoftStructureElementLimit = 768;
 
     private void SplitDisconnectedGrid(PhysicsGrid grid)
     {
@@ -590,6 +943,16 @@ public sealed class VoxelPhysicsSimulator : IVoxelPhysicsService, IDisposable
         (int X, int Y, int Z) second,
         VoxelPoint direction)
     {
+        // A soft body's collision envelopes move and bend, so their current AABBs
+        // need not retain an exact shared plane. Its source lattice is still the
+        // structural topology: adjacent source cells remain connected until one of
+        // those cells is explicitly removed.
+        bool firstIsSmooth = grid.SmoothSpheres.Any(sphere =>
+            sphere.CellX == first.X && sphere.CellY == first.Y && sphere.CellZ == first.Z);
+        bool secondIsSmooth = grid.SmoothSpheres.Any(sphere =>
+            sphere.CellX == second.X && sphere.CellY == second.Y && sphere.CellZ == second.Z);
+        if (firstIsSmooth || secondIsSmooth) return true;
+
         foreach (PhysicsGridElement a in grid.Elements.Where(element =>
                      element.CellX == first.X && element.CellY == first.Y && element.CellZ == first.Z))
         foreach (PhysicsGridElement b in grid.Elements.Where(element =>

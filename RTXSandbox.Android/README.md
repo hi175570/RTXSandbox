@@ -1,6 +1,6 @@
 # RTX Sandbox Android V1
 
-Android 版本是同一個遊戲的行動 Host，不是固定畫面的獨立 Demo。它直接編入桌面版既有的 World、Camera、PlayerController、Block／Item Registry、CreativeHotbar、PlayerInventory、WorldSaveService 與 Mod API，並以 Android 平台層處理 Activity、儲存、觸控與 GLES。
+Android 版本是同一個遊戲的行動 Host，不是固定畫面的獨立 Demo。它直接編入桌面版既有的 World、Camera、PlayerController、Block／Item Registry、CreativeHotbar、PlayerInventory、WorldSaveService 與 Engine contracts，並以 Android 平台層處理 Activity、儲存、觸控與 GLES；本專案沒有獨立 Mod API。
 
 目前可用：
 
@@ -9,7 +9,7 @@ Android 版本是同一個遊戲的行動 Host，不是固定畫面的獨立 Dem
 - 可編輯八方向鍵或搖桿、按鈕、右側視角區；配置以 normalized JSON 儲存。按鈕可選完整標準 104 鍵名稱；右側空白視角區可長按破壞，獨立 LMB／RMB 仍保留。
 - 外接鍵盤、滑鼠與手把映射到同一套 `GameAction`。鍵盤預設可用 WASD／方向鍵、Space、Shift 蹲下、Ctrl＋前進或連按兩次前進衝刺、E、V、B、Escape；遊戲內按鍵頁可捕捉新的實體鍵、重設並跨重啟保存。
 - 與桌面直接共用 `SharedImGuiScreens` 的 ESC 暫停選單、成就列表與繁中／簡中／英文頁；語言清單固定顯示 `繁體中文／简体中文／English`；相同 `RTX Sandbox Editor`、`Blocks / Tools`、九格快捷欄、搜尋及材質卡片排列；相同三頁籤設定骨架。觸控配置是 Android 額外區塊。
-- Classic GLES 與 PBR Forward GLES；GLES 3 裝置另有真正的 MRT G-buffer Deferred 與 Hybrid PBR；GLES 3.1 裝置可使用 Compute voxel ray tracing V1。四條 Raster 管線共用 color/detail atlas、材質面、粗糙度與 emission，但分別執行 Lambert、GGX Forward、G-buffer lighting 與加強環境反射，不以同一張 Classic 畫面套濾鏡冒充其他 Renderer。
+- Classic GLES 與 PBR Forward GLES；GLES 3 裝置另有真正的 MRT G-buffer Deferred 與 Hybrid PBR；GLES 3.1 裝置可使用 Compute voxel ray tracing V1。四條 Raster 管線共用 color/detail atlas、材質面、粗糙度與 emission，但分別執行 Lambert、GGX Forward、G-buffer lighting，以及帶深度步進與視差的 screen-space reflection Hybrid pass，不以同一張 Classic 畫面套濾鏡冒充其他 Renderer。
 - 共用有限體積流水、實際液面高度與透明水面；共用 Micro Voxel 精密放置／刪除；共用 BEPUphysics 2 Physics Grid 模擬、顯示與互動。
 - 世界建立、載入、同 Seed 重建、重新命名與刪除；測試用世界已實際建立、切回舊世界並刪除。
 - App 背景化會開啟暫停並排入合併式背景保存；離開世界會完成保存後返回主選單。
@@ -24,13 +24,13 @@ Android 版本是同一個遊戲的行動 Host，不是固定畫面的獨立 Dem
 
 - Android x64 Debug／Release 與 x86 Release：`0 warnings / 0 errors`。ARM64／ARMv7 Release 均成功產生 signed APK，但各保留 1 個 MonoMod／RuntimeDetour 不支援該 ABI 的警告；基本 BasePlugin 可載入不代表 Runtime patch 類 Mod 相容。
 - x64 APK 以 `adb install -r` 覆蓋安裝於既有 Android 11／API 30 模擬器成功，沒有卸載或清除資料。
-- 日誌確認讀取舊世界；host-GPU GLES 3.1 測試 VM 中 Classic 約 59–60 FPS、Compute V1 約 58–60 FPS。Deferred 修正每幀重建 G-buffer 後由約 19 FPS 提升到穩態 58–60 FPS；切換後僅首次配置有約 55 ms 尖峰，後續量測多為 5–10 ms。
+- 2026-10-11 以 diagnostic intent 在同一個 host-GPU GLES 3.1、Android 11／API 30 VM 和同一個 75,240 vertices 世界逐條強制啟動：Classic 約 44–53 FPS、PBR Forward 42–56 FPS、Deferred 38–48 FPS、Hybrid 39–47 FPS、Compute V1 48–59 FPS；五條管線均持續出圖且沒有 shader／FBO／AndroidRuntime fatal。`artifacts/android-hybrid-real.png` 與 `artifacts/android-compute-real-2.png` 另以畫面狀態列確認實際後端，不以初始 `Classic 已載入` 訊息冒充切換結果。這些是目前 VM 的新一輪區間，不覆寫成早期 58–60 FPS 的單一結論。
 - Debug Physics Grid 診斷在同一 VM 實際執行 1 個 BEPU 動態剛體與每幀 2 個碰撞步驟；縮減不必要的玩家遠距 collider 預熱後，靜態碰撞體 `2,409 → 755`，穩態約 `22–26 → 38–39 FPS`。
 - arm64 Release 已安裝至 Samsung A32（Android 13／API 33）；手機受安全鎖保護，本輪沒有繞過，因此不得宣稱真機畫面／觸控已驗證。
 - 共用暫停、PC 版式設定、`RTX Sandbox Editor`、成就四列、繁中／簡中／英文切換、觸控編輯入口及中央 `SHF` 已在 API 30 x64 VM 逐頁驗證；新中文 glyph 正常，沒有 `AndroidRuntime` fatal 或 ImGui 載入失敗。
 - 設定頁已恢復 PC 的「畫面／時間與光照／控制與介面」三個核心頁籤並另加「觸控」；VM 已實際操作日夜時間、日長、FOV、顯示距離、靈敏度、建造距離、飛行／穿牆、物理開關與保存。時間亮度 uniform 已在 Classic、PBR、Deferred 與 Compute 實際建 Shader／出圖，Hybrid 共用已驗證的 Deferred lighting path。
 - 語言頁在 VM 實際以三種語言自稱顯示；同一視角長按前後畫面確認草方塊被破壞，且 LMB／RMB 按鈕未移除；可綁定鍵表程式檢查為 104 項。
-- Release x64 以 BepInEx managed-plugin adapter 從 `/storage/emulated/0/Documents/RTXSandbox/Mods/ExampleMod/` 直接載入 Example Mod，日誌包含 `Registered examplemod:signal_block` 與 `WorldReady`，不是只把 ModAPI 打包進 APK。
+- 舊版 Release x64 曾以 BepInEx managed-plugin adapter 從 `/storage/emulated/0/Documents/RTXSandbox/Mods/ExampleMod/` 載入插件；目前插件改為直接引用遊戲程序集，需在下次 VM 驗證其 Android Hook 相容性，不能沿用舊 Mod API 日誌當新證據。
 - 外接鍵盤前進鍵由 W 改綁為 Q 後 UI 即時更新，SharedPreferences 寫入 `Keyboard:W -> Q`，強制停止並重新啟動 App 後仍保留。
 - 背景保存以舊世界檔案時間戳實測更新，程序保持存活且沒有 ANR；世界管理建立的臨時世界在驗證載入／切換後已刪除。
 - x64／ARM64 `libcimgui.so` 的 ELF `LOAD` alignment 均為 `0x4000`，且靜態連結 C++ runtime，不依賴 APK 外的 `libc++_shared.so`。

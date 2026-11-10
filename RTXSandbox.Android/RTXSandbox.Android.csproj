@@ -21,17 +21,20 @@
     <AndroidLinkMode>SdkOnly</AndroidLinkMode>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\RTXSandbox.ModAPI\RTXSandbox.ModAPI.csproj" />
     <PackageReference Include="BepuPhysics" Version="2.4.0" />
     <PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.785" />
     <PackageReference Include="HarmonyX" Version="2.16.1" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" ExcludeAssets="native;build" />
+    <Compile Include="..\Engine\Contracts\*.cs" Link="Shared\Engine\Contracts\%(Filename)%(Extension)" />
     <Compile Include="..\World\*.cs" Link="Shared\World\%(Filename)%(Extension)" />
     <Compile Include="..\Gameplay\PlayerController.cs" Link="Shared\Gameplay\PlayerController.cs" />
     <Compile Include="..\Gameplay\Camera.cs" Link="Shared\Gameplay\Camera.cs" />
     <Compile Include="..\Gameplay\WorldClock.cs" Link="Shared\Gameplay\WorldClock.cs" />
     <Compile Include="..\Gameplay\CreativeHotbar.cs" Link="Shared\Gameplay\CreativeHotbar.cs" />
     <Compile Include="..\Gameplay\CreativePaletteOrdering.cs" Link="Shared\Gameplay\CreativePaletteOrdering.cs" />
+    <Compile Include="..\Gameplay\CreativeInventoryModel.cs" Link="Shared\Gameplay\CreativeInventoryModel.cs" />
+    <Compile Include="..\UI\CreativeInventoryPanel.cs" Link="Shared\UI\CreativeInventoryPanel.cs" />
+    <Compile Include="..\UI\MechanicalItemIcon.cs" Link="Shared\UI\MechanicalItemIcon.cs" />
     <Compile Include="..\Gameplay\ItemRegistry.cs" Link="Shared\Gameplay\ItemRegistry.cs" />
     <Compile Include="..\Gameplay\RecipeRegistry.cs" Link="Shared\Gameplay\RecipeRegistry.cs" />
     <Compile Include="..\Gameplay\BuildToolRegistry.cs" Link="Shared\Gameplay\BuildToolRegistry.cs" />
@@ -50,9 +53,9 @@
     <Compile Include="..\Infrastructure\Platform\PlatformServices.cs" Link="Shared\Infrastructure\PlatformServices.cs" />
     <Compile Include="..\Modding\BepInExBootstrap.cs" Link="Shared\Modding\BepInExBootstrap.cs" />
     <Compile Include="..\Modding\BepInExEnvironment.cs" Link="Shared\Modding\BepInExEnvironment.cs" />
-    <Compile Include="..\Modding\ModHost.cs" Link="Shared\Modding\ModHost.cs" />
     <Compile Include="..\Persistence\WorldSaveService.cs" Link="Shared\Persistence\WorldSaveService.cs" />
     <Compile Include="..\Rendering\ProceduralMaterialAtlas.cs" Link="Shared\Rendering\ProceduralMaterialAtlas.cs" />
+    <Compile Include="..\Rendering\MechanicalPartGeometry.cs" Link="Shared\Rendering\MechanicalPartGeometry.cs" />
     <AndroidAsset Include="..\Content\Base\**\*.json">
       <Link>Content\Base\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </AndroidAsset>

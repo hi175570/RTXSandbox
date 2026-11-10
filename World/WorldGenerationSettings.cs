@@ -7,6 +7,7 @@ public enum WorldPreset
     PureNature,
     Void,
     Showcase,
+    ExternalBridge,
 }
 
 public enum BiomePreset

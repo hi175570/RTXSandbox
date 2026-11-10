@@ -3,7 +3,8 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using RTXSandbox.ModAPI;
+using RTXSandbox.Engine;
+using RTXSandbox.Gameplay;
 using RTXSandbox.Infrastructure;
 using RTXSandbox.World;
 
@@ -61,13 +62,29 @@ public readonly struct SavedWorldState
 public sealed class WorldSaveService
 {
     private const int Magic = 0x57585452; // RTXW in little endian
-    private const int Version = 8;
+    private const int Version = 11;
     private const int ChunkMagic = 0x48435852; // RXCH
     private const int ChunkVersion = 1;
     private const int RegionMagic = 0x47525852; // RXRG
     private const int RegionVersion = 2;
     private const int PhysicsMagic = 0x48505852; // RXPH
-    private const int PhysicsVersion = 2;
+    private const int PhysicsVersion = 5;
+    private const int MaximumSavedPhysicsGridCount = 250_000;
+    private const ushort RetiredMaterialId = ushort.MaxValue;
+    private static readonly HashSet<string> RetiredMechanicalKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "rtxsandbox:linear_controller", "rtxsandbox:rotary_controller", "rtxsandbox:vertical_actuator",
+        "rtxsandbox:rocker_joint", "rtxsandbox:conveyor_drive", "rtxsandbox:impulse_pad",
+        "rtxsandbox:drive_shaft", "rtxsandbox:mechanical_coupler", "rtxsandbox:electric_motor",
+        "rtxsandbox:high_speed_motor", "rtxsandbox:reduction_gearbox", "rtxsandbox:overdrive_gearbox",
+        "rtxsandbox:flywheel", "rtxsandbox:mechanical_brake", "rtxsandbox:heavy_duty_motor",
+        "rtxsandbox:small_spur_gear", "rtxsandbox:large_spur_gear", "rtxsandbox:bevel_gear",
+        "rtxsandbox:gear_rack", "rtxsandbox:mechanical_clutch", "rtxsandbox:universal_joint",
+        "rtxsandbox:chain_sprocket", "rtxsandbox:belt_pulley", "rtxsandbox:bearing_block",
+        "rtxsandbox:worm_reducer", "rtxsandbox:idler_gear", "rtxsandbox:torque_limiter",
+        "rtxsandbox:crank_wheel", "rtxsandbox:camshaft", "rtxsandbox:differential",
+        "rtxsandbox:chain_drive", "rtxsandbox:belt_drive", "rtxsandbox:counterweight",
+    };
 
     private readonly BlockRegistry _blocks;
     private readonly bool _singleFileMode;
@@ -611,7 +628,11 @@ public sealed class WorldSaveService
             grid.AngularVelocity,
             grid.IsSleeping,
             grid.FractureOnImpact,
-            grid.Elements.ToArray())).ToArray();
+            grid.IsStaticDeformation,
+            grid.IsPhysicsGunFrozen,
+            grid.FractureGeneration,
+            grid.Elements.ToArray(),
+            grid.SmoothSpheres.ToArray())).ToArray();
 
     private static IReadOnlyList<SavedAnalyticSphere> CaptureAnalyticSpheres(
         IReadOnlyList<AnalyticSphere> spheres) =>
@@ -642,6 +663,9 @@ public sealed class WorldSaveService
                 WriteVector3(writer, grid.AngularVelocity);
                 writer.Write(grid.Sleeping);
                 writer.Write(grid.FractureOnImpact);
+                writer.Write(grid.StaticDeformation);
+                writer.Write(grid.PhysicsGunFrozen);
+                writer.Write(grid.FractureGeneration);
                 writer.Write(grid.Elements.Count);
                 foreach (PhysicsGridElement element in grid.Elements)
                 {
@@ -650,6 +674,7 @@ public sealed class WorldSaveService
                     WriteVector3(writer, element.Maximum);
                     writer.Write(element.MaterialId);
                 }
+                WriteSmoothSurface(writer, grid.SmoothSurface);
             }
             writer.Write(spheres.Count);
             foreach (SavedAnalyticSphere sphere in spheres)
@@ -930,7 +955,7 @@ public sealed class WorldSaveService
                     y < VoxelWorld.MinimumY || y >= VoxelWorld.MaximumY ||
                     savedMaterial >= remap.Length || !occupied.Add((localX, y, localZ)))
                     throw new InvalidDataException("Region contains an invalid regular voxel.");
-                ushort material = remap[savedMaterial];
+                ushort material = WorldMaterial(remap[savedMaterial]);
                 if (material != 0) voxels.Add(new StoredVoxel(localX, y, localZ, material));
             }
 
@@ -982,7 +1007,7 @@ public sealed class WorldSaveService
                     ushort savedMaterial = reader.ReadUInt16();
                     if (savedMaterial >= remap.Length)
                         throw new InvalidDataException("Precision material exceeds the saved material table.");
-                    ushort material = remap[savedMaterial];
+                    ushort material = WorldMaterial(remap[savedMaterial]);
                     if (material != 0)
                         boxes.Add(new MicroVoxelBox(minX, minY, minZ, maxX, maxY, maxZ, material));
                 }
@@ -1037,7 +1062,7 @@ public sealed class WorldSaveService
             int z = coordinate.MinimumZ + localZ;
             if (x >= VoxelWorld.Width || z >= VoxelWorld.Depth)
                 throw new InvalidDataException("Sparse chunk voxel is outside the world edge.");
-            ushort material = remap[savedMaterial];
+            ushort material = WorldMaterial(remap[savedMaterial]);
             if (material != 0) voxels[WorldLinearIndex(x, y - VoxelWorld.MinimumY, z)] = material;
         }
 
@@ -1071,7 +1096,7 @@ public sealed class WorldSaveService
                 ushort savedMaterial = reader.ReadUInt16();
                 if (savedMaterial >= remap.Length)
                     throw new InvalidDataException("Precision material exceeds the saved material table.");
-                ushort material = remap[savedMaterial];
+                ushort material = WorldMaterial(remap[savedMaterial]);
                 if (material != 0)
                     boxes.Add(new MicroVoxelBox(minX, minY, minZ, maxX, maxY, maxZ, material));
             }
@@ -1097,7 +1122,8 @@ public sealed class WorldSaveService
         if (version is < 1 or > PhysicsVersion)
             throw new InvalidDataException($"Unsupported physics state version {version}.");
         int gridCount = reader.ReadInt32();
-        if (gridCount < 0 || gridCount > 4096) throw new InvalidDataException("Invalid physics grid count.");
+        if (gridCount < 0 || gridCount > MaximumSavedPhysicsGridCount)
+            throw new InvalidDataException("Invalid physics grid count.");
         var grids = new List<SavedPhysicsGrid>(gridCount);
         for (int gridIndex = 0; gridIndex < gridCount; gridIndex++)
         {
@@ -1110,10 +1136,15 @@ public sealed class WorldSaveService
             Vector3 angularVelocity = ReadVector3(reader);
             bool sleeping = reader.ReadBoolean();
             bool fractureOnImpact = reader.ReadBoolean();
+            bool staticDeformation = version >= 3 && reader.ReadBoolean();
+            bool physicsGunFrozen = version >= 5 && reader.ReadBoolean();
+            int fractureGeneration = version >= 4 ? reader.ReadInt32() : 0;
+            if (fractureGeneration is < 0 or > EnergyProjectileSystem.MaximumGlassFractureGeneration)
+                throw new InvalidDataException("Invalid glass fracture generation.");
             int elementCount = reader.ReadInt32();
             if (elementCount <= 0 || elementCount > 1_000_000)
                 throw new InvalidDataException("Invalid physics grid element count.");
-            var elements = new PhysicsGridElement[elementCount];
+            var elements = new List<PhysicsGridElement>(elementCount);
             for (int elementIndex = 0; elementIndex < elementCount; elementIndex++)
             {
                 int cellX = reader.ReadInt32(); int cellY = reader.ReadInt32(); int cellZ = reader.ReadInt32();
@@ -1123,12 +1154,20 @@ public sealed class WorldSaveService
                 if (savedMaterial >= remap.Length)
                     throw new InvalidDataException("Physics grid material exceeds the saved material table.");
                 ushort material = remap[savedMaterial];
+                if (material == RetiredMaterialId) continue;
                 if (material == 0) material = BlockRegistry.UnknownBlockId;
-                elements[elementIndex] = new PhysicsGridElement(
-                    cellX, cellY, cellZ, minimum, maximum, material);
+                elements.Add(new PhysicsGridElement(
+                    cellX, cellY, cellZ, minimum, maximum, material));
             }
+            IReadOnlyList<PhysicsGridSmoothSphere> smoothSurface = version >= 3
+                ? ReadSmoothSurface(reader, remap)
+                : Array.Empty<PhysicsGridSmoothSphere>();
+            if (version < 4)
+                fractureGeneration = InferLegacyFractureGeneration(elements, smoothSurface);
+            if (elements.Count == 0) continue;
             grids.Add(new SavedPhysicsGrid(
-                position, orientation, linearVelocity, angularVelocity, sleeping, fractureOnImpact, elements));
+                position, orientation, linearVelocity, angularVelocity, sleeping, fractureOnImpact,
+                staticDeformation, physicsGunFrozen, fractureGeneration, elements, smoothSurface));
         }
         var spheres = new List<SavedAnalyticSphere>();
         if (version >= 2)
@@ -1147,10 +1186,11 @@ public sealed class WorldSaveService
                 if (savedMaterial >= remap.Length)
                     throw new InvalidDataException("Analytic sphere material exceeds the saved material table.");
                 ushort material = remap[savedMaterial];
-                if (material == 0) material = BlockRegistry.UnknownBlockId;
                 Vector3 linearVelocity = ReadVector3(reader);
                 Vector3 angularVelocity = ReadVector3(reader);
                 bool sleeping = reader.ReadBoolean();
+                if (material == RetiredMaterialId) continue;
+                if (material == 0) material = BlockRegistry.UnknownBlockId;
                 spheres.Add(new SavedAnalyticSphere(
                     center, radius, material, linearVelocity, angularVelocity, sleeping));
             }
@@ -1193,29 +1233,67 @@ public sealed class WorldSaveService
         for (int id = 0; id < keysById.Length; id++)
         {
             string key = keysById[id];
-            if (!string.IsNullOrWhiteSpace(key) && _blocks.TryGet(key, out BlockDefinition? definition))
+            if (RetiredMechanicalKeys.Contains(key))
+                remap[id] = RetiredMaterialId;
+            else if (!string.IsNullOrWhiteSpace(key) && _blocks.TryGet(key, out BlockDefinition? definition))
                 remap[id] = definition!.Id;
         }
         return remap;
     }
 
-    private static void RestorePhysicsState(VoxelWorld world, SavedPhysicsState physics)
+    private int InferLegacyFractureGeneration(
+        IReadOnlyList<PhysicsGridElement> elements,
+        IReadOnlyList<PhysicsGridSmoothSphere> smoothSurface)
+    {
+        if (!smoothSurface.Any(surface => surface.HasExplicitCorners) || elements.Count == 0)
+            return 0;
+        BlockDefinition material = _blocks.Get(elements[0].MaterialId);
+        bool glass = material.IsTransparent &&
+                     (material.Key.Contains("glass", StringComparison.OrdinalIgnoreCase) ||
+                      material.Tags.Any(tag => tag.Contains("glass", StringComparison.OrdinalIgnoreCase)) ||
+                      material.DisplayName.Contains("玻璃", StringComparison.Ordinal));
+        return glass ? 1 : 0;
+    }
+
+    private void RestorePhysicsState(VoxelWorld world, SavedPhysicsState physics)
     {
         foreach (SavedPhysicsGrid savedGrid in physics.Grids)
         {
             PhysicsGrid grid = world.PhysicsGrids.Create(savedGrid.Elements, Vector3.Zero);
             grid.SetTransformAndVelocity(
                 savedGrid.Position, savedGrid.Orientation, savedGrid.LinearVelocity, savedGrid.AngularVelocity);
-            grid.IsSleeping = savedGrid.Sleeping;
             grid.FractureOnImpact = savedGrid.FractureOnImpact;
+            grid.FractureGeneration = savedGrid.FractureGeneration;
+            // Solver sleep is only trustworthy while the static contacts that caused
+            // it still exist. Those contacts are rebuilt asynchronously after loading,
+            // so complete structures must revalidate support under gravity once. Tiny
+            // settled debris keeps its persisted sleep/virtualization state.
+            grid.IsSleeping = savedGrid.Sleeping && grid.IsDebrisFragment;
+            grid.RequiresSupportRevalidation = !grid.IsDebrisFragment && !savedGrid.StaticDeformation;
+            if (savedGrid.SmoothSurface.Count > 0) grid.SetSmoothSpheres(savedGrid.SmoothSurface);
+            if (savedGrid.StaticDeformation) grid.FreezeAsStaticDeformation();
+            else if (savedGrid.PhysicsGunFrozen)
+            {
+                grid.IsPhysicsGunFrozen = true;
+                grid.IsKinematicController = true;
+                grid.LinearVelocity = Vector3.Zero;
+                grid.AngularVelocity = Vector3.Zero;
+                grid.IsSleeping = true;
+                grid.RequiresSupportRevalidation = false;
+            }
         }
         foreach (SavedAnalyticSphere savedSphere in physics.AnalyticSpheres)
         {
             AnalyticSphere sphere = world.AnalyticSpheres.Create(
                 savedSphere.Center, savedSphere.Radius, savedSphere.MaterialId);
-            sphere.LinearVelocity = savedSphere.LinearVelocity;
-            sphere.AngularVelocity = savedSphere.AngularVelocity;
-            sphere.IsSleeping = savedSphere.Sleeping;
+            BlockDefinition material = _blocks.Get(savedSphere.MaterialId);
+            bool blackHole = AnalyticSpherePlacement.IsBlackHole(material);
+            sphere.IsKinematic = blackHole;
+            sphere.LinearVelocity = blackHole ? Vector3.Zero : savedSphere.LinearVelocity;
+            sphere.AngularVelocity = blackHole ? Vector3.Zero : savedSphere.AngularVelocity;
+            // As with complete grids, a sphere must not inherit sleep after its old
+            // contact manifold has been discarded during world loading.
+            sphere.IsSleeping = blackHole;
         }
     }
 
@@ -1343,6 +1421,9 @@ public sealed class WorldSaveService
             WriteVector3(writer, grid.AngularVelocity);
             writer.Write(grid.IsSleeping);
             writer.Write(grid.FractureOnImpact);
+            writer.Write(grid.IsStaticDeformation);
+            writer.Write(grid.IsPhysicsGunFrozen);
+            writer.Write(grid.FractureGeneration);
             writer.Write(grid.Elements.Count);
             foreach (PhysicsGridElement element in grid.Elements)
             {
@@ -1353,6 +1434,7 @@ public sealed class WorldSaveService
                 WriteVector3(writer, element.Maximum);
                 writer.Write(element.MaterialId);
             }
+            WriteSmoothSurface(writer, grid.SmoothSpheres);
         }
         stream.Flush(flushToDisk: true);
     }
@@ -1454,9 +1536,9 @@ public sealed class WorldSaveService
             {
                 throw new InvalidDataException($"Saved block id {savedId} exceeds the supported material table.");
             }
-            remap[savedId] = _blocks.TryGet(key, out BlockDefinition? definition)
-                ? definition!.Id
-                : (ushort)0;
+            remap[savedId] = RetiredMechanicalKeys.Contains(key)
+                ? RetiredMaterialId
+                : _blocks.TryGet(key, out BlockDefinition? definition) ? definition!.Id : (ushort)0;
         }
 
         int voxelCount = reader.ReadInt32();
@@ -1512,7 +1594,7 @@ public sealed class WorldSaveService
                     ushort savedMaterial = reader.ReadUInt16();
                     if (savedMaterial >= remap.Length)
                         throw new InvalidDataException($"Saved micro material id {savedMaterial} exceeds the supported material table.");
-                    ushort material = remap[savedMaterial];
+                    ushort material = WorldMaterial(remap[savedMaterial]);
                     if (material != 0)
                         boxes.Add(new MicroVoxelBox(minX, minY, minZ, maxX, maxY, maxZ, material));
                 }
@@ -1527,7 +1609,8 @@ public sealed class WorldSaveService
         if (version >= 7)
         {
             int gridCount = reader.ReadInt32();
-            if (gridCount < 0 || gridCount > 4096) throw new InvalidDataException("Invalid physics grid count.");
+            if (gridCount < 0 || gridCount > MaximumSavedPhysicsGridCount)
+                throw new InvalidDataException("Invalid physics grid count.");
             for (int gridIndex = 0; gridIndex < gridCount; gridIndex++)
             {
                 Vector3 position = ReadVector3(reader);
@@ -1539,10 +1622,15 @@ public sealed class WorldSaveService
                 Vector3 angularVelocity = ReadVector3(reader);
                 bool sleeping = reader.ReadBoolean();
                 bool fractureOnImpact = reader.ReadBoolean();
+                bool staticDeformation = version >= 9 && reader.ReadBoolean();
+                bool physicsGunFrozen = version >= 11 && reader.ReadBoolean();
+                int fractureGeneration = version >= 10 ? reader.ReadInt32() : 0;
+                if (fractureGeneration is < 0 or > EnergyProjectileSystem.MaximumGlassFractureGeneration)
+                    throw new InvalidDataException("Invalid glass fracture generation.");
                 int elementCount = reader.ReadInt32();
                 if (elementCount <= 0 || elementCount > 1_000_000)
                     throw new InvalidDataException("Invalid physics grid element count.");
-                var elements = new PhysicsGridElement[elementCount];
+                var elements = new List<PhysicsGridElement>(elementCount);
                 for (int elementIndex = 0; elementIndex < elementCount; elementIndex++)
                 {
                     int cellX = reader.ReadInt32();
@@ -1554,12 +1642,20 @@ public sealed class WorldSaveService
                     if (savedMaterial >= remap.Length)
                         throw new InvalidDataException("Physics grid material exceeds the supported table.");
                     ushort material = remap[savedMaterial];
+                    if (material == RetiredMaterialId) continue;
                     if (material == 0) material = BlockRegistry.UnknownBlockId;
-                    elements[elementIndex] = new PhysicsGridElement(
-                        cellX, cellY, cellZ, minimum, maximum, material);
+                    elements.Add(new PhysicsGridElement(
+                        cellX, cellY, cellZ, minimum, maximum, material));
                 }
+                IReadOnlyList<PhysicsGridSmoothSphere> smoothSurface = version >= 9
+                    ? ReadSmoothSurface(reader, remap)
+                    : Array.Empty<PhysicsGridSmoothSphere>();
+                if (version < 10)
+                    fractureGeneration = InferLegacyFractureGeneration(elements, smoothSurface);
+                if (elements.Count == 0) continue;
                 physicsGrids.Add(new SavedPhysicsGrid(
-                    position, orientation, linearVelocity, angularVelocity, sleeping, fractureOnImpact, elements));
+                    position, orientation, linearVelocity, angularVelocity, sleeping, fractureOnImpact,
+                    staticDeformation, physicsGunFrozen, fractureGeneration, elements, smoothSurface));
             }
         }
         if (stream.Position != stream.Length)
@@ -1571,7 +1667,7 @@ public sealed class WorldSaveService
         {
             if (sourceVoxels[i] >= remap.Length)
                 throw new InvalidDataException($"Saved voxel material id {sourceVoxels[i]} exceeds the supported material table.");
-            sourceVoxels[i] = remap[sourceVoxels[i]];
+            sourceVoxels[i] = WorldMaterial(remap[sourceVoxels[i]]);
         }
         var voxels = new ushort[VoxelWorld.Width * VoxelWorld.Height * VoxelWorld.Depth];
         for (int z = 0; z < depth; z++)
@@ -1594,8 +1690,21 @@ public sealed class WorldSaveService
                 savedGrid.Orientation,
                 savedGrid.LinearVelocity,
                 savedGrid.AngularVelocity);
-            grid.IsSleeping = savedGrid.Sleeping;
             grid.FractureOnImpact = savedGrid.FractureOnImpact;
+            grid.FractureGeneration = savedGrid.FractureGeneration;
+            grid.IsSleeping = savedGrid.Sleeping && grid.IsDebrisFragment;
+            grid.RequiresSupportRevalidation = !grid.IsDebrisFragment && !savedGrid.StaticDeformation;
+            if (savedGrid.SmoothSurface.Count > 0) grid.SetSmoothSpheres(savedGrid.SmoothSurface);
+            if (savedGrid.StaticDeformation) grid.FreezeAsStaticDeformation();
+            else if (savedGrid.PhysicsGunFrozen)
+            {
+                grid.IsPhysicsGunFrozen = true;
+                grid.IsKinematicController = true;
+                grid.LinearVelocity = Vector3.Zero;
+                grid.AngularVelocity = Vector3.Zero;
+                grid.IsSleeping = true;
+                grid.RequiresSupportRevalidation = false;
+            }
         }
         world.SetGenerationMetadata(generation);
         return new SavedWorldState(
@@ -1674,6 +1783,64 @@ public sealed class WorldSaveService
             return fallback;
         }
     }
+
+    private static void WriteSmoothSurface(
+        BinaryWriter writer,
+        IReadOnlyList<PhysicsGridSmoothSphere> surface)
+    {
+        writer.Write(surface.Count);
+        foreach (PhysicsGridSmoothSphere cell in surface)
+        {
+            WriteVector3(writer, cell.Center);
+            writer.Write(cell.Radius);
+            writer.Write(cell.MaterialId);
+            writer.Write(cell.CellX);
+            writer.Write(cell.CellY);
+            writer.Write(cell.CellZ);
+            writer.Write(cell.HasExplicitCorners);
+            if (!cell.HasExplicitCorners) continue;
+            foreach (Vector3 corner in cell.ExplicitCorners!) WriteVector3(writer, corner);
+        }
+    }
+
+    private static IReadOnlyList<PhysicsGridSmoothSphere> ReadSmoothSurface(
+        BinaryReader reader,
+        ushort[] remap)
+    {
+        int count = reader.ReadInt32();
+        if (count < 0 || count > 1_000_000)
+            throw new InvalidDataException("Invalid physics surface cell count.");
+        var result = new List<PhysicsGridSmoothSphere>(count);
+        for (int index = 0; index < count; index++)
+        {
+            Vector3 center = ReadVector3(reader);
+            float radius = reader.ReadSingle();
+            ushort savedMaterial = reader.ReadUInt16();
+            int cellX = reader.ReadInt32();
+            int cellY = reader.ReadInt32();
+            int cellZ = reader.ReadInt32();
+            bool hasCorners = reader.ReadBoolean();
+            if (!float.IsFinite(radius) || radius <= 0f || radius > 128f || savedMaterial >= remap.Length)
+                throw new InvalidDataException("Invalid physics surface cell.");
+            ushort material = remap[savedMaterial];
+            Vector3[]? corners = null;
+            if (hasCorners)
+            {
+                corners = new Vector3[8];
+                for (int corner = 0; corner < corners.Length; corner++) corners[corner] = ReadVector3(reader);
+            }
+            if (material == RetiredMaterialId) continue;
+            if (material == 0) material = BlockRegistry.UnknownBlockId;
+            result.Add(new PhysicsGridSmoothSphere(center, radius, material, cellX, cellY, cellZ)
+            {
+                ExplicitCorners = corners,
+            });
+        }
+        return result;
+    }
+
+    private static ushort WorldMaterial(ushort material) =>
+        material == RetiredMaterialId ? (ushort)0 : material;
 
     private static void WriteVector3(BinaryWriter writer, Vector3 value)
     {
@@ -1870,7 +2037,11 @@ public sealed class WorldSaveService
         Vector3 AngularVelocity,
         bool Sleeping,
         bool FractureOnImpact,
-        IReadOnlyList<PhysicsGridElement> Elements);
+        bool StaticDeformation,
+        bool PhysicsGunFrozen,
+        int FractureGeneration,
+        IReadOnlyList<PhysicsGridElement> Elements,
+        IReadOnlyList<PhysicsGridSmoothSphere> SmoothSurface);
     private sealed record SavedAnalyticSphere(
         Vector3 Center,
         float Radius,

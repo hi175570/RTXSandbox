@@ -8,6 +8,7 @@ uniform float uExposure;
 uniform float uTimeOfDay;
 uniform int uHdrEnabled;
 uniform int uBloomEnabled;
+uniform float uBloomStrength;
 uniform int uPostQuality;
 uniform int uFogQuality;
 uniform int uToneMapping;
@@ -60,16 +61,17 @@ vec3 toneMap(vec3 color)
 
 void main()
 {
+    vec4 position = texture(uPosition, vUv);
+    float presentationAlpha = position.a > 0.5 ? 1.0 : 0.0;
     vec3 color = uPostQuality >= 2 && uDebugView == 0
         ? fxaa(vUv)
         : texture(uHdrColor, vUv).rgb;
     if (uDebugView != 0)
     {
-        outColor = vec4(pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+        outColor = vec4(pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2)), presentationAlpha);
         return;
     }
 
-    vec4 position = texture(uPosition, vUv);
     if (uFogQuality > 0 && position.a > 0.5)
     {
         vec3 viewRay = position.xyz - uCameraPosition;
@@ -96,19 +98,29 @@ void main()
     if (uBloomEnabled != 0 && uPostQuality > 0)
     {
         vec3 bloom = vec3(0.0);
-        float weight = 0.0;
+        float kernelWeight = 0.0;
         float radius = 1.0 + float(uPostQuality);
         for (int y = -2; y <= 2; y++)
         for (int x = -2; x <= 2; x++)
         {
             vec2 offset = vec2(x, y) * uTexelSize * radius;
             vec3 sampleColor = texture(uHdrColor, clamp(vUv + offset, vec2(0.001), vec2(0.999))).rgb;
-            float luminance = dot(sampleColor, vec3(0.2126, 0.7152, 0.0722));
-            float contribution = smoothstep(0.9, 2.4, luminance);
-            bloom += sampleColor * contribution;
-            weight += contribution;
+            float luminance = luminanceOf(sampleColor);
+            // Extract only energy above the HDR threshold. The previous code divided
+            // by the number of bright taps, so one LED made every neighbouring pixel
+            // receive a full-strength copy of that LED.
+            float excess = max(luminance - 1.35, 0.0) / max(luminance, 1e-4);
+            float spatialWeight = 1.0 / (1.0 + float(x * x + y * y));
+            bloom += sampleColor * excess * spatialWeight;
+            kernelWeight += spatialWeight;
         }
-        if (weight > 0.001) color += bloom / weight * (0.06 + float(uPostQuality) * 0.035);
+        if (kernelWeight > 0.001)
+        {
+            bloom /= kernelWeight;
+            float bloomLuminance = luminanceOf(bloom);
+            bloom *= min(1.0, 3.0 / max(bloomLuminance, 1e-4));
+            color += bloom * clamp(uBloomStrength, 0.0, 1.0);
+        }
     }
 
     if (uPostQuality >= 2)
@@ -125,5 +137,5 @@ void main()
     color = mix(vec3(dot(color, vec3(0.2126, 0.7152, 0.0722))), color, 1.06);
     if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
     vec3 mapped = toneMap(max(color, vec3(0.0)));
-    outColor = vec4(pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+    outColor = vec4(pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2)), presentationAlpha);
 }
